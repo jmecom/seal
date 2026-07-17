@@ -2,9 +2,10 @@
 
 Seal is a small Neovim interface for a real Codex session.
 
-Press one key, enter a prompt, and Seal routes it in one of two ways:
+Press one key, enter a prompt, and Seal routes it in one of three ways:
 
 - A normal prompt goes unchanged to a persistent Codex thread and runs in the background. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
+- `targeted:` uses that same writable thread but asks Codex to make the smallest change that satisfies the request, without unrelated cleanup.
 - `fun:`, `type:`, `class:`, and other declaration prefixes create independent temporary read-only forks of that thread. Each fork inherits the conversation and can inspect the repository. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview. Several marked locations can run concurrently.
 
 Codex owns the agent loop, tools, conversation history, and compaction. Seal keeps only one thread ID per project root in the current Neovim process.
@@ -56,8 +57,10 @@ Commands provide the same operations:
 
 ```vim
 :Seal explain why this test is failing
+:Seal targeted: fix only the parser edge case
 :Seal fun: load the saved state from disk
 :Seal type: represent an entry in the on-disk cache
+:Seal interface: define the storage API without implementations
 :SealChat
 :SealAttach
 :SealAccept
@@ -66,7 +69,9 @@ Commands provide the same operations:
 :SealStop
 ```
 
-Recognized declaration prefixes are `fun`, `fn`, `function`, `type`, `class`, `method`, `struct`, `interface`, `enum`, `trait`, and `impl`. Everything else is a normal Codex prompt, including unknown colon-prefixed text such as `fix: ...`.
+`targeted:` is a writable main-thread convenience prefix. Seal replaces the prefix with concise minimal-change guidance and the request, so the expanded prompt appears in the persistent Codex conversation.
+
+Recognized inline declaration prefixes are `fun`, `fn`, `function`, `type`, `class`, `method`, `struct`, `interface`, `enum`, `trait`, and `impl`. `interface:` asks for the target language's API surface and signatures without concrete implementations. Everything else is a normal Codex prompt, including unknown colon-prefixed text such as `fix: ...`.
 
 The current buffer, cursor, file type, and visual selection are attached as editor context. Normal agent prompts save the current modified buffer first so Codex does not edit an older on-disk version. Declaration forks are read-only and can use an unsaved buffer snapshot safely.
 
@@ -106,8 +111,16 @@ require("seal").setup({
     type = "type",
     class = "class",
   },
+  agent_prefixes = {
+    targeted = "Make the minimum change needed for the request.",
+  },
+  declaration_instructions = {
+    interface = "Return API signatures without concrete implementations.",
+  },
 })
 ```
+
+`declaration_instructions` is keyed by the resolved declaration kind, so aliases such as `fn` share the `function` instruction.
 
 The model, reasoning level, sandbox, and other defaults come from the normal Codex configuration. Declaration forks inherit the main thread's model settings.
 

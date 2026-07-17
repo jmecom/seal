@@ -165,6 +165,16 @@ function tests.routes_only_known_prefixes()
     original = "fun: load it",
   }, "fun prefix should select declaration mode")
   equal(seal._route("TYPE: durable state").kind, "type", "prefixes should be case insensitive")
+  local targeted = seal._route(" TARGETED: fix only the parser edge case ")
+  equal(targeted.mode, "agent", "targeted should remain a main-thread prompt")
+  equal(targeted.prompt, "fix only the parser edge case", "targeted should strip its control prefix")
+  truthy(targeted.instruction:find("minimum necessary", 1, true), "targeted should add the minimal-change policy")
+  local interface = seal._route("INTERFACE: storage backend")
+  equal(interface.kind, "interface", "interface should remain an inline declaration")
+  truthy(
+    interface.instruction:find("no concrete implementation logic", 1, true),
+    "interface should prohibit implementation bodies"
+  )
   equal(seal._route("fix: this bug").mode, "agent", "unknown colon prefixes should remain freeform")
   equal(seal._route("https://example.com").mode, "agent", "URLs should remain freeform")
   equal(seal._route("  preserve me  ").prompt, "  preserve me  ", "freeform whitespace should be preserved")
@@ -212,6 +222,32 @@ function tests.freeform_uses_main_thread_unchanged()
   }, "normal turns should use a protocol-valid workspace-writing policy")
   equal(request(fake, "thread/start").params.approvalPolicy, "never", "the main thread should be non-interactive")
   equal(request(fake, "thread/start").params.sandbox, "workspace-write", "the main thread should be workspace-writing")
+end
+
+function tests.targeted_adds_minimal_change_guidance_to_the_main_thread()
+  setup({ "local value = 1" })
+  truthy(seal.submit("TARGETED: fix only the parser edge case"), "targeted prompt should submit")
+  local turn = request(fake, "turn/start")
+  equal(turn.params.threadId, "main-thread", "targeted should use the persistent thread")
+  truthy(request(fake, "thread/fork") == nil, "targeted must not create a declaration fork")
+  truthy(turn.params.outputSchema == nil, "targeted must not constrain the agent response")
+  truthy(
+    turn.params.input[1].text:find("minimum necessary", 1, true),
+    "Codex should receive the minimal-change policy"
+  )
+  truthy(
+    turn.params.input[1].text:find("\n\nRequest:\nfix only the parser edge case", 1, true),
+    "the policy should remain scoped to this request"
+  )
+  truthy(not turn.params.input[1].text:find("TARGETED:", 1, true), "the control prefix should not reach Codex")
+  truthy(
+    turn.params.additionalContext["seal.editor"].value:find("local value = 1", 1, true),
+    "targeted should retain editor context"
+  )
+
+  setup({ "" })
+  truthy(not seal.submit("targeted:   "), "an empty targeted prompt should not submit")
+  truthy(request(fake, "thread/start") == nil, "an empty targeted prompt should not open a thread")
 end
 
 function tests.freeform_steers_an_active_turn()
@@ -725,6 +761,24 @@ function tests.declaration_uses_safe_ephemeral_fork()
   truthy(turn.params.input[1].text:find("exactly one function", 1, true), "turn should carry the declaration contract")
   truthy(turn.params.input[1].text:find("load the durable state", 1, true), "turn should carry the user's intent")
   equal(turn.params.outputSchema.required, { "code" }, "declaration should require structured code")
+end
+
+function tests.interface_prefix_requests_api_without_implementation()
+  setup({ "" })
+  truthy(seal.submit("INTERFACE: storage backend"), "interface prompt should submit")
+  local turn = request(fake, "turn/start")
+  equal(turn.params.threadId, "fork-thread", "interface should run on an ephemeral fork")
+  truthy(turn.params.input[1].text:find("exactly one interface", 1, true), "interface should keep the declaration contract")
+  truthy(
+    turn.params.input[1].text:find("no concrete implementation logic", 1, true),
+    "interface should request signatures without implementations"
+  )
+  truthy(turn.params.input[1].text:find("storage backend", 1, true), "interface should carry the user's request")
+  truthy(
+    not turn.params.input[1].text:find("minimum necessary", 1, true),
+    "interface should not inherit the targeted policy"
+  )
+  equal(turn.params.outputSchema.required, { "code" }, "interface should retain structured declaration output")
 end
 
 function tests.first_declaration_handles_empty_main_thread()
@@ -1585,6 +1639,7 @@ local order = {
   "large_context_keeps_cursor_line",
   "visual_selection_shares_the_context_budget",
   "freeform_uses_main_thread_unchanged",
+  "targeted_adds_minimal_change_guidance_to_the_main_thread",
   "freeform_steers_an_active_turn",
   "freeform_uses_the_post_format_buffer_and_selection",
   "freeform_maps_context_through_a_full_buffer_format",
@@ -1609,6 +1664,7 @@ local order = {
   "wiped_chat_ignores_a_delayed_refresh",
   "declaration_waits_for_active_main_turn",
   "declaration_uses_safe_ephemeral_fork",
+  "interface_prefix_requests_api_without_implementation",
   "first_declaration_handles_empty_main_thread",
   "thread_setting_changes_flow_into_forks",
   "null_thread_settings_are_omitted_from_forks",
