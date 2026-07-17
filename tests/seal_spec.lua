@@ -1086,7 +1086,7 @@ function tests.mapping_restoration_preserves_replace_keycodes()
   equal(restored.replace_keycodes, nil, "Seal should preserve replace_keycodes=false")
 end
 
-function tests.buffer_edit_cancels_only_jobs_in_that_buffer()
+function tests.buffer_edit_cancels_only_the_changed_target()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: first")
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
@@ -1099,12 +1099,86 @@ function tests.buffer_edit_cancels_only_jobs_in_that_buffer()
   seal.submit("fun: other buffer", { buf = other, cursor = { 1, 0 } })
   equal(vim.tbl_count(seal._state.jobs), 3, "all three jobs should be active")
 
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
-  equal(vim.tbl_count(seal._state.jobs), 1, "the edit should cancel both jobs in the changed buffer")
+  vim.api.nvim_buf_set_lines(0, 0, 1, false, { "local changed = true" })
+  truthy(vim.wait(500, function()
+    return vim.tbl_count(seal._state.jobs) == 2
+  end, 5), "the edit should cancel only the job whose target line changed")
+  truthy(seal._state.jobs[1] == nil, "the changed target's job should be cancelled")
+  truthy(seal._state.jobs[2] ~= nil, "an unchanged target in the same buffer should remain active")
   truthy(seal._state.jobs[3] ~= nil, "the other buffer's job should remain active")
 
+  seal.reject(2)
   seal.reject(3)
   vim.api.nvim_buf_delete(other, { force = true })
+end
+
+function tests.insert_mode_away_from_marker_keeps_and_reanchors_job()
+  setup({ "local before = true", "local between = true", "" }, { activity = { interval_ms = 100000 } })
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  seal.submit("fun: survives unrelated insert mode")
+  local job = seal._state.jobs[1]
+
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("i<Esc>", true, false, true), "xt", false)
+  truthy(seal._state.jobs[1] == job, "entering and leaving insert mode at the marker should not cancel it")
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.api.nvim_feedkeys(
+    vim.api.nvim_replace_termcodes("O-- editing while Seal works<Esc>", true, false, true),
+    "xt",
+    false
+  )
+  truthy(vim.wait(500, function()
+    return seal._state.jobs[1] == job
+      and job.snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "an insert-mode edit away from the marker should rebase the running job")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, {})
+  equal(position[1], 3, "the marker should follow a line inserted above it")
+
+  complete_declaration("function survives_unrelated_insert_mode() end")
+  vim.api.nvim_win_set_cursor(0, { position[1] + 1, 0 })
+  truthy(seal.accept(), "the rebased result should still be acceptable")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {
+    "-- editing while Seal works",
+    "local before = true",
+    "local between = true",
+    "function survives_unrelated_insert_mode() end",
+  }, "accepting should preserve the concurrent insert-mode edit")
+end
+
+function tests.undo_away_from_marker_keeps_job()
+  setup({ "local before = true", "local between = true", "" }, { activity = { interval_ms = 100000 } })
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("A -- temporary<Esc>", true, false, true), "xt", false)
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  seal.submit("fun: survives unrelated undo")
+  local job = seal._state.jobs[1]
+
+  vim.cmd("undo")
+
+  truthy(vim.wait(500, function()
+    return seal._state.jobs[1] == job
+      and job.snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "undo away from the marker should rebase the running job")
+  equal(vim.api.nvim_buf_get_lines(0, 0, 1, false), { "local before = true" }, "the unrelated edit should undo")
+  seal.reject(1)
+end
+
+function tests.editing_selected_context_cancels_job()
+  setup({ "local selected = true", "local more = true", "" }, { activity = { interval_ms = 100000 } })
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  seal.submit("fun: uses the selected context", { range = 2, line1 = 1, line2 = 2 })
+  truthy(seal._state.jobs[1] ~= nil, "the selected-context job should start")
+
+  vim.api.nvim_buf_set_lines(0, 0, 1, false, { "local selected = false" })
+
+  truthy(vim.wait(500, function()
+    return seal._state.jobs[1] == nil
+  end, 5), "editing context explicitly selected for the prompt should cancel the job")
+  truthy(
+    notifications[#notifications].message:find("context changed", 1, true),
+    "selection invalidation should explain why the spinner disappeared"
+  )
 end
 
 function tests.new_thread_interrupts_and_detaches_old_thread()
@@ -1264,8 +1338,11 @@ function tests.parallel_results_complete_and_accept_out_of_order()
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local second_position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, second.extmark, {})
   equal(second_position[1], 4, "the lower result should reanchor after a multi-line insertion above it")
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
-  truthy(seal._state.jobs[2] ~= nil, "the controlled TextChanged event should preserve the rebased sibling")
+  equal(
+    second.snapshot.changedtick,
+    vim.api.nvim_buf_get_changedtick(0),
+    "the sibling should be rebased during the accepted buffer edit"
+  )
 
   vim.api.nvim_win_set_cursor(0, { second_position[1] + 1, 0 })
   vim.cmd("SealAccept")
@@ -1384,8 +1461,10 @@ end
 function tests.completion_text_change_cancels_generation()
   setup({ "" })
   seal.submit("fun: cancelled by completion")
-  vim.api.nvim_exec_autocmds("TextChangedP", { buffer = 0 })
-  truthy(seal._state.generation == nil, "completion-menu edits should cancel declaration generation")
+  vim.api.nvim_buf_set_lines(0, 0, 1, false, { "completed text" })
+  truthy(vim.wait(500, function()
+    return seal._state.generation == nil
+  end, 5), "completion-menu edits should cancel declaration generation")
   equal(request(fake, "turn/interrupt").params.turnId, "fork-turn", "the cancelled fork turn should be interrupted")
 end
 
@@ -1535,7 +1614,10 @@ local order = {
   "closed_source_buffer_discards_ready_jobs_and_mappings",
   "mapping_installed_during_a_job_is_not_clobbered",
   "mapping_restoration_preserves_replace_keycodes",
-  "buffer_edit_cancels_only_jobs_in_that_buffer",
+  "buffer_edit_cancels_only_the_changed_target",
+  "insert_mode_away_from_marker_keeps_and_reanchors_job",
+  "undo_away_from_marker_keeps_job",
+  "editing_selected_context_cancels_job",
   "new_thread_interrupts_and_detaches_old_thread",
   "late_turn_start_response_does_not_interrupt_a_ready_result",
   "parallel_jobs_dispatch_in_their_own_buffers",

@@ -46,7 +46,7 @@ local state = {
   jobs = {},
   jobs_by_thread = {},
   job_mappings = {},
-  internal_ticks = {},
+  job_buffers = {},
   spinner_timer = nil,
   spinner_frame = 1,
   job_sequence = 0,
@@ -69,6 +69,13 @@ local function notify(message, level)
     config.notify(message, level or vim.log.levels.INFO, { title = "Seal" })
   else
     vim.notify(message, level or vim.log.levels.INFO, { title = "Seal" })
+  end
+end
+
+local function notify_job_invalidation(job)
+  if job.invalidation_reason and not job.invalidation_notified then
+    job.invalidation_notified = true
+    notify(job.invalidation_reason, vim.log.levels.WARN)
   end
 end
 
@@ -388,11 +395,17 @@ local function job_position(job)
   if not job.extmark or not vim.api.nvim_buf_is_valid(buf) then
     return nil
   end
-  local ok, position = pcall(vim.api.nvim_buf_get_extmark_by_id, buf, activity_namespace, job.extmark, {})
-  if not ok or #position ~= 2 then
+  local ok, position = pcall(
+    vim.api.nvim_buf_get_extmark_by_id,
+    buf,
+    activity_namespace,
+    job.extmark,
+    { details = true }
+  )
+  if not ok or #position ~= 3 or position[3].invalid then
     return nil
   end
-  return position
+  return { position[1], position[2] }
 end
 
 local function summary_text(kind, prompt)
@@ -427,15 +440,21 @@ end
 
 local function render_spinner(job)
   local buf = job.snapshot.buf
-  if job.phase ~= "generating" or not vim.api.nvim_buf_is_valid(buf) then
+  if job.phase ~= "generating" or job.invalidated or not vim.api.nvim_buf_is_valid(buf) then
     return false
   end
-  local position = job_position(job) or { job.snapshot.row, job.snapshot.column }
+  local position = job_position(job)
+  if not position then
+    if job.extmark then
+      return false
+    end
+    position = { job.snapshot.row, job.snapshot.column }
+  end
   local frames = config.activity.frames or {}
   local frame = frames[state.spinner_frame] or "⠋"
   local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, buf, activity_namespace, position[1], position[2], {
     id = job.extmark,
-    right_gravity = false,
+    right_gravity = true,
     strict = false,
     virt_text = {
       { " " .. frame .. " ", "SealSpinner" },
@@ -444,6 +463,7 @@ local function render_spinner(job)
     virt_text_pos = "inline",
     hl_mode = "combine",
     priority = 200,
+    undo_restore = true,
   })
   if not ok then
     return false
@@ -453,6 +473,8 @@ local function render_spinner(job)
 end
 
 local cancel_job
+local reconcile_buffer_lines
+local reconcile_buffer_tick
 
 function M._tick_activity()
   local frames = config.activity.frames or {}
@@ -464,7 +486,9 @@ function M._tick_activity()
     end
   end
   for _, job in ipairs(stale) do
-    cancel_job(job, true)
+    if cancel_job(job, true) then
+      notify_job_invalidation(job)
+    end
   end
   stop_spinner_if_idle()
 end
@@ -613,6 +637,10 @@ local function detach_job(job)
   sync_job_aliases()
   if not has_buffer_jobs(job.snapshot.buf) then
     restore_job_mappings(job.snapshot.buf)
+    local buffer_state = state.job_buffers[job.snapshot.buf]
+    if buffer_state then
+      buffer_state.idle = true
+    end
   end
   stop_spinner_if_idle()
   return true
@@ -640,6 +668,82 @@ cancel_job = function(job, interrupt)
   return true
 end
 
+local function schedule_job_cancellation(stale)
+  if #stale == 0 then
+    return
+  end
+  vim.schedule(function()
+    for _, job in ipairs(stale) do
+      if state.jobs[job.id] == job then
+        local changed = cancel_job(job, true)
+        if changed then
+          notify_job_invalidation(job)
+        end
+      end
+    end
+  end)
+end
+
+local function schedule_buffer_job_cancellation(buf)
+  local stale = {}
+  for _, job in pairs(state.jobs) do
+    if job.snapshot.buf == buf then
+      job.invalidated = true
+      table.insert(stale, job)
+    end
+  end
+  schedule_job_cancellation(stale)
+end
+
+local function ensure_job_buffer(buf)
+  if state.job_buffers[buf] then
+    state.job_buffers[buf].idle = false
+    return true
+  end
+  local token = {}
+  state.job_buffers[buf] = token
+  local attached = vim.api.nvim_buf_attach(buf, false, {
+    on_lines = function(_, changed_buf, changedtick, first, last, new_last)
+      if state.job_buffers[changed_buf] ~= token then
+        return true
+      end
+      if token.idle then
+        state.job_buffers[changed_buf] = nil
+        return true
+      end
+      reconcile_buffer_lines(changed_buf, changedtick, first, last, new_last)
+    end,
+    on_changedtick = function(_, changed_buf, changedtick)
+      if state.job_buffers[changed_buf] ~= token then
+        return true
+      end
+      if token.idle then
+        state.job_buffers[changed_buf] = nil
+        return true
+      end
+      reconcile_buffer_tick(changed_buf, changedtick)
+    end,
+    on_reload = function(_, changed_buf)
+      if state.job_buffers[changed_buf] ~= token then
+        return true
+      end
+      state.job_buffers[changed_buf] = nil
+      schedule_buffer_job_cancellation(changed_buf)
+      return true
+    end,
+    on_detach = function(_, changed_buf)
+      if state.job_buffers[changed_buf] == token then
+        state.job_buffers[changed_buf] = nil
+        schedule_buffer_job_cancellation(changed_buf)
+      end
+    end,
+  })
+  if not attached then
+    state.job_buffers[buf] = nil
+  end
+  return attached
+end
+
 local function clear_jobs(predicate, interrupt)
   local jobs = {}
   for _, job in pairs(state.jobs) do
@@ -656,6 +760,10 @@ end
 local function add_job(job)
   state.jobs[job.id] = job
   sync_job_aliases()
+  if not ensure_job_buffer(job.snapshot.buf) then
+    detach_job(job)
+    return false
+  end
   ensure_job_mappings(job.snapshot.buf)
   if not render_spinner(job) then
     detach_job(job)
@@ -1509,7 +1617,7 @@ end
 
 local function render_preview(job, lines)
   local snapshot = job.snapshot
-  if state.jobs[job.id] ~= job or not snapshot_valid(snapshot) then
+  if state.jobs[job.id] ~= job or job.invalidated or not snapshot_valid(snapshot) then
     notify("The buffer or file changed while Codex was working; result discarded", vim.log.levels.WARN)
     cancel_job(job, false)
     return false
@@ -1528,7 +1636,7 @@ local function render_preview(job, lines)
   end
   local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, snapshot.buf, activity_namespace, position[1], position[2], {
     id = job.extmark,
-    right_gravity = false,
+    right_gravity = true,
     strict = false,
     virt_lines = virtual_lines,
     virt_lines_above = true,
@@ -1538,6 +1646,7 @@ local function render_preview(job, lines)
     },
     virt_text_pos = "eol",
     priority = 200,
+    undo_restore = true,
   })
   if not ok then
     cancel_job(job, false)
@@ -1562,6 +1671,11 @@ function M._finish_generation(job)
   unsubscribe_thread(job.fork_id)
   if job.cancelled then
     cancel_job(job, false)
+    return
+  end
+  if job.invalidated then
+    cancel_job(job, false)
+    notify_job_invalidation(job)
     return
   end
   if job.turn_status ~= "completed" then
@@ -2020,6 +2134,9 @@ local function selected_job(job_id)
 end
 
 local function rebase_job(job, changedtick)
+  if job.invalidated then
+    return false
+  end
   local position = job_position(job)
   if not position or not vim.api.nvim_buf_is_valid(job.snapshot.buf) then
     return false
@@ -2028,35 +2145,83 @@ local function rebase_job(job, changedtick)
   if line ~= job.snapshot.line then
     return false
   end
-  local row_delta = position[1] - job.snapshot.row
   job.snapshot.row = position[1]
   job.snapshot.column = math.min(position[2], #line)
   job.snapshot.changedtick = changedtick
   job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = job.snapshot.buf })
-  if job.snapshot.selection_range and row_delta ~= 0 then
-    job.snapshot.selection_range.line1 = job.snapshot.selection_range.line1 + row_delta
-    job.snapshot.selection_range.line2 = job.snapshot.selection_range.line2 + row_delta
+  return true
+end
+
+local function rebase_selection(snapshot, first, last, new_last)
+  local selection = snapshot.selection_range
+  if not selection then
+    return true
+  end
+  local selection_first = selection.line1 - 1
+  local selection_last = selection.line2
+  local insertion = first == last
+  local intersects
+  if insertion then
+    intersects = first > selection_first and first < selection_last
+  else
+    intersects = first < selection_last and last > selection_first
+  end
+  if intersects then
+    return false
+  end
+  if last <= selection_first then
+    local delta = new_last - last
+    selection.line1 = selection.line1 + delta
+    selection.line2 = selection.line2 + delta
   end
   return true
 end
 
-local function rebase_jobs_after_insert(buf)
-  local changedtick = vim.api.nvim_buf_get_changedtick(buf)
-  state.internal_ticks[buf] = changedtick
+reconcile_buffer_lines = function(buf, changedtick, first, last, new_last)
   local stale = {}
   for _, job in pairs(state.jobs) do
-    if job.snapshot.buf == buf and not rebase_job(job, changedtick) then
-      table.insert(stale, job)
+    if job.snapshot.buf == buf and not job.invalidated then
+      local old_row = job.snapshot.row
+      local target_touched = first < last and first <= old_row and old_row < last
+      local expected_row = old_row
+      if last <= old_row then
+        expected_row = old_row + new_last - last
+      end
+      if target_touched
+        or not rebase_selection(job.snapshot, first, last, new_last)
+        or not rebase_job(job, changedtick)
+        or job.snapshot.row ~= expected_row
+      then
+        job.invalidated = true
+        if target_touched then
+          job.invalidation_reason = "The marked line changed; Seal job cancelled"
+        else
+          job.invalidation_reason = "The marked context changed; Seal job cancelled"
+        end
+        table.insert(stale, job)
+      end
     end
   end
-  for _, job in ipairs(stale) do
-    cancel_job(job, true)
+  schedule_job_cancellation(stale)
+end
+
+reconcile_buffer_tick = function(buf, changedtick)
+  for _, job in pairs(state.jobs) do
+    if job.snapshot.buf == buf and not job.invalidated then
+      job.snapshot.changedtick = changedtick
+      job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = buf })
+    end
   end
 end
 
 function M.accept(job_id)
   local job = selected_job(job_id)
   if not job then
+    return false
+  end
+  if job.invalidated then
+    cancel_job(job, true)
+    notify_job_invalidation(job)
     return false
   end
   if job.phase ~= "ready" then
@@ -2094,7 +2259,6 @@ function M.accept(job_id)
     notify("Could not insert the declaration: " .. tostring(insert_error), vim.log.levels.ERROR)
     return false
   end
-  rebase_jobs_after_insert(buf)
   notify("Declaration inserted")
   return true
 end
@@ -2315,7 +2479,7 @@ function M.setup(opts)
       local stale = {}
       for _, job in pairs(state.jobs) do
         if job.snapshot.buf == args.buf then
-          if job.snapshot.changedtick ~= changedtick or not matches_disk then
+          if not matches_disk or not rebase_job(job, changedtick) then
             table.insert(stale, job)
           else
             job.snapshot.file_stamp = current_disk.stamp
@@ -2325,14 +2489,13 @@ function M.setup(opts)
         end
       end
       for _, job in ipairs(stale) do
-        cancel_job(job, true)
+        if cancel_job(job, true) then
+          notify_job_invalidation(job)
+        end
       end
     end,
   })
   vim.api.nvim_create_autocmd({
-    "TextChanged",
-    "TextChangedI",
-    "TextChangedP",
     "BufFilePost",
     "BufUnload",
     "BufDelete",
@@ -2345,18 +2508,10 @@ function M.setup(opts)
       if buffer_closed then
         state.file_baselines[args.buf] = nil
         state.file_conflicts[args.buf] = nil
-        state.internal_ticks[args.buf] = nil
       end
       if chat and chat.buf == args.buf and buffer_closed then
         state.chat = nil
         state.chat_request = state.chat_request + 1
-      end
-      local internal_tick = state.internal_ticks[args.buf]
-      if internal_tick and args.event:find("TextChanged", 1, true) then
-        state.internal_ticks[args.buf] = nil
-        if vim.api.nvim_buf_is_valid(args.buf) and vim.api.nvim_buf_get_changedtick(args.buf) == internal_tick then
-          return
-        end
       end
       clear_jobs(function(job)
         return job.snapshot.buf == args.buf
@@ -2405,7 +2560,6 @@ M._reset = function()
   state.jobs = {}
   state.jobs_by_thread = {}
   state.job_mappings = {}
-  state.internal_ticks = {}
   state.spinner_timer = nil
   state.spinner_frame = 1
   state.job_sequence = 0

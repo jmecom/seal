@@ -74,7 +74,7 @@ Normal saves run through the editor's usual `BufWritePre` hooks, including forma
 
 Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
 
-Declaration jobs are anchored to their cursor lines. You can prompt several locations in one or more buffers, let the forks finish in any order, and accept each result from its marker. Accepting one result rebases non-overlapping jobs in the same buffer. Ordinary edits, completion/formatting edits, file changes, and workspace-writing main-thread turns cancel affected jobs rather than applying stale output. Accepted declarations format normally on the next save.
+Declaration jobs are anchored to their cursor lines. You can prompt several locations in one or more buffers, continue editing, let the forks finish in any order, and accept each result from its marker. Edits, undo, and formatting away from a marker re-anchor that job; changing its target line cancels it. External file changes and workspace-writing main-thread turns still discard affected jobs rather than applying stale output. Accepted declarations format normally on the next save.
 
 Seal never opens a terminal or Zellij pane. Normal turns can edit the workspace but use a non-interactive approval policy: sandbox escalation and user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
 
