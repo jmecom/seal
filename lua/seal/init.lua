@@ -3,6 +3,7 @@ local Chat = require("seal.chat")
 
 local M = {}
 local namespace = vim.api.nvim_create_namespace("seal-preview")
+local context_namespace = vim.api.nvim_create_namespace("seal-context")
 
 local defaults = {
   codex_command = "codex",
@@ -42,6 +43,8 @@ local state = {
   chat = nil,
   chat_request = 0,
   owned_turns = {},
+  file_baselines = {},
+  file_conflicts = {},
   sequence = 0,
   stopping = false,
 }
@@ -70,6 +73,206 @@ local function root_for_buffer(buf)
   local name = vim.api.nvim_buf_get_name(buf)
   local start = name ~= "" and vim.fs.dirname(name) or (vim.uv or vim.loop).cwd()
   return vim.fs.root(start, { ".git" }) or start
+end
+
+local function file_stamp(path)
+  if not path or path == "" then
+    return nil
+  end
+  local stat = (vim.uv or vim.loop).fs_stat(path)
+  if not stat then
+    return { missing = true }
+  end
+  return {
+    type = stat.type,
+    size = stat.size,
+    device = stat.dev,
+    inode = stat.ino,
+    mtime_sec = stat.mtime and stat.mtime.sec or nil,
+    mtime_nsec = stat.mtime and stat.mtime.nsec or nil,
+    ctime_sec = stat.ctime and stat.ctime.sec or nil,
+    ctime_nsec = stat.ctime and stat.ctime.nsec or nil,
+  }
+end
+
+local function file_digest(path)
+  if not path or path == "" then
+    return nil
+  end
+  local ok, contents = pcall(vim.fn.readblob, path)
+  if not ok then
+    return nil
+  end
+  return vim.fn.sha256(vim.fn.string(contents))
+end
+
+local function disk_state(path)
+  return {
+    stamp = file_stamp(path),
+    digest = file_digest(path),
+  }
+end
+
+local function same_disk_state(left, right)
+  if not left or not right then
+    return false
+  end
+  if left.digest ~= nil and right.digest ~= nil then
+    return left.digest == right.digest
+  end
+  return vim.deep_equal(left.stamp, right.stamp)
+end
+
+local function file_unchanged(path, stamp, digest)
+  if stamp == nil then
+    return true
+  end
+  return same_disk_state({ stamp = stamp, digest = digest }, disk_state(path))
+end
+
+local function buffer_matches_disk(buf, path)
+  if not path or path == "" then
+    return true
+  end
+  if not (vim.uv or vim.loop).fs_stat(path) then
+    return false
+  end
+
+  local disk_buf = vim.api.nvim_create_buf(false, true)
+  local fileencoding = vim.api.nvim_get_option_value("fileencoding", { buf = buf })
+  local fileformat = vim.api.nvim_get_option_value("fileformat", { buf = buf })
+  local binary = vim.api.nvim_get_option_value("binary", { buf = buf })
+  local read_options = {
+    "++enc=" .. (fileencoding ~= "" and fileencoding or vim.o.encoding),
+    "++ff=" .. fileformat,
+    binary and "++bin" or "++nobin",
+  }
+  local ok = pcall(vim.api.nvim_buf_call, disk_buf, function()
+    vim.cmd("silent noautocmd 0read " .. table.concat(read_options, " ") .. " " .. vim.fn.fnameescape(path))
+  end)
+  if not ok then
+    pcall(vim.api.nvim_buf_delete, disk_buf, { force = true })
+    return false
+  end
+  local disk_lines = vim.api.nvim_buf_get_lines(disk_buf, 0, -1, false)
+  pcall(vim.api.nvim_buf_delete, disk_buf, { force = true })
+  table.remove(disk_lines)
+  if #disk_lines == 0 then
+    disk_lines = { "" }
+  end
+  return vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), disk_lines)
+end
+
+local function remember_file_baseline(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local path = vim.api.nvim_buf_get_name(buf)
+  if path == "" then
+    state.file_baselines[buf] = nil
+    state.file_conflicts[buf] = nil
+    return
+  end
+  state.file_baselines[buf] = { path = path, disk = disk_state(path) }
+  state.file_conflicts[buf] = nil
+end
+
+local function latch_file_conflict(buf, path, reason)
+  state.file_conflicts[buf] = { path = path, reason = reason }
+end
+
+local function preflight_buffer(buf)
+  local path = vim.api.nvim_buf_get_name(buf)
+  if path == "" then
+    state.file_baselines[buf] = nil
+    state.file_conflicts[buf] = nil
+    return true
+  end
+
+  local baseline = state.file_baselines[buf]
+  if baseline and baseline.path ~= path then
+    state.file_baselines[buf] = nil
+    state.file_conflicts[buf] = nil
+    baseline = nil
+  end
+  local before = disk_state(path)
+  local modified = vim.api.nvim_get_option_value("modified", { buf = buf })
+  if baseline and not same_disk_state(baseline.disk, before) and (modified or before.digest == nil) then
+    latch_file_conflict(buf, path, before.digest == nil and "deleted" or "conflict")
+  end
+
+  local pending = state.file_conflicts[buf]
+  if pending and pending.path == path then
+    if before.digest ~= nil and buffer_matches_disk(buf, path) then
+      state.file_conflicts[buf] = nil
+      state.file_baselines[buf] = { path = path, disk = before }
+    else
+      return false, "the file changed on disk while the buffer has local changes (" .. pending.reason .. ")"
+    end
+  end
+
+  local conflict
+  local autocmd = vim.api.nvim_create_autocmd("FileChangedShell", {
+    buffer = buf,
+    once = true,
+    callback = function()
+      local reason = vim.v.fcs_reason
+      if not vim.api.nvim_get_option_value("modified", { buf = buf }) and reason ~= "deleted" then
+        vim.v.fcs_choice = "reload"
+      else
+        conflict = reason
+        latch_file_conflict(buf, path, reason)
+        vim.v.fcs_choice = ""
+      end
+    end,
+  })
+  local ok, check_error = pcall(vim.cmd, "checktime " .. buf)
+  pcall(vim.api.nvim_del_autocmd, autocmd)
+  if not ok then
+    return false, tostring(check_error)
+  end
+  if conflict then
+    return false, "the file changed on disk while the buffer has local changes (" .. conflict .. ")"
+  end
+  local current = disk_state(path)
+  pending = state.file_conflicts[buf]
+  if pending and pending.path == path then
+    if current.digest ~= nil and buffer_matches_disk(buf, path) then
+      state.file_conflicts[buf] = nil
+    else
+      return false, "the file changed on disk while the buffer has local changes (" .. pending.reason .. ")"
+    end
+  end
+  if current.digest ~= nil
+    and not vim.api.nvim_get_option_value("modified", { buf = buf })
+    and not buffer_matches_disk(buf, path)
+  then
+    return false, "the buffer does not match the file on disk"
+  end
+  state.file_baselines[buf] = { path = path, disk = current }
+  return true
+end
+
+local function check_unmodified_project_buffers(root)
+  local failures = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_is_loaded(buf)
+      and vim.api.nvim_get_option_value("buftype", { buf = buf }) == ""
+      and not vim.api.nvim_get_option_value("modified", { buf = buf })
+      and vim.api.nvim_buf_get_name(buf) ~= ""
+      and root_for_buffer(buf) == root
+    then
+      local path = vim.api.nvim_buf_get_name(buf)
+      local ok, check_error = pcall(vim.cmd, "checktime " .. buf)
+      if not ok then
+        table.insert(failures, tostring(check_error))
+      elseif file_digest(path) ~= nil and buffer_matches_disk(buf, path) then
+        remember_file_baseline(buf)
+      end
+    end
+  end
+  return failures
 end
 
 local function find_session_by_thread(thread_id)
@@ -185,6 +388,7 @@ local function handle_notification(method, params)
   if method == "turn/started" then
     local session = find_session_by_thread(params.threadId)
     if session and params.turn then
+      M.reject()
       session.active_turn_id = params.turn.id
       if refresh_chat then
         vim.schedule(function()
@@ -205,6 +409,14 @@ local function handle_notification(method, params)
           refresh_chat(params.threadId)
         end)
       end
+    end
+    if session then
+      vim.schedule(function()
+        local failures = check_unmodified_project_buffers(session.root)
+        if #failures > 0 then
+          notify("Could not check for Codex file changes: " .. table.concat(failures, "; "), vim.log.levels.WARN)
+        end
+      end)
     end
   end
 
@@ -444,6 +656,12 @@ local function bounded_excerpt(lines, cursor_row, selection)
   return truncate_text(text, budget), first, last
 end
 
+local function capture_selection(buf, line1, line2)
+  local selected_lines = vim.api.nvim_buf_get_lines(buf, line1 - 1, line2, false)
+  local selection_budget = math.floor(math.max(0, config.max_context_chars) / 2)
+  return truncate_text(table.concat(selected_lines, "\n"), selection_budget)
+end
+
 local function capture_snapshot(opts)
   opts = opts or {}
   local current_buf = vim.api.nvim_get_current_buf()
@@ -454,6 +672,11 @@ local function capture_snapshot(opts)
     and vim.api.nvim_buf_is_valid(state.chat.return_buf)
   local buf = from_chat and state.chat.return_buf or opts.buf or current_buf
   local win = opts.win or vim.api.nvim_get_current_win()
+  local ready, preflight_error = preflight_buffer(buf)
+  if not ready then
+    notify("Resolve the file conflict before using Seal: " .. preflight_error, vim.log.levels.WARN)
+    return nil
+  end
   local cursor
   if opts.cursor then
     cursor = opts.cursor
@@ -467,12 +690,25 @@ local function capture_snapshot(opts)
   local row = cursor[1]
   local current_line = lines[row] or ""
   local selection
+  local selection_range
   if not from_chat and opts.range and opts.range > 0 then
-    local selected_lines = vim.api.nvim_buf_get_lines(buf, opts.line1 - 1, opts.line2, false)
-    local selection_budget = math.floor(math.max(0, config.max_context_chars) / 2)
-    selection = truncate_text(table.concat(selected_lines, "\n"), selection_budget)
+    selection_range = { line1 = opts.line1, line2 = opts.line2 }
+    selection = capture_selection(buf, selection_range.line1, selection_range.line2)
   end
   local text, first, last = bounded_excerpt(lines, row, selection)
+  local file = vim.api.nvim_buf_get_name(buf)
+  local current_disk = disk_state(file)
+  local baseline = state.file_baselines[buf]
+  if baseline and baseline.path == file and not same_disk_state(baseline.disk, current_disk) then
+    latch_file_conflict(buf, file, current_disk.digest == nil and "deleted" or "conflict")
+    notify("The file changed on disk while Seal was capturing context; run the prompt again", vim.log.levels.WARN)
+    return nil
+  end
+  local modified = vim.api.nvim_get_option_value("modified", { buf = buf })
+  if current_disk.digest ~= nil and not modified and not buffer_matches_disk(buf, file) then
+    notify("The file changed on disk while Seal was capturing context; run the prompt again", vim.log.levels.WARN)
+    return nil
+  end
 
   return {
     buf = buf,
@@ -484,13 +720,16 @@ local function capture_snapshot(opts)
     replace_blank = current_line:match("^%s*$") ~= nil,
     base_indent = current_line:match("^%s*") or "",
     root = root_for_buffer(buf),
-    file = vim.api.nvim_buf_get_name(buf),
+    file = file,
+    file_stamp = current_disk.stamp,
+    file_digest = current_disk.digest,
     filetype = vim.api.nvim_get_option_value("filetype", { buf = buf }),
-    modified = vim.api.nvim_get_option_value("modified", { buf = buf }),
+    modified = modified,
     excerpt = text,
     excerpt_first = first,
     excerpt_last = last,
     selection = selection,
+    selection_range = selection_range,
   }
 end
 
@@ -501,6 +740,11 @@ local function refresh_snapshot(snapshot)
   local lines = vim.api.nvim_buf_get_lines(snapshot.buf, 0, -1, false)
   local row = math.max(1, math.min(snapshot.row + 1, #lines))
   local line = lines[row] or ""
+  if snapshot.selection_range then
+    local line1 = math.min(snapshot.selection_range.line1, #lines)
+    local line2 = math.min(snapshot.selection_range.line2, #lines)
+    snapshot.selection = capture_selection(snapshot.buf, line1, math.max(line1, line2))
+  end
   local text, first, last = bounded_excerpt(lines, row, snapshot.selection)
   snapshot.changedtick = vim.api.nvim_buf_get_changedtick(snapshot.buf)
   snapshot.row = row - 1
@@ -509,12 +753,141 @@ local function refresh_snapshot(snapshot)
   snapshot.replace_blank = line:match("^%s*$") ~= nil
   snapshot.base_indent = line:match("^%s*") or ""
   snapshot.file = vim.api.nvim_buf_get_name(snapshot.buf)
+  local current_disk = disk_state(snapshot.file)
+  snapshot.file_stamp = current_disk.stamp
+  snapshot.file_digest = current_disk.digest
   snapshot.filetype = vim.api.nvim_get_option_value("filetype", { buf = snapshot.buf })
   snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = snapshot.buf })
   snapshot.excerpt = text
   snapshot.excerpt_first = first
   snapshot.excerpt_last = last
   return snapshot
+end
+
+local function anchor_snapshot(snapshot)
+  local lines = vim.api.nvim_buf_get_lines(snapshot.buf, 0, -1, false)
+  local cursor_row = math.max(0, math.min(snapshot.row, #lines - 1))
+  local cursor_column = math.min(snapshot.column, #(lines[cursor_row + 1] or ""))
+  local anchors = {
+    lines = lines,
+    cursor_row = cursor_row,
+    cursor_column = cursor_column,
+    selection_range = snapshot.selection_range and vim.deepcopy(snapshot.selection_range) or nil,
+    ids = {},
+  }
+  anchors.ids.cursor = vim.api.nvim_buf_set_extmark(snapshot.buf, context_namespace, cursor_row, cursor_column, {
+    right_gravity = false,
+    strict = false,
+  })
+  if snapshot.selection_range then
+    local first = math.max(1, math.min(snapshot.selection_range.line1, #lines))
+    local last = math.max(first, math.min(snapshot.selection_range.line2, #lines))
+    anchors.ids.selection_start = vim.api.nvim_buf_set_extmark(snapshot.buf, context_namespace, first - 1, 0, {
+      right_gravity = false,
+      strict = false,
+    })
+    anchors.ids.selection_end = vim.api.nvim_buf_set_extmark(
+      snapshot.buf,
+      context_namespace,
+      last - 1,
+      #(lines[last] or ""),
+      { right_gravity = true, strict = false }
+    )
+  end
+  return anchors
+end
+
+local function map_formatted_row(old_lines, new_lines, old_row)
+  local ok, hunks = pcall(vim.diff, table.concat(old_lines, "\n") .. "\n", table.concat(new_lines, "\n") .. "\n", {
+    result_type = "indices",
+    algorithm = "histogram",
+    linematch = 1000,
+  })
+  if not ok then
+    return nil
+  end
+
+  local old_line = old_row + 1
+  local offset = 0
+  for _, hunk in ipairs(hunks) do
+    local old_start, old_count, new_start, new_count = unpack(hunk)
+    if old_count == 0 then
+      if old_line > old_start then
+        offset = offset + new_count
+      end
+    elseif old_line < old_start then
+      break
+    elseif old_line < old_start + old_count then
+      if new_count == 0 then
+        return math.max(0, math.min(new_start - 1, #new_lines - 1))
+      end
+      local relative = math.min(old_line - old_start, new_count - 1)
+      return math.max(0, math.min(new_start + relative - 1, #new_lines - 1))
+    else
+      offset = offset + new_count - old_count
+    end
+  end
+  return math.max(0, math.min(old_row + offset, #new_lines - 1))
+end
+
+local function restore_snapshot_anchors(snapshot, anchors)
+  if not anchors or not vim.api.nvim_buf_is_valid(snapshot.buf) then
+    return
+  end
+  local new_lines = vim.api.nvim_buf_get_lines(snapshot.buf, 0, -1, false)
+  local mapped_cursor = map_formatted_row(anchors.lines, new_lines, anchors.cursor_row)
+  local cursor = vim.api.nvim_buf_get_extmark_by_id(snapshot.buf, context_namespace, anchors.ids.cursor, {})
+  if mapped_cursor ~= nil then
+    snapshot.row = mapped_cursor
+    snapshot.column = math.min(anchors.cursor_column, #(new_lines[mapped_cursor + 1] or ""))
+    if #cursor == 2 and cursor[1] == mapped_cursor then
+      snapshot.column = cursor[2]
+    end
+  elseif #cursor == 2 then
+    snapshot.row = cursor[1]
+    snapshot.column = cursor[2]
+  end
+  if anchors.selection_range then
+    local first = map_formatted_row(anchors.lines, new_lines, anchors.selection_range.line1 - 1)
+    local last = map_formatted_row(anchors.lines, new_lines, anchors.selection_range.line2 - 1)
+    if first ~= nil and last ~= nil then
+      local extmark_first = vim.api.nvim_buf_get_extmark_by_id(
+        snapshot.buf,
+        context_namespace,
+        anchors.ids.selection_start,
+        {}
+      )
+      local extmark_last = vim.api.nvim_buf_get_extmark_by_id(
+        snapshot.buf,
+        context_namespace,
+        anchors.ids.selection_end,
+        {}
+      )
+      local selection_did_not_end_at_eof = anchors.selection_range.line2 < #anchors.lines
+      local extmark_last_row = #extmark_last == 2 and extmark_last[1] or nil
+      if extmark_last_row and extmark_last[2] == 0 and extmark_last_row > first then
+        extmark_last_row = extmark_last_row - 1
+      end
+      local extmark_swallowed_eof = #extmark_last == 2
+        and extmark_last_row == #new_lines - 1
+        and selection_did_not_end_at_eof
+      if #extmark_first == 2
+        and #extmark_last == 2
+        and extmark_first[1] == first
+        and extmark_last_row >= last
+        and not extmark_swallowed_eof
+      then
+        last = extmark_last_row
+      end
+      snapshot.selection_range = {
+        line1 = math.min(first, last) + 1,
+        line2 = math.max(first, last) + 1,
+      }
+    end
+  end
+  for _, id in pairs(anchors.ids) do
+    pcall(vim.api.nvim_buf_del_extmark, snapshot.buf, context_namespace, id)
+  end
 end
 
 local function editor_context(snapshot)
@@ -559,7 +932,9 @@ end
 
 local function snapshot_valid(snapshot)
   return vim.api.nvim_buf_is_valid(snapshot.buf)
+    and vim.api.nvim_buf_get_name(snapshot.buf) == snapshot.file
     and vim.api.nvim_buf_get_changedtick(snapshot.buf) == snapshot.changedtick
+    and file_unchanged(snapshot.file, snapshot.file_stamp, snapshot.file_digest)
 end
 
 local function strip_fence(text)
@@ -815,10 +1190,8 @@ local function previous_buffer_map(buf, lhs)
 end
 
 local function render_preview(snapshot, lines)
-  if not vim.api.nvim_buf_is_valid(snapshot.buf)
-    or vim.api.nvim_buf_get_changedtick(snapshot.buf) ~= snapshot.changedtick
-  then
-    notify("The buffer changed while Codex was working; result discarded", vim.log.levels.WARN)
+  if not snapshot_valid(snapshot) then
+    notify("The buffer or file changed while Codex was working; result discarded", vim.log.levels.WARN)
     return false
   end
 
@@ -852,6 +1225,9 @@ local function render_preview(snapshot, lines)
   state.preview = {
     buf = snapshot.buf,
     changedtick = snapshot.changedtick,
+    file = snapshot.file,
+    file_stamp = snapshot.file_stamp,
+    file_digest = snapshot.file_digest,
     row = snapshot.row,
     replace_blank = snapshot.replace_blank,
     lines = lines,
@@ -1150,22 +1526,77 @@ refresh_chat = function(thread_id)
   end
 end
 
+local function other_modified_project_buffers(root, source_buf)
+  local paths = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if buf ~= source_buf
+      and vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_is_loaded(buf)
+      and vim.api.nvim_get_option_value("buftype", { buf = buf }) == ""
+      and vim.api.nvim_get_option_value("modified", { buf = buf })
+    then
+      local path = vim.api.nvim_buf_get_name(buf)
+      if path ~= "" and root_for_buffer(buf) == root then
+        table.insert(paths, vim.fn.fnamemodify(path, ":~:."))
+      end
+    end
+  end
+  table.sort(paths)
+  return paths
+end
+
 local function start_agent(session, snapshot, prompt)
   if not snapshot_valid(snapshot) then
     notify("The source buffer changed while Codex was starting", vim.log.levels.WARN)
     return
   end
+  local modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
+  if #modified > 0 then
+    notify(
+      "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
+      vim.log.levels.WARN
+    )
+    return
+  end
+  M.reject()
   if config.save_before_agent and snapshot.modified and vim.api.nvim_buf_is_valid(snapshot.buf) then
+    local source_file = snapshot.file
+    local anchors = anchor_snapshot(snapshot)
     local ok, err = pcall(vim.api.nvim_buf_call, snapshot.buf, function()
       vim.cmd("silent update")
     end)
+    restore_snapshot_anchors(snapshot, anchors)
     if not ok then
       notify("Could not save the current buffer: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    if not vim.api.nvim_buf_is_valid(snapshot.buf) then
+      notify("The source buffer closed while it was being saved", vim.log.levels.ERROR)
+      return
+    end
+    if vim.api.nvim_buf_get_name(snapshot.buf) ~= source_file then
+      notify("The source buffer was renamed while it was being saved; run the prompt again", vim.log.levels.WARN)
       return
     end
     snapshot = refresh_snapshot(snapshot)
     if not snapshot then
       notify("The source buffer closed while it was being saved", vim.log.levels.ERROR)
+      return
+    end
+    if snapshot.modified or not buffer_matches_disk(snapshot.buf, snapshot.file) then
+      notify(
+        "Save or format hooks left the buffer different from disk; save again before starting Codex",
+        vim.log.levels.WARN
+      )
+      return
+    end
+    remember_file_baseline(snapshot.buf)
+    modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
+    if #modified > 0 then
+      notify(
+        "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
+        vim.log.levels.WARN
+      )
       return
     end
   end
@@ -1218,10 +1649,11 @@ function M.submit(text, opts)
     return false
   end
   local snapshot = opts.snapshot or capture_snapshot(opts)
-  if not vim.api.nvim_buf_is_valid(snapshot.buf)
-    or vim.api.nvim_buf_get_changedtick(snapshot.buf) ~= snapshot.changedtick
-  then
-    notify("The source buffer changed while the prompt was open", vim.log.levels.WARN)
+  if not snapshot then
+    return false
+  end
+  if not snapshot_valid(snapshot) then
+    notify("The source buffer or file changed while the prompt was open", vim.log.levels.WARN)
     return false
   end
   with_session_status(snapshot.root, function(session, thread_status)
@@ -1241,6 +1673,9 @@ end
 function M.prompt(opts)
   opts = opts or {}
   local snapshot = capture_snapshot(opts)
+  if not snapshot then
+    return
+  end
   local input = config.input or vim.ui.input
   input({ prompt = "Seal> " }, function(text)
     if text ~= nil then
@@ -1259,10 +1694,12 @@ function M.accept()
     return false
   end
   if not vim.api.nvim_buf_is_valid(preview.buf)
+    or vim.api.nvim_buf_get_name(preview.buf) ~= preview.file
     or vim.api.nvim_buf_get_changedtick(preview.buf) ~= preview.changedtick
+    or not file_unchanged(preview.file, preview.file_stamp, preview.file_digest)
   then
     clear_preview()
-    notify("The buffer changed; result discarded", vim.log.levels.WARN)
+    notify("The buffer or file changed; result discarded", vim.log.levels.WARN)
     return false
   end
 
@@ -1436,6 +1873,9 @@ function M.setup(opts)
     local context = { range = args.range, line1 = args.line1, line2 = args.line2 }
     if args.args ~= "" then
       context.snapshot = capture_snapshot(context)
+      if not context.snapshot then
+        return
+      end
       M.submit(args.args, context)
     else
       M.prompt(context)
@@ -1450,12 +1890,22 @@ function M.setup(opts)
   pcall(vim.api.nvim_del_user_command, "SealTerminal")
 
   local group = vim.api.nvim_create_augroup("Seal", { clear = true })
-  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "BufWipeout" }, {
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufWritePost" }, {
+    group = group,
+    callback = function(args)
+      remember_file_baseline(args.buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP", "BufWipeout" }, {
     group = group,
     callback = function(args)
       local preview = state.preview
       local generation = state.generation
       local chat = state.chat
+      if args.event == "BufWipeout" then
+        state.file_baselines[args.buf] = nil
+        state.file_conflicts[args.buf] = nil
+      end
       if chat and chat.buf == args.buf then
         state.chat = nil
         state.chat_request = state.chat_request + 1
@@ -1468,6 +1918,15 @@ function M.setup(opts)
     end,
   })
   vim.api.nvim_create_autocmd("VimLeavePre", { group = group, callback = M.stop })
+
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_is_loaded(buf)
+      and vim.api.nvim_buf_get_name(buf) ~= ""
+    then
+      remember_file_baseline(buf)
+    end
+  end
 
   if config.keymaps.prompt then
     vim.keymap.set("n", config.keymaps.prompt, M.prompt, { desc = "Seal prompt" })
@@ -1502,6 +1961,8 @@ M._reset = function()
   state.chat = nil
   state.chat_request = 0
   state.owned_turns = {}
+  state.file_baselines = {}
+  state.file_conflicts = {}
   state.sequence = 0
   state.stopping = false
   config = vim.deepcopy(defaults)

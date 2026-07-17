@@ -70,6 +70,12 @@ Recognized declaration prefixes are `fun`, `fn`, `function`, `type`, `class`, `m
 
 The current buffer, cursor, file type, and visual selection are attached as editor context. Normal agent prompts save the current modified buffer first so Codex does not edit an older on-disk version. Declaration forks are read-only and can use an unsaved buffer snapshot safely.
 
+Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. It refuses to start a writable turn while another project buffer has unsaved changes. After any main-thread turn, it reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
+
+Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
+
+Declaration previews never modify or save the buffer. They are discarded if the buffer or underlying file changes, if completion/formatting edits occur, or if a workspace-writing main-thread turn starts. Accepted declarations format normally on the next save.
+
 Seal never opens a terminal or Zellij pane. Normal turns can edit the workspace but use a non-interactive approval policy: sandbox escalation and user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
 
 `SealChat` replaces the current buffer with a read-only conversation view. Press `r` to refresh and `q` to return. It shows persisted user and Codex messages from the main thread while omitting tool activity, editor context attachments, and system instructions. Temporary declaration forks intentionally do not appear in this conversation.
