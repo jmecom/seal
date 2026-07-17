@@ -2255,6 +2255,52 @@ function tests.targeted_preserves_parallel_declaration_spinners()
   seal.reject(2)
 end
 
+function tests.targeted_patch_reload_preserves_unaffected_previews()
+  setup({ "local build = true", "", "local output = {}", "" }, { activity = { interval_ms = 100000 } })
+  local path = vim.fn.tempname() .. ".lua"
+  vim.api.nvim_buf_set_name(0, path)
+  vim.cmd("silent write")
+
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: log the build process")
+  complete_declaration("function log_build() end")
+  vim.api.nvim_win_set_cursor(0, { 4, 0 })
+  seal.submit("type: represent build output")
+  complete_declaration("BuildOutput = {}", "fork-thread-2", "fork-turn-2")
+  local first = seal._state.jobs[1]
+  local second = seal._state.jobs[2]
+  truthy(first and first.phase == "ready" and second and second.phase == "ready", "both previews should be ready")
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  seal.submit("targeted: add a build-file header")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+  vim.fn.writefile({ "-- targeted change", "local build = true", "", "local output = {}", "" }, path)
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+
+  truthy(vim.wait(1000, function()
+    return vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "-- targeted change"
+      and seal._state.jobs[1] == first
+      and seal._state.jobs[2] == second
+      and first.phase == "ready"
+      and second.phase == "ready"
+  end, 5), "an unrelated targeted patch should reload without discarding either preview")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local first_position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, first.extmark, {})
+  local second_position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, second.extmark, {})
+  equal(first_position[1], 2, "the function preview should follow the inserted header")
+  equal(second_position[1], 4, "the type preview should follow the inserted header")
+
+  seal.reject(1)
+  seal.reject(2)
+  vim.fn.delete(path)
+end
+
 function tests.attached_tui_turn_clears_an_existing_preview()
   setup({ "" })
   seal.submit("fun: focused change")
@@ -2546,6 +2592,7 @@ local order = {
   "reject_leaves_buffer_untouched",
   "freeform_preserves_an_existing_preview",
   "targeted_preserves_parallel_declaration_spinners",
+  "targeted_patch_reload_preserves_unaffected_previews",
   "attached_tui_turn_clears_an_existing_preview",
   "external_file_change_blocks_preview_acceptance",
   "external_file_change_blocks_preview_rendering",

@@ -818,7 +818,6 @@ local function ensure_job_buffer(buf)
         return true
       end
       state.job_buffers[changed_buf] = nil
-      schedule_buffer_job_cancellation(changed_buf)
       return true
     end,
     on_detach = function(_, changed_buf)
@@ -1935,6 +1934,7 @@ local function capture_snapshot(opts)
     excerpt_last = last,
     selection = selection,
     selection_range = selection_range,
+    source_lines = lines,
   }
 end
 
@@ -1966,6 +1966,7 @@ local function refresh_snapshot(snapshot)
   snapshot.excerpt = text
   snapshot.excerpt_first = first
   snapshot.excerpt_last = last
+  snapshot.source_lines = lines
   return snapshot
 end
 
@@ -2409,7 +2410,7 @@ local function validate_declaration(snapshot, lines, kind)
   return valid, reason
 end
 
-local function render_preview(job, lines)
+local function render_preview(job, lines, quiet)
   local snapshot = job.snapshot
   if state.jobs[job.id] ~= job or job.invalidated or not snapshot_valid(snapshot) then
     notify("The buffer or file changed while Codex was working; result discarded", vim.log.levels.WARN)
@@ -2451,7 +2452,9 @@ local function render_preview(job, lines)
   job.lines = lines
   sync_job_aliases()
   stop_spinner_if_idle()
-  notify("Declaration ready: Tab accepts, Esc rejects")
+  if not quiet then
+    notify("Declaration ready: Tab accepts, Esc rejects")
+  end
   return true
 end
 
@@ -3006,7 +3009,72 @@ local function rebase_job(job, changedtick)
   job.snapshot.column = math.min(position[2], #line)
   job.snapshot.changedtick = changedtick
   job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = job.snapshot.buf })
+  job.snapshot.source_lines = vim.api.nvim_buf_get_lines(job.snapshot.buf, 0, -1, false)
   return true
+end
+
+local function rebase_reloaded_job(job, changedtick, current_disk)
+  local snapshot = job.snapshot
+  if job.invalidated or not snapshot.source_lines or not vim.api.nvim_buf_is_valid(snapshot.buf) then
+    return false
+  end
+  if vim.api.nvim_buf_get_name(snapshot.buf) ~= snapshot.file then
+    return false
+  end
+
+  local new_lines = vim.api.nvim_buf_get_lines(snapshot.buf, 0, -1, false)
+  local mapped_row = map_formatted_row(snapshot.source_lines, new_lines, snapshot.row)
+  if mapped_row == nil or (new_lines[mapped_row + 1] or "") ~= snapshot.line then
+    return false
+  end
+
+  if snapshot.selection_range then
+    local old_first = snapshot.selection_range.line1
+    local old_last = snapshot.selection_range.line2
+    local mapped_first = map_formatted_row(snapshot.source_lines, new_lines, old_first - 1)
+    local mapped_last = map_formatted_row(snapshot.source_lines, new_lines, old_last - 1)
+    if mapped_first == nil
+      or mapped_last == nil
+      or not vim.deep_equal(
+        vim.list_slice(snapshot.source_lines, old_first, old_last),
+        vim.list_slice(new_lines, mapped_first + 1, mapped_last + 1)
+      )
+    then
+      return false
+    end
+    snapshot.selection_range = { line1 = mapped_first + 1, line2 = mapped_last + 1 }
+    snapshot.selection = capture_selection(snapshot.buf, mapped_first + 1, mapped_last + 1)
+  end
+
+  snapshot.row = mapped_row
+  snapshot.column = math.min(snapshot.column, #snapshot.line)
+  snapshot.changedtick = changedtick
+  snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = snapshot.buf })
+  snapshot.file_stamp = current_disk.stamp
+  snapshot.file_digest = current_disk.digest
+  snapshot.source_lines = new_lines
+  local excerpt_text, excerpt_first, excerpt_last = bounded_excerpt(new_lines, mapped_row + 1, snapshot.selection)
+  snapshot.excerpt = excerpt_text
+  snapshot.excerpt_first = excerpt_first
+  snapshot.excerpt_last = excerpt_last
+
+  if job.extmark then
+    pcall(vim.api.nvim_buf_del_extmark, snapshot.buf, activity_namespace, job.extmark)
+  end
+  job.extmark = nil
+  local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, snapshot.buf, activity_namespace, mapped_row, snapshot.column, {
+    right_gravity = true,
+    strict = false,
+    undo_restore = true,
+  })
+  if not ok then
+    return false
+  end
+  job.extmark = extmark
+  if job.phase == "ready" then
+    return render_preview(job, job.lines, true)
+  end
+  return render_spinner(job)
 end
 
 local function rebase_selection(snapshot, first, last, new_last)
@@ -3379,10 +3447,29 @@ function M.setup(opts)
     group = group,
     callback = function(args)
       if args.event == "BufReadPost" then
-        remember_file_baseline(args.buf)
-        clear_jobs(function(job)
-          return job.snapshot.buf == args.buf
-        end, true)
+        local path = vim.api.nvim_buf_get_name(args.buf)
+        local changedtick = vim.api.nvim_buf_get_changedtick(args.buf)
+        local current_disk = disk_state(path)
+        local matches_disk = buffer_matches_disk(args.buf, path)
+        if matches_disk then
+          remember_file_baseline(args.buf)
+        end
+        local stale = {}
+        for _, job in pairs(state.jobs) do
+          if job.snapshot.buf == args.buf
+            and (not matches_disk or not rebase_reloaded_job(job, changedtick, current_disk))
+          then
+            table.insert(stale, job)
+          end
+        end
+        if has_buffer_jobs(args.buf) then
+          ensure_job_buffer(args.buf)
+        end
+        for _, job in ipairs(stale) do
+          if cancel_job(job, true) then
+            notify_job_invalidation(job)
+          end
+        end
         clear_activities(function(activity)
           return activity.snapshot.buf == args.buf
         end)
