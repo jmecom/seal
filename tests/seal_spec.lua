@@ -147,7 +147,9 @@ local function setup(lines, overrides, before_setup)
   end
   buffer_sequence = buffer_sequence + 1
   vim.bo.filetype = "lua"
-  vim.api.nvim_buf_set_name(0, string.format("/tmp/seal-project/example-%d.lua", buffer_sequence))
+  local buffer_path = string.format("/tmp/seal-project/example-%d.lua", buffer_sequence)
+  vim.fn.delete(buffer_path)
+  vim.api.nvim_buf_set_name(0, buffer_path)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, lines or { "" })
   local undolevels = vim.bo.undolevels
   vim.bo.undolevels = -1
@@ -995,7 +997,12 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
   vim.fn.maparg("q", "n", false, true).callback()
   truthy(seal._state.reviews["51"] ~= nil, "closing the view should defer rather than approve the patch")
   truthy(seal.review("/tmp/seal-project"), ":SealReview should reopen the pending patch")
-  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  review = seal._state.reviews["51"]
+  equal(vim.api.nvim_get_current_buf(), review.view.buf, "the reopened review should be current")
+  truthy(review.warning == nil, "the unchanged review should remain acceptable: " .. tostring(review.warning))
+  local accept = vim.fn.maparg("<Tab>", "n", false, true)
+  truthy(type(accept.callback) == "function", "the reopened review should restore its accept mapping")
+  accept.callback()
   truthy(
     #fake.responses > 0,
     "acceptance should answer the app-server request: " .. vim.inspect(notifications[#notifications])
@@ -1062,9 +1069,10 @@ function tests.prompting_from_patch_review_targets_the_source_buffer()
   vim.fn.maparg("<Esc>", "n", false, true).callback()
 end
 
-function tests.changed_review_target_cannot_be_accepted()
+function tests.modified_review_target_is_saved_before_acceptance()
   setup({ "local value = 1" })
-  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  vim.fn.mkdir("/tmp/seal-project", "p")
+  vim.cmd("silent write")
   seal.submit("change this value")
   local source = vim.api.nvim_get_current_buf()
   local source_path = vim.api.nvim_buf_get_name(source)
@@ -1092,16 +1100,53 @@ function tests.changed_review_target_cannot_be_accepted()
 
   vim.api.nvim_buf_set_lines(source, 0, -1, false, { "local user_value = 3" })
   vim.fn.maparg("<Tab>", "n", false, true).callback()
-  local review = seal._state.reviews["52"]
-  truthy(review and review.warning, "the stale review should become non-acceptable")
-  truthy(vim.fn.maparg("<Tab>", "n", false, true).callback == nil, "the blocked review should remove acceptance")
-  equal(#fake.responses, 0, "a stale diff must not be approved")
-
-  vim.fn.maparg("<Esc>", "n", false, true).callback()
   equal(fake.responses[#fake.responses], {
     id = 52,
-    result = { decision = "decline" },
-  }, "Esc should safely reject the stale patch")
+    result = { decision = "accept" },
+  }, "Seal should approve after saving the local buffer")
+  equal(vim.api.nvim_get_option_value("modified", { buf = source }), false, "the local changes should be saved first")
+  equal(vim.fn.readfile(source_path), { "local user_value = 3" }, "saving must preserve the user's local edit")
+  truthy(seal._state.reviews["52"] == nil, "the accepted review should close")
+  vim.fn.delete(source_path)
+end
+
+function tests.external_review_target_change_remains_blocked()
+  setup({ "local value = 1" })
+  vim.fn.mkdir("/tmp/seal-project", "p")
+  vim.cmd("silent write")
+  local source_path = vim.api.nvim_buf_get_name(0)
+  seal.submit("change this value")
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = {
+      id = "patch-external",
+      type = "fileChange",
+      status = "inProgress",
+      changes = {
+        {
+          path = source_path,
+          kind = { type = "update" },
+          diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+        },
+      },
+    },
+  })
+  seal._server_request({
+    id = 68,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "patch-external" },
+  })
+  vim.fn.writefile({ "local external_value = 4" }, source_path)
+  local accept = vim.fn.maparg("<Tab>", "n", false, true)
+  truthy(type(accept.callback) == "function", "the initially safe review should offer acceptance")
+  accept.callback()
+
+  local review = seal._state.reviews["68"]
+  truthy(review and review.warning, "an external disk change should still block approval")
+  equal(#fake.responses, 0, "Seal must not approve over an external disk change")
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+  vim.fn.delete(source_path)
 end
 
 function tests.unsafe_patch_has_no_accept_mapping()
@@ -2634,7 +2679,8 @@ local order = {
   "server_request_is_resolved_without_an_interactive_client",
   "multi_file_patch_waits_for_review_and_acceptance",
   "prompting_from_patch_review_targets_the_source_buffer",
-  "changed_review_target_cannot_be_accepted",
+  "modified_review_target_is_saved_before_acceptance",
+  "external_review_target_change_remains_blocked",
   "unsafe_patch_has_no_accept_mapping",
   "command_approvals_auto_accept_by_default",
   "command_approval_warns_about_unpreviewed_writes",

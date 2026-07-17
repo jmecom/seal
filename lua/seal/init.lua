@@ -988,16 +988,31 @@ local function review_key(request_id)
   return tostring(request_id)
 end
 
+local function canonical_path(path)
+  local normalized = vim.fs.normalize(path)
+  local uv = vim.uv or vim.loop
+  local resolved = uv.fs_realpath(normalized)
+  if resolved then
+    return vim.fs.normalize(resolved)
+  end
+  local parent = vim.fs.dirname(normalized)
+  local resolved_parent = parent and uv.fs_realpath(parent)
+  if resolved_parent then
+    return vim.fs.normalize(resolved_parent .. "/" .. vim.fs.basename(normalized))
+  end
+  return normalized
+end
+
 local function normalized_change_path(root, path)
   if type(path) ~= "string" or path == "" then
     return nil
   end
   local absolute = path:sub(1, 1) == "/" or path:match("^%a:[/\\]")
-  return vim.fs.normalize(absolute and path or (root .. "/" .. path))
+  return canonical_path(absolute and path or (root .. "/" .. path))
 end
 
 local function path_in_root(root, path)
-  local normalized_root = vim.fs.normalize(root):gsub("/+$", "")
+  local normalized_root = canonical_path(root):gsub("/+$", "")
   local normalized = normalized_change_path(root, path)
   return normalized and normalized:sub(1, #normalized_root + 1) == normalized_root .. "/", normalized
 end
@@ -1011,7 +1026,7 @@ end
 
 local function buffer_for_path(path)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) and vim.fs.normalize(vim.api.nvim_buf_get_name(buf)) == path then
+    if vim.api.nvim_buf_is_valid(buf) and canonical_path(vim.api.nvim_buf_get_name(buf)) == path then
       return buf
     end
   end
@@ -1051,6 +1066,42 @@ local function review_safety(review)
     end
   end
   review.targets = targets
+end
+
+local function save_modified_review_targets(review)
+  local saved = 0
+  for path, target in pairs(review.targets or {}) do
+    if not same_disk_state(target.disk, disk_state(path)) then
+      return "A proposed file changed on disk while you were reviewing it: " .. path
+    end
+    local buf = buffer_for_path(path)
+    if buf and vim.api.nvim_get_option_value("modified", { buf = buf }) then
+      if target.disk.digest == nil then
+        return "Codex proposed creating a file that now has local editor changes: " .. path
+      end
+      local ok, save_error = pcall(vim.api.nvim_buf_call, buf, function()
+        vim.cmd("silent update")
+      end)
+      if not ok then
+        return "Could not save local changes before accepting the Codex patch: " .. tostring(save_error)
+      end
+      saved = saved + 1
+    end
+    if buf then
+      local current_disk = disk_state(path)
+      if vim.api.nvim_get_option_value("modified", { buf = buf })
+        or (current_disk.digest ~= nil and not buffer_matches_disk(buf, path))
+      then
+        return "Save or format hooks left the proposed file different from disk: " .. path
+      end
+      target.buf = buf
+      target.changedtick = vim.api.nvim_buf_get_changedtick(buf)
+      target.disk = current_disk
+    else
+      target.disk = disk_state(path)
+    end
+  end
+  return nil, saved
 end
 
 local function changed_review_target(review)
@@ -1142,12 +1193,22 @@ resolve_file_review = function(review, decision)
     return false
   end
   if decision == "accept" then
+    local save_error, saved = save_modified_review_targets(review)
+    if save_error then
+      review.warning = save_error
+      notify(save_error, vim.log.levels.WARN)
+      open_file_review(review)
+      return false
+    end
     local changed = changed_review_target(review)
     if changed then
       review.warning = changed
       notify(changed, vim.log.levels.WARN)
       open_file_review(review)
       return false
+    end
+    if saved > 0 then
+      notify(string.format("Saved local changes in %d reviewed file(s) before approval", saved))
     end
   end
   if not state.client or not state.client:respond(review.request_id, { decision = decision }) then
