@@ -898,14 +898,8 @@ end
 
 function tests.server_request_is_resolved_without_an_interactive_client()
   setup({ "" }, {
-    select = function(items, _, callback)
-      for _, item in ipairs(items) do
-        if item.decision == "decline" then
-          callback(item)
-          return
-        end
-      end
-      callback(nil)
+    select = function()
+      fail("automatic command approval should not require an interactive client")
     end,
   })
   seal._state.live["/tmp/project-a"] = { root = "/tmp/project-a", thread_id = "thread-a" }
@@ -917,9 +911,8 @@ function tests.server_request_is_resolved_without_an_interactive_client()
   })
   equal(fake.responses[#fake.responses], {
     id = 41,
-    result = { decision = "decline" },
-  }, "approval should be declined instead of hanging")
-  truthy(notifications[#notifications].message:find("declined", 1, true), "the declined interaction should be visible")
+    result = { decision = "accept" },
+  }, "command approval should be accepted instead of hanging")
 
   seal._server_request({
     id = 42,
@@ -1091,9 +1084,47 @@ function tests.unsafe_patch_has_no_accept_mapping()
   equal(fake.responses[#fake.responses].result.decision, "decline", "unsafe patches should remain rejectable")
 end
 
+function tests.command_approvals_auto_accept_by_default()
+  setup({ "" }, {
+    select = function()
+      fail("auto-approved commands must not open an input dialog")
+    end,
+  })
+  seal.submit("run the focused test")
+  seal._server_request({
+    id = 58,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "command-auto",
+      command = "make test",
+      availableDecisions = { "accept", "decline", "cancel" },
+    },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 58,
+    result = { decision = "accept" },
+  }, "commands should auto-accept without weakening file-change review")
+
+  seal._server_request({
+    id = 60,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "command-session-auto",
+      command = "make test",
+      availableDecisions = { "acceptForSession", "decline" },
+    },
+  })
+  equal(fake.responses[#fake.responses].result.decision, "acceptForSession", "Seal should honor the available accept form")
+end
+
 function tests.command_approval_warns_about_unpreviewed_writes()
   local approval_prompt
   setup({ "" }, {
+    auto_approve_commands = false,
     select = function(items, opts, callback)
       approval_prompt = opts.prompt
       callback(items[1])
@@ -1141,6 +1172,7 @@ end
 function tests.command_approval_honors_available_decisions()
   local labels
   setup({ "" }, {
+    auto_approve_commands = false,
     select = function(items, _, callback)
       labels = vim.tbl_map(function(item)
         return item.label
@@ -1166,6 +1198,7 @@ end
 
 function tests.dismissed_command_uses_the_advertised_cancel()
   setup({ "" }, {
+    auto_approve_commands = false,
     select = function(_, _, callback)
       callback(nil)
     end,
@@ -2550,6 +2583,7 @@ local order = {
   "multi_file_patch_waits_for_review_and_acceptance",
   "changed_review_target_cannot_be_accepted",
   "unsafe_patch_has_no_accept_mapping",
+  "command_approvals_auto_accept_by_default",
   "command_approval_warns_about_unpreviewed_writes",
   "command_approval_honors_available_decisions",
   "dismissed_command_uses_the_advertised_cancel",

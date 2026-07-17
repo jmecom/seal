@@ -13,6 +13,7 @@ local defaults = {
   main_sandbox = "workspace-write",
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
+  auto_approve_commands = true,
   save_before_agent = true,
   validate_declarations = false,
   activity = {
@@ -1310,6 +1311,25 @@ local function command_decision_choices(params, can_accept)
   return choices, fallback
 end
 
+local function automatic_command_decision(params)
+  local advertised = not_null(params.availableDecisions)
+  if type(advertised) ~= "table" then
+    return "accept"
+  end
+  local allowed = {}
+  for _, decision in ipairs(advertised) do
+    if type(decision) == "string" then
+      allowed[decision] = true
+    end
+  end
+  if allowed.accept then
+    return "accept"
+  end
+  if allowed.acceptForSession then
+    return "acceptForSession"
+  end
+end
+
 local function request_command_decision(request, item)
   local key = review_key(request.id)
   state.command_requests[key] = request
@@ -1600,8 +1620,15 @@ handle_server_request = function(request)
     open_file_review(review)
     return
   elseif request.method == "item/commandExecution/requestApproval" and not is_generation then
-    local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
-    request_command_decision(request, item)
+    local decision = config.auto_approve_commands and automatic_command_decision(params)
+    if decision then
+      if not state.client:respond(request.id, { decision = decision }) then
+        notify("Could not auto-approve the Codex command", vim.log.levels.ERROR)
+      end
+    else
+      local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
+      request_command_decision(request, item)
+    end
     return
   elseif request.method == "item/permissions/requestApproval" then
     state.client:respond(request.id, { permissions = {}, scope = "turn" })

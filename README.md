@@ -80,9 +80,9 @@ The project root, file path, file type, cursor line and byte column, nearby buff
 
 Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. It refuses to start a writable turn while another project buffer has unsaved changes. After any main-thread turn, it reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
 
-Normal Seal turns request Codex's `untrusted` approval policy with the user as reviewer. For every Seal-owned file-change approval app-server sends, Seal opens the complete patch in a read-only diff window before answering. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself is not atomic and can partially fail. Seal queues concurrent requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Seal disables acceptance if a target buffer or file differs from the state captured when the review opened.
+Normal Seal turns keep Codex's `untrusted` approval policy so file changes still reach Seal's review boundary. Seal auto-approves command-execution requests by default, while every Seal-owned file-change request opens the complete patch in a read-only diff window before Seal answers. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself is not atomic and can partially fail. Seal queues concurrent file-change requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Seal disables acceptance if a target buffer or file differs from the state captured when the review opened.
 
-This is an app-server approval UI, not a universal filesystem barrier. App-server can skip a prompt after another attached client grants session-wide approval, and custom Codex or Seal permission settings can disable prompts. If Codex asks to run an untrusted command, Seal shows its full command and requested scope in a separate dialog and warns that it has no diff preview. An accepted formatter, generator, script, MCP tool, or command can change files directly. Turns started from an attached Codex TUI use that TUI's permissions and are not presented as Seal-reviewed turns. Keep the workspace sandbox enabled; Seal's path checks are a review safeguard, not a replacement for it.
+This is an app-server approval UI, not a universal filesystem barrier. An auto-approved formatter, generator, script, MCP tool, or shell command can change files directly without a patch preview. App-server can also skip a prompt after another attached client grants session-wide approval, and custom Codex or Seal permission settings can disable prompts. Set `auto_approve_commands = false` to restore per-command dialogs. Turns started from an attached Codex TUI use that TUI's permissions and are not presented as Seal-reviewed turns. Keep the workspace sandbox enabled; Seal's path checks are a review safeguard, not a replacement for it.
 
 Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
 
@@ -104,6 +104,7 @@ require("seal").setup({
   main_sandbox = "workspace-write",
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
+  auto_approve_commands = true,
   save_before_agent = true,
   validate_declarations = false,
   activity = {
