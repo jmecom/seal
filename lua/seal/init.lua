@@ -1352,8 +1352,9 @@ end
 
 local function handle_notification(method, params)
   local notification_turn_id = params.turnId or (params.turn and params.turn.id)
+  local notification_owner
   if notification_turn_id then
-    owned_turn_context(params.threadId, notification_turn_id)
+    notification_owner = owned_turn_context(params.threadId, notification_turn_id)
   end
   if method == "item/started" or method == "item/completed" then
     remember_collab_threads(params)
@@ -1447,9 +1448,6 @@ local function handle_notification(method, params)
   if method == "turn/started" then
     local session = find_session_by_thread(params.threadId)
     if session and params.turn then
-      clear_jobs(function(job)
-        return job.snapshot.root == session.root
-      end, true)
       session.active_turn_id = params.turn.id
       local claimed_turn = false
       for _, activity in pairs(state.activities) do
@@ -1468,6 +1466,11 @@ local function handle_notification(method, params)
           root = session.root,
           thread_id = session.thread_id,
         }
+      end
+      if not claimed_turn and not notification_owner then
+        clear_jobs(function(job)
+          return job.snapshot.root == session.root
+        end, true)
       end
       if refresh_chat then
         vim.schedule(function()
@@ -2832,11 +2835,6 @@ local function start_agent(session, snapshot, prompt, activity)
       )
     end
   end
-  -- Once the workspace-writing request is sent, declarations derived from
-  -- this chat can become stale. Keep them until all save/format checks pass.
-  clear_jobs(function(job)
-    return job.snapshot.root == session.root
-  end, true)
   local method = session.active_turn_id and "turn/steer" or "turn/start"
   activity.thread_id = session.thread_id
   activity.turn_id = session.active_turn_id

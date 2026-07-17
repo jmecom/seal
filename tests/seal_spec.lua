@@ -1758,7 +1758,7 @@ function tests.delayed_old_client_exit_preserves_restarted_activity()
   seal.stop()
 end
 
-function tests.agent_turn_cancels_a_declaration_waiting_for_status()
+function tests.agent_turn_preserves_a_declaration_waiting_for_status()
   setup({ "" }, { activity = { interval_ms = 100000 } })
   local original_request = fake.request
   local held_read
@@ -1776,9 +1776,10 @@ function tests.agent_turn_cancels_a_declaration_waiting_for_status()
   end
 
   seal.submit("fun: stale pending declaration")
-  truthy(seal._state.jobs[1] ~= nil, "the declaration should have an immediate marker")
+  local job = seal._state.jobs[1]
+  truthy(job ~= nil, "the declaration should have an immediate marker")
   seal.submit("make a workspace change")
-  equal(vim.tbl_count(seal._state.jobs), 0, "a writable turn should cancel pending declarations in its project")
+  equal(seal._state.jobs[1], job, "a Seal-started writable turn should preserve the pending declaration")
 
   held_read({
     thread = {
@@ -1787,7 +1788,8 @@ function tests.agent_turn_cancels_a_declaration_waiting_for_status()
       status = { type = "idle" },
     },
   })
-  truthy(request(fake, "thread/fork") == nil, "the cancelled declaration must not fork after its status read returns")
+  truthy(request(fake, "thread/fork") ~= nil, "the preserved declaration should fork after its status read returns")
+  seal.reject(1)
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
@@ -2222,13 +2224,35 @@ function tests.reject_leaves_buffer_untouched()
   equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), { "" }, "reject must not edit the buffer")
 end
 
-function tests.freeform_clears_an_existing_preview()
+function tests.freeform_preserves_an_existing_preview()
   setup({ "" })
   seal.submit("fun: focused change")
   complete_declaration("function focused_change() end")
   truthy(seal._state.preview ~= nil, "declaration preview should exist before the freeform prompt")
   seal.submit("make a broader change")
-  truthy(seal._state.preview == nil, "a workspace-writing turn must clear the pending preview")
+  truthy(seal._state.preview ~= nil, "a Seal-started writable turn should preserve the pending preview")
+  seal.reject(1)
+end
+
+function tests.targeted_preserves_parallel_declaration_spinners()
+  setup({ "", "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: log the build process")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("type: represent build output")
+  local first = seal._state.jobs[1]
+  local second = seal._state.jobs[2]
+
+  seal.submit("targeted: connect build logging")
+  equal(vim.tbl_count(seal._state.jobs), 2, "targeted submission should preserve both declaration spinners")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+  equal(seal._state.jobs[1], first, "the function spinner should survive the targeted turn start")
+  equal(seal._state.jobs[2], second, "the type spinner should survive the targeted turn start")
+
+  seal.reject(1)
+  seal.reject(2)
 end
 
 function tests.attached_tui_turn_clears_an_existing_preview()
@@ -2501,7 +2525,7 @@ local order = {
   "session_read_failure_clears_immediate_agent_spinner",
   "app_server_start_failure_clears_immediate_spinners",
   "delayed_old_client_exit_preserves_restarted_activity",
-  "agent_turn_cancels_a_declaration_waiting_for_status",
+  "agent_turn_preserves_a_declaration_waiting_for_status",
   "spinner_is_anchored_and_animates_in_place",
   "mapping_away_from_marker_preserves_global_behavior",
   "rejecting_one_parallel_job_keeps_its_sibling",
@@ -2520,7 +2544,8 @@ local order = {
   "parallel_results_complete_and_accept_out_of_order",
   "preview_accepts_as_one_edit",
   "reject_leaves_buffer_untouched",
-  "freeform_clears_an_existing_preview",
+  "freeform_preserves_an_existing_preview",
+  "targeted_preserves_parallel_declaration_spinners",
   "attached_tui_turn_clears_an_existing_preview",
   "external_file_change_blocks_preview_acceptance",
   "external_file_change_blocks_preview_rendering",
