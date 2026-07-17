@@ -786,17 +786,20 @@ function tests.wiped_chat_ignores_a_delayed_refresh()
   equal(vim.api.nvim_get_current_buf(), source, "a delayed refresh must not steal focus")
 end
 
-function tests.declaration_waits_for_active_main_turn()
+function tests.declaration_forks_during_active_main_turn()
   setup({ "" })
-  seal.submit("first prompt")
+  seal.submit("targeted: make the surrounding change")
   fake.thread_status = { type = "active", activeFlags = {} }
   seal._notification("turn/started", {
     threadId = "main-thread",
-    turn = { id = "active-turn", status = "inProgress" },
+    turn = { id = "main-turn", status = "inProgress" },
   })
-  seal.submit("fun: wait for consistency")
-  truthy(request(fake, "thread/fork") == nil, "declaration must not fork an in-progress transcript")
-  truthy(notifications[#notifications].message:find(":SealChat", 1, true), "busy declaration should point to the chat")
+  seal.submit("fun: run alongside the targeted turn")
+  local fork = request(fake, "thread/fork")
+  truthy(fork ~= nil, "a declaration should fork while the targeted turn is in progress")
+  equal(fork.params.threadId, "main-thread", "the parallel declaration should retain the backing chat context")
+  equal(request(fake, "turn/start").params.threadId, "fork-thread", "the declaration should start on its fork")
+  seal.reject(1)
 end
 
 function tests.declaration_uses_safe_ephemeral_fork()
@@ -1008,6 +1011,55 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
     turn = { id = "main-turn", status = "completed" },
   })
   equal(vim.tbl_count(seal._state.activities), 0, "the marker should clear only when the turn finishes")
+end
+
+function tests.prompting_from_patch_review_targets_the_source_buffer()
+  setup({ "local value = 1", "" })
+  local source = vim.api.nvim_get_current_buf()
+  local source_path = vim.api.nvim_buf_get_name(source)
+  seal.submit("targeted: update the value")
+  fake.thread_status = { type = "active", activeFlags = {} }
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = {
+      id = "patch-prompt",
+      type = "fileChange",
+      status = "inProgress",
+      changes = {
+        {
+          path = source_path,
+          kind = { type = "update" },
+          diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+        },
+      },
+    },
+  })
+  seal._server_request({
+    id = 69,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "patch-prompt" },
+  })
+  local review = seal._state.reviews["69"]
+  truthy(review and vim.api.nvim_get_current_buf() == review.view.buf, "the patch review should be current")
+  equal(vim.bo.modifiable, false, "the patch review should remain read-only")
+
+  local snapshot = seal._capture()
+  equal(snapshot.buf, source, "a prompt opened from the review should capture the underlying source")
+  seal.submit("fun: read the value", { snapshot = snapshot })
+  equal(review.view, nil, "submitting should defer the patch review")
+  equal(vim.api.nvim_get_current_buf(), source, "submitting should return to the source buffer")
+  equal(vim.bo.modifiable, true, "Seal must not leave the source buffer read-only")
+  equal(seal._state.jobs[1].snapshot.buf, source, "the declaration should belong to the source buffer")
+  truthy(request(fake, "thread/fork") ~= nil, "the declaration should fork during the active targeted turn")
+
+  seal.reject(1)
+  seal.review("/tmp/seal-project")
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
 end
 
 function tests.changed_review_target_cannot_be_accepted()
@@ -2573,7 +2625,7 @@ local order = {
   "chat_reads_and_renders_the_backing_thread",
   "attach_copies_the_real_tui_command",
   "wiped_chat_ignores_a_delayed_refresh",
-  "declaration_waits_for_active_main_turn",
+  "declaration_forks_during_active_main_turn",
   "declaration_uses_safe_ephemeral_fork",
   "interface_prefix_requests_api_without_implementation",
   "first_declaration_handles_empty_main_thread",
@@ -2581,6 +2633,7 @@ local order = {
   "null_thread_settings_are_omitted_from_forks",
   "server_request_is_resolved_without_an_interactive_client",
   "multi_file_patch_waits_for_review_and_acceptance",
+  "prompting_from_patch_review_targets_the_source_buffer",
   "changed_review_target_cannot_be_accepted",
   "unsafe_patch_has_no_accept_mapping",
   "command_approvals_auto_accept_by_default",

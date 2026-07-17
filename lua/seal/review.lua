@@ -70,6 +70,9 @@ local function dimensions(lines)
 end
 
 function M.open(opts)
+  local return_win = vim.api.nvim_get_current_win()
+  local return_buf = vim.api.nvim_get_current_buf()
+  local return_cursor = vim.api.nvim_win_get_cursor(return_win)
   local lines = M.lines(opts.changes, opts.root, opts.warning)
   local width, height = dimensions(lines)
   local buf = vim.api.nvim_create_buf(false, true)
@@ -97,7 +100,14 @@ function M.open(opts)
   })
   vim.api.nvim_set_option_value("wrap", false, { win = win })
 
-  local view = { buf = buf, win = win, closed = false }
+  local view = {
+    buf = buf,
+    win = win,
+    closed = false,
+    return_win = return_win,
+    return_buf = return_buf,
+    return_cursor = return_cursor,
+  }
 
   function view:close()
     if self.closed then

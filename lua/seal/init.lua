@@ -1893,16 +1893,33 @@ local function capture_selection(buf, line1, line2)
   return truncate_text(table.concat(selected_lines, "\n"), selection_budget)
 end
 
+local function review_for_buffer(buf)
+  for _, review in pairs(state.reviews) do
+    if review.view and review.view.buf == buf and not review.view.closed then
+      return review
+    end
+  end
+end
+
 local function capture_snapshot(opts)
   opts = opts or {}
   local current_buf = vim.api.nvim_get_current_buf()
+  local source_review = not opts.buf and review_for_buffer(current_buf) or nil
   local from_chat = not opts.buf
     and state.chat
     and state.chat.buf == current_buf
     and state.chat.return_buf
     and vim.api.nvim_buf_is_valid(state.chat.return_buf)
-  local buf = from_chat and state.chat.return_buf or opts.buf or current_buf
-  local win = opts.win or vim.api.nvim_get_current_win()
+  local review_buf = source_review and source_review.view.return_buf
+  if review_buf and state.chat and review_buf == state.chat.buf then
+    review_buf = state.chat.return_buf
+  end
+  local from_review = review_buf and vim.api.nvim_buf_is_valid(review_buf)
+  local buf = from_chat and state.chat.return_buf or from_review and review_buf or opts.buf or current_buf
+  local review_win = source_review and source_review.view.return_win
+  local win = opts.win
+    or (from_review and review_win and vim.api.nvim_win_is_valid(review_win) and review_win)
+    or vim.api.nvim_get_current_win()
   local ready, preflight_error = preflight_buffer(buf)
   if not ready then
     notify("Resolve the file conflict before using Seal: " .. preflight_error, vim.log.levels.WARN)
@@ -1914,6 +1931,12 @@ local function capture_snapshot(opts)
   elseif from_chat then
     local source_window = vim.fn.bufwinid(buf)
     cursor = source_window ~= -1 and vim.api.nvim_win_get_cursor(source_window) or state.chat.return_cursor or { 1, 0 }
+  elseif from_review then
+    local source_window = vim.fn.bufwinid(buf)
+    cursor = source_window ~= -1
+        and vim.api.nvim_win_get_cursor(source_window)
+      or source_review.view.return_cursor
+      or { 1, 0 }
   else
     cursor = vim.api.nvim_win_get_cursor(win)
   end
@@ -1922,7 +1945,7 @@ local function capture_snapshot(opts)
   local current_line = lines[row] or ""
   local selection
   local selection_range
-  if not from_chat and opts.range and opts.range > 0 then
+  if not from_chat and not from_review and opts.range and opts.range > 0 then
     selection_range = { line1 = opts.line1, line2 = opts.line2 }
     selection = capture_selection(buf, selection_range.line1, selection_range.line2)
   end
@@ -2944,6 +2967,7 @@ end
 
 function M.submit(text, opts)
   opts = opts or {}
+  local submitting_review = review_for_buffer(vim.api.nvim_get_current_buf())
   local route = route_prompt(text)
   if vim.trim(route.prompt) == "" and route.mode == "agent" then
     return false
@@ -2955,6 +2979,11 @@ function M.submit(text, opts)
   if not snapshot_valid(snapshot) then
     notify("The source buffer or file changed while the prompt was open", vim.log.levels.WARN)
     return false
+  end
+  if submitting_review and submitting_review.view then
+    submitting_review.view:close()
+    submitting_review.view = nil
+    notify("Patch review deferred; use :SealReview to reopen it")
   end
   local declaration_job
   local agent_activity
@@ -2979,13 +3008,8 @@ function M.submit(text, opts)
       return false
     end
   end
-  with_session_status(snapshot.root, function(session, thread_status)
+  with_session_status(snapshot.root, function(session)
     if route.mode == "declaration" then
-      if thread_status ~= "idle" then
-        cancel_job(declaration_job, false)
-        notify("Finish the active Codex turn before generating a declaration; use :SealChat to inspect it", vim.log.levels.WARN)
-        return
-      end
       start_declaration(session, snapshot, route, declaration_job)
     else
       start_agent(session, snapshot, routed_agent_prompt(route), agent_activity)
