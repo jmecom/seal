@@ -1477,8 +1477,19 @@ function tests.stale_result_is_discarded()
   truthy(notifications[#notifications].message:find("changed", 1, true), "stale result should explain why it was discarded")
 end
 
-function tests.multiple_declarations_are_rejected()
+function tests.python_type_alias_reaches_preview_by_default()
   setup({ "" })
+  vim.bo.filetype = "python"
+  vim.api.nvim_buf_set_name(0, "/tmp/seal-project/storage_types.py")
+  seal.submit("type: represent values stored on disk")
+  complete_declaration("StorageValue: TypeAlias = dict[str, str]")
+
+  truthy(seal._state.preview ~= nil, "a Python type-alias expression should reach the manual preview")
+  seal.reject()
+end
+
+function tests.multiple_declarations_are_rejected()
+  setup({ "" }, { validate_declarations = true })
   seal.submit("fun: too many")
   seal._notification("item/completed", {
     threadId = "fork-thread",
@@ -1502,7 +1513,7 @@ function tests.multiple_declarations_are_rejected()
 end
 
 function tests.wrong_declaration_kind_is_rejected()
-  setup({ "" })
+  setup({ "" }, { validate_declarations = true })
   seal.submit("fun: not actually a function")
   seal._notification("item/completed", {
     threadId = "fork-thread",
@@ -1526,7 +1537,7 @@ function tests.wrong_declaration_kind_is_rejected()
 end
 
 function tests.wrapper_with_multiple_functions_is_rejected()
-  setup({ "" })
+  setup({ "" }, { validate_declarations = true })
   local snapshot = seal._capture()
   local valid = seal._validate_declaration(snapshot, {
     "do",
@@ -1538,7 +1549,7 @@ function tests.wrapper_with_multiple_functions_is_rejected()
 end
 
 function tests.javascript_arrow_function_is_accepted()
-  setup({ "" })
+  setup({ "" }, { validate_declarations = true })
   vim.bo.filetype = "javascript"
   local snapshot = seal._capture()
   local valid, reason = seal._validate_declaration(snapshot, { "const load = () => true;" }, "function")
@@ -1634,6 +1645,7 @@ local order = {
   "buffer_rename_blocks_preview_acceptance",
   "completion_text_change_cancels_generation",
   "stale_result_is_discarded",
+  "python_type_alias_reaches_preview_by_default",
   "multiple_declarations_are_rejected",
   "wrong_declaration_kind_is_rejected",
   "wrapper_with_multiple_functions_is_rejected",

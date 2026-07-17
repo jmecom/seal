@@ -12,7 +12,7 @@ Codex owns the agent loop, tools, conversation history, and compaction. Seal kee
 ## Requirements
 
 - Neovim 0.11 or newer
-- A Tree-sitter parser for languages where declaration prefixes are used
+- A Tree-sitter parser only if declaration validation is explicitly enabled
 - Go 1.23 or newer for the small bridge binary
 - Codex CLI with `app-server`, `--remote`, and `thread/fork` support
 
@@ -82,7 +82,7 @@ Seal never opens a terminal or Zellij pane. Normal turns can edit the workspace 
 
 The backing session is a normal Codex app-server thread. To use the full Codex TUI for that exact conversation, run `:SealAttach`, switch to your existing Zellij terminal pane, and paste the copied command. Seal only copies the `codex resume --remote ...` command; it never creates or controls the pane.
 
-Before showing a declaration, Seal parses the proposed full buffer with Tree-sitter and verifies that the inserted range contains one syntax unit of the requested kind. A parser for the current file type must be installed. Set `validate_declarations = false` only if you prefer manual preview review for an unsupported language.
+Seal does not block model output based on language-specific AST shapes. Prefixes constrain the Codex prompt, and the inline preview plus `Tab` is the approval boundary. Set `validate_declarations = true` to opt into the stricter Tree-sitter check that requires one syntax unit of the requested kind.
 
 ## Configure
 
@@ -92,7 +92,7 @@ require("seal").setup({
   main_sandbox = "workspace-write",
   main_approval_policy = "never",
   save_before_agent = true,
-  validate_declarations = true,
+  validate_declarations = false,
   activity = {
     interval_ms = 80,
     max_summary_cells = 56,
