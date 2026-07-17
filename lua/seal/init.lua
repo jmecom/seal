@@ -61,11 +61,13 @@ local state = {
   loading = {},
   jobs = {},
   jobs_by_thread = {},
+  activities = {},
   job_mappings = {},
   job_buffers = {},
   spinner_timer = nil,
   spinner_frame = 1,
   job_sequence = 0,
+  activity_sequence = 0,
   -- Kept as aliases for callers that only need the old single-job booleans.
   generation = nil,
   preview = nil,
@@ -404,6 +406,19 @@ local function has_generating_jobs()
   return false
 end
 
+local function has_generating_activities()
+  for _, activity in pairs(state.activities) do
+    if activity.phase == "generating" then
+      return true
+    end
+  end
+  return false
+end
+
+local function has_spinner_work()
+  return has_generating_jobs() or has_generating_activities()
+end
+
 local function has_buffer_jobs(buf)
   for _, job in pairs(state.jobs) do
     if job.snapshot.buf == buf then
@@ -453,7 +468,7 @@ local function summary_text(kind, prompt)
 end
 
 local function stop_spinner_if_idle()
-  if has_generating_jobs() or not state.spinner_timer then
+  if has_spinner_work() or not state.spinner_timer then
     return
   end
   pcall(vim.fn.timer_stop, state.spinner_timer)
@@ -498,6 +513,7 @@ end
 local cancel_job
 local reconcile_buffer_lines
 local reconcile_buffer_tick
+local remove_activity
 
 function M._tick_activity()
   local frames = config.activity.frames or {}
@@ -508,16 +524,25 @@ function M._tick_activity()
       table.insert(stale, job)
     end
   end
+  local stale_activities = {}
+  for _, activity in pairs(state.activities) do
+    if activity.phase == "generating" and not render_spinner(activity) then
+      table.insert(stale_activities, activity)
+    end
+  end
   for _, job in ipairs(stale) do
     if cancel_job(job, true) then
       notify_job_invalidation(job)
     end
   end
+  for _, activity in ipairs(stale_activities) do
+    remove_activity(activity)
+  end
   stop_spinner_if_idle()
 end
 
 local function ensure_spinner()
-  if state.spinner_timer or not has_generating_jobs() then
+  if state.spinner_timer or not has_spinner_work() then
     return
   end
   local timer
@@ -527,6 +552,48 @@ local function ensure_spinner()
     end
   end, { ["repeat"] = -1 })
   state.spinner_timer = timer
+end
+
+local function add_activity(snapshot, kind, prompt)
+  state.activity_sequence = state.activity_sequence + 1
+  local activity = {
+    id = state.activity_sequence,
+    phase = "generating",
+    snapshot = snapshot,
+    root = snapshot.root,
+    summary = summary_text(kind, prompt),
+  }
+  state.activities[activity.id] = activity
+  if not render_spinner(activity) then
+    state.activities[activity.id] = nil
+    return nil
+  end
+  ensure_spinner()
+  return activity
+end
+
+remove_activity = function(activity)
+  if not activity or state.activities[activity.id] ~= activity then
+    return false
+  end
+  state.activities[activity.id] = nil
+  if activity.extmark and vim.api.nvim_buf_is_valid(activity.snapshot.buf) then
+    pcall(vim.api.nvim_buf_del_extmark, activity.snapshot.buf, activity_namespace, activity.extmark)
+  end
+  stop_spinner_if_idle()
+  return true
+end
+
+local function clear_activities(predicate)
+  local activities = {}
+  for _, activity in pairs(state.activities) do
+    if not predicate or predicate(activity) then
+      table.insert(activities, activity)
+    end
+  end
+  for _, activity in ipairs(activities) do
+    remove_activity(activity)
+  end
 end
 
 local function restore_job_mappings(buf)
@@ -1339,6 +1406,9 @@ local function handle_notification(method, params)
       end)
       clear_command_requests(params.threadId)
       state.owned_threads[params.threadId] = nil
+      clear_activities(function(activity)
+        return activity.thread_id == params.threadId
+      end)
     end
     return
   end
@@ -1369,15 +1439,36 @@ local function handle_notification(method, params)
     end)
     clear_command_requests(params.threadId)
     state.owned_threads[params.threadId] = nil
+    clear_activities(function(activity)
+      return activity.thread_id == params.threadId
+    end)
     return
   end
   if method == "turn/started" then
     local session = find_session_by_thread(params.threadId)
     if session and params.turn then
       clear_jobs(function(job)
-        return job.source_thread_id == session.thread_id
+        return job.snapshot.root == session.root
       end, true)
       session.active_turn_id = params.turn.id
+      local claimed_turn = false
+      for _, activity in pairs(state.activities) do
+        if activity.thread_id == params.threadId and (activity.start_pending or not activity.turn_id) then
+          if activity.provisional_turn_id and activity.provisional_turn_id ~= params.turn.id then
+            state.owned_turns[activity.provisional_turn_id] = nil
+          end
+          activity.turn_id = params.turn.id
+          activity.start_pending = false
+          activity.provisional_turn_id = nil
+          claimed_turn = true
+        end
+      end
+      if claimed_turn then
+        state.owned_turns[params.turn.id] = {
+          root = session.root,
+          thread_id = session.thread_id,
+        }
+      end
       if refresh_chat then
         vim.schedule(function()
           refresh_chat(params.threadId)
@@ -1414,6 +1505,17 @@ local function handle_notification(method, params)
     end)
     clear_approval_items(params.threadId, completed_turn_id)
     clear_command_requests(params.threadId, completed_turn_id)
+    clear_activities(function(activity)
+      if activity.thread_id ~= params.threadId then
+        return false
+      end
+      local matches = not completed_turn_id or activity.turn_id == completed_turn_id
+      if matches and activity.steer_pending then
+        activity.completed_while_steering = completed_turn_id or true
+        return false
+      end
+      return matches
+    end)
     local completed_root = session and session.root
       or (type(completed_owner) == "table" and not completed_owner.parent_turn_id and completed_owner.root)
     if completed_root then
@@ -1521,22 +1623,38 @@ local function client()
   if state.client then
     return state.client
   end
-  state.client = Client.new({
+  local active_client
+  active_client = Client.new({
     bridge = config.bridge,
     codex_command = config.codex_command,
     transport_factory = config.transport_factory,
-    on_notification = handle_notification,
-    on_server_request = handle_server_request,
+    on_notification = function(method, params)
+      if state.client == active_client then
+        handle_notification(method, params)
+      end
+    end,
+    on_server_request = function(request)
+      if state.client == active_client then
+        handle_server_request(request)
+      end
+    end,
     on_error = function(message)
-      notify(message, vim.log.levels.ERROR)
+      if state.client == active_client then
+        notify(message, vim.log.levels.ERROR)
+      end
     end,
     on_exit = function(_, expected)
+      if state.client ~= active_client then
+        return
+      end
       state.live = {}
+      state.loading = {}
       state.owned_turns = {}
       state.owned_threads = {}
       state.approval_items = {}
       state.accepted_file_items = {}
       state.resolved_requests = {}
+      clear_activities()
       clear_reviews()
       clear_command_requests()
       local had_generating = has_generating_jobs()
@@ -1550,7 +1668,8 @@ local function client()
     end,
     on_log = config.on_log,
   })
-  return state.client
+  state.client = active_client
+  return active_client
 end
 
 local function remember_thread(root, result)
@@ -1571,13 +1690,17 @@ local function remember_thread(root, result)
   return session
 end
 
-local function start_thread(root, callback)
-  client():request("thread/start", {
+local function start_thread(root, callback, requesting_client)
+  requesting_client = requesting_client or client()
+  requesting_client:request("thread/start", {
     cwd = root,
     sandbox = config.main_sandbox,
     approvalPolicy = config.main_approval_policy,
     approvalsReviewer = config.main_approvals_reviewer,
   }, function(result, err)
+    if state.client ~= requesting_client then
+      return
+    end
     if err or not result or not result.thread then
       callback(nil, error_message(err, "could not start a Codex thread"))
       return
@@ -1586,8 +1709,11 @@ local function start_thread(root, callback)
   end)
 end
 
-local function finish_session_load(root, session, err)
-  local callbacks = state.loading[root] or {}
+local function finish_session_load(root, loading, session, err)
+  if state.loading[root] ~= loading then
+    return
+  end
+  local callbacks = loading.callbacks
   state.loading[root] = nil
   for _, callback in ipairs(callbacks) do
     callback(session, err)
@@ -1600,45 +1726,58 @@ local function ensure_session(root, callback)
     return
   end
   if state.loading[root] then
-    table.insert(state.loading[root], callback)
+    table.insert(state.loading[root].callbacks, callback)
     return
   end
-  state.loading[root] = { callback }
+  local loading = {
+    callbacks = { callback },
+    client = client(),
+  }
+  state.loading[root] = loading
 
-  client():start(function(ok, start_err)
+  loading.client:start(function(ok, start_err)
+    if state.loading[root] ~= loading or state.client ~= loading.client then
+      return
+    end
     if not ok then
-      finish_session_load(root, nil, start_err)
+      finish_session_load(root, loading, nil, start_err)
       return
     end
 
     local saved = state.sessions[root]
     if not saved or not saved.thread_id then
       start_thread(root, function(session, err)
-        finish_session_load(root, session, err)
-      end)
+        finish_session_load(root, loading, session, err)
+      end, loading.client)
       return
     end
 
-    client():request("thread/resume", {
+    loading.client:request("thread/resume", {
       threadId = saved.thread_id,
       excludeTurns = true,
       approvalPolicy = config.main_approval_policy,
       approvalsReviewer = config.main_approvals_reviewer,
     }, function(result, err)
+      if state.loading[root] ~= loading or state.client ~= loading.client then
+        return
+      end
       if not err and result and result.thread then
-        finish_session_load(root, remember_thread(root, result))
+        finish_session_load(root, loading, remember_thread(root, result))
       else
         start_thread(root, function(session, start_err)
-          finish_session_load(root, session, start_err)
-        end)
+          finish_session_load(root, loading, session, start_err)
+        end, loading.client)
       end
     end)
   end)
 end
 
-local function with_session_status(root, callback)
+local function with_session_status(root, callback, on_failure)
   ensure_session(root, function(session, err)
     if not session then
+      if on_failure then
+        on_failure()
+      end
       notify(error_message(err, "could not create a Codex session"), vim.log.levels.ERROR)
       return
     end
@@ -1647,9 +1786,15 @@ local function with_session_status(root, callback)
       includeTurns = false,
     }, function(result, read_err)
       if state.live[root] ~= session then
+        if on_failure then
+          on_failure()
+        end
         return
       end
       if read_err or not result or not result.thread then
+        if on_failure then
+          on_failure()
+        end
         notify(error_message(read_err, "could not read Codex thread"), vim.log.levels.ERROR)
         return
       end
@@ -1990,6 +2135,7 @@ local function route_prompt(text)
     if instruction then
       return {
         mode = "agent",
+        label = normalized_prefix,
         prompt = vim.trim(body),
         original = trimmed,
         instruction = instruction,
@@ -2363,27 +2509,34 @@ function M._finish_generation(job)
   render_preview(job, lines)
 end
 
-local function start_declaration(session, snapshot, route)
+local function start_declaration(session, snapshot, route, job)
+  if state.jobs[job.id] ~= job or job.phase ~= "generating" then
+    return false
+  end
   if not snapshot_valid(snapshot) then
     notify("The source buffer changed while Codex was starting", vim.log.levels.WARN)
-    return
+    cancel_job(job, false)
+    return false
   end
   if route.prompt == "" then
     notify(route.kind .. " prompt cannot be empty", vim.log.levels.WARN)
-    return
+    cancel_job(job, false)
+    return false
   end
   if config.validate_declarations and not config.validator then
     local _, parser_error = declaration_parser(snapshot)
     if parser_error then
       notify(parser_error, vim.log.levels.ERROR)
-      return
+      cancel_job(job, false)
+      return false
     end
   end
   for _, existing in pairs(state.jobs) do
     local position = job_position(existing)
-    if existing.snapshot.buf == snapshot.buf and position and position[1] == snapshot.row then
+    if existing ~= job and existing.snapshot.buf == snapshot.buf and position and position[1] == snapshot.row then
       notify("A Seal job already exists on this line", vim.log.levels.WARN)
-      return
+      cancel_job(job, false)
+      return false
     end
   end
 
@@ -2405,20 +2558,7 @@ local function start_declaration(session, snapshot, route)
   })
   local declaration_prompt = table.concat(declaration_prompt_parts, " ")
 
-  state.job_sequence = state.job_sequence + 1
-  local job = {
-    id = state.job_sequence,
-    phase = "generating",
-    snapshot = snapshot,
-    source_thread_id = session.thread_id,
-    kind = route.kind,
-    summary = summary_text(route.kind, route.prompt),
-  }
-  if not add_job(job) then
-    notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
-    return
-  end
-  notify("Codex is generating one " .. route.kind .. "…")
+  job.source_thread_id = session.thread_id
 
   local function start_turn(result, err)
     if state.jobs[job.id] ~= job or job.phase ~= "generating" then
@@ -2500,6 +2640,7 @@ local function start_declaration(session, snapshot, route)
     end
     start_turn(result, err)
   end)
+  return true
 end
 
 local function close_chat()
@@ -2634,22 +2775,27 @@ local function other_modified_project_buffers(root, source_buf)
   return paths
 end
 
-local function start_agent(session, snapshot, prompt)
+local function start_agent(session, snapshot, prompt, activity)
+  local function fail(message, level)
+    remove_activity(activity)
+    notify(message, level or vim.log.levels.WARN)
+    return false
+  end
+  if not activity or state.activities[activity.id] ~= activity then
+    return false
+  end
   if not snapshot_valid(snapshot) then
-    notify("The source buffer changed while Codex was starting", vim.log.levels.WARN)
-    return
+    return fail("The source buffer changed while Codex was starting")
   end
   if session.active_turn_id and not state.owned_turns[session.active_turn_id] then
-    notify("Finish the Codex TUI turn before sending a reviewed Seal prompt", vim.log.levels.WARN)
-    return
+    return fail("Finish the Codex TUI turn before sending a reviewed Seal prompt")
   end
   local modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
   if #modified > 0 then
-    notify(
+    return fail(
       "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
       vim.log.levels.WARN
     )
-    return
   end
   if config.save_before_agent and snapshot.modified and vim.api.nvim_buf_is_valid(snapshot.buf) then
     local source_file = snapshot.file
@@ -2659,45 +2805,45 @@ local function start_agent(session, snapshot, prompt)
     end)
     restore_snapshot_anchors(snapshot, anchors)
     if not ok then
-      notify("Could not save the current buffer: " .. tostring(err), vim.log.levels.ERROR)
-      return
+      return fail("Could not save the current buffer: " .. tostring(err), vim.log.levels.ERROR)
     end
     if not vim.api.nvim_buf_is_valid(snapshot.buf) then
-      notify("The source buffer closed while it was being saved", vim.log.levels.ERROR)
-      return
+      return fail("The source buffer closed while it was being saved", vim.log.levels.ERROR)
     end
     if vim.api.nvim_buf_get_name(snapshot.buf) ~= source_file then
-      notify("The source buffer was renamed while it was being saved; run the prompt again", vim.log.levels.WARN)
-      return
+      return fail("The source buffer was renamed while it was being saved; run the prompt again")
     end
     snapshot = refresh_snapshot(snapshot)
     if not snapshot then
-      notify("The source buffer closed while it was being saved", vim.log.levels.ERROR)
-      return
+      return fail("The source buffer closed while it was being saved", vim.log.levels.ERROR)
     end
     if snapshot.modified or not buffer_matches_disk(snapshot.buf, snapshot.file) then
-      notify(
+      return fail(
         "Save or format hooks left the buffer different from disk; save again before starting Codex",
         vim.log.levels.WARN
       )
-      return
     end
     remember_file_baseline(snapshot.buf)
     modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
     if #modified > 0 then
-      notify(
+      return fail(
         "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
         vim.log.levels.WARN
       )
-      return
     end
   end
   -- Once the workspace-writing request is sent, declarations derived from
   -- this chat can become stale. Keep them until all save/format checks pass.
   clear_jobs(function(job)
-    return job.source_thread_id == session.thread_id
+    return job.snapshot.root == session.root
   end, true)
   local method = session.active_turn_id and "turn/steer" or "turn/start"
+  activity.thread_id = session.thread_id
+  activity.turn_id = session.active_turn_id
+  activity.start_pending = method == "turn/start"
+  activity.provisional_turn_id = nil
+  activity.steer_pending = method == "turn/steer"
+  activity.completed_while_steering = nil
   local params = {
     threadId = session.thread_id,
     clientUserMessageId = next_client_id(),
@@ -2713,35 +2859,59 @@ local function start_agent(session, snapshot, prompt)
     params.expectedTurnId = session.active_turn_id
   end
   local function report(result, err, owns_turn)
+    if state.activities[activity.id] ~= activity then
+      return
+    end
+    activity.steer_pending = false
     if err then
+      activity.start_pending = false
+      remove_activity(activity)
       notify(error_message(err, "could not start Codex turn"), vim.log.levels.ERROR)
     else
       if owns_turn and result and result.turn then
-        state.owned_turns[result.turn.id] = {
+        if activity.start_pending then
+          activity.provisional_turn_id = result.turn.id
+          activity.turn_id = activity.turn_id or result.turn.id
+        end
+        local owned_turn_id = activity.turn_id or result.turn.id
+        state.owned_turns[owned_turn_id] = {
           root = session.root,
           thread_id = session.thread_id,
         }
       end
+      if activity.completed_while_steering then
+        remove_activity(activity)
+      end
       notify("Prompt sent to Codex; use :SealChat to inspect it")
     end
   end
-  client():request(method, params, function(result, err)
+  local request_client = client()
+  request_client:request(method, params, function(result, err)
+    if state.client ~= request_client or state.activities[activity.id] ~= activity then
+      return
+    end
     local message = err and err.message or ""
     if method == "turn/steer"
       and err
       and (message:find("no active turn", 1, true) or message:find("expected active turn", 1, true))
     then
+      activity.steer_pending = false
+      activity.completed_while_steering = nil
+      activity.turn_id = nil
+      activity.start_pending = true
+      activity.provisional_turn_id = nil
       params.expectedTurnId = nil
       params.sandboxPolicy = turn_sandbox_policy(config.main_sandbox)
       params.approvalPolicy = config.main_approval_policy
       params.approvalsReviewer = config.main_approvals_reviewer
-      client():request("turn/start", params, function(start_result, start_err)
+      request_client:request("turn/start", params, function(start_result, start_err)
         report(start_result, start_err, true)
       end)
       return
     end
     report(result, err, method == "turn/start")
   end)
+  return true
 end
 
 function M.submit(text, opts)
@@ -2758,16 +2928,45 @@ function M.submit(text, opts)
     notify("The source buffer or file changed while the prompt was open", vim.log.levels.WARN)
     return false
   end
+  local declaration_job
+  local agent_activity
+  if route.mode == "declaration" then
+    state.job_sequence = state.job_sequence + 1
+    declaration_job = {
+      id = state.job_sequence,
+      phase = "generating",
+      snapshot = snapshot,
+      kind = route.kind,
+      summary = summary_text(route.kind, route.prompt),
+    }
+    if not add_job(declaration_job) then
+      notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
+      return false
+    end
+    notify("Codex is generating one " .. route.kind .. "…")
+  else
+    agent_activity = add_activity(snapshot, route.label or "Codex", route.prompt)
+    if not agent_activity then
+      notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
+      return false
+    end
+  end
   with_session_status(snapshot.root, function(session, thread_status)
     if route.mode == "declaration" then
       if thread_status ~= "idle" then
+        cancel_job(declaration_job, false)
         notify("Finish the active Codex turn before generating a declaration; use :SealChat to inspect it", vim.log.levels.WARN)
         return
       end
-      start_declaration(session, snapshot, route)
+      start_declaration(session, snapshot, route, declaration_job)
     else
-      start_agent(session, snapshot, routed_agent_prompt(route))
+      start_agent(session, snapshot, routed_agent_prompt(route), agent_activity)
     end
+  end, function()
+    if declaration_job then
+      cancel_job(declaration_job, false)
+    end
+    remove_activity(agent_activity)
   end)
   return true
 end
@@ -2847,13 +3046,11 @@ reconcile_buffer_lines = function(buf, changedtick, first, last, new_last)
       if last <= old_row then
         expected_row = old_row + new_last - last
       end
-      if target_touched
-        or not rebase_selection(job.snapshot, first, last, new_last)
-        or not rebase_job(job, changedtick)
-        or job.snapshot.row ~= expected_row
-      then
+      local selection_unchanged = rebase_selection(job.snapshot, first, last, new_last)
+      local target_unchanged = rebase_job(job, changedtick) and job.snapshot.row == expected_row
+      if not selection_unchanged or not target_unchanged then
         job.invalidated = true
-        if target_touched then
+        if target_touched and not target_unchanged then
           job.invalidation_reason = "The marked line changed; Seal job cancelled"
         else
           job.invalidation_reason = "The marked context changed; Seal job cancelled"
@@ -3028,10 +3225,13 @@ function M.new_thread()
     end
 
     local function start_new()
+      clear_activities(function(activity)
+        return activity.root == root
+      end)
+      clear_jobs(function(job)
+        return job.snapshot.root == root
+      end, true)
       if previous then
-        clear_jobs(function(job)
-          return job.source_thread_id == previous.thread_id
-        end, true)
         clear_reviews(function(review)
           return review.thread_id == previous.thread_id
         end)
@@ -3067,13 +3267,16 @@ end
 function M.stop()
   state.stopping = true
   clear_jobs(nil, true)
+  clear_activities()
   clear_reviews(nil, "cancel")
   clear_command_requests(nil, nil, "cancel")
   stop_spinner_if_idle()
   close_chat()
-  if state.client then
-    state.client:stop()
-    state.client = nil
+  local stopped_client = state.client
+  state.client = nil
+  state.loading = {}
+  if stopped_client then
+    stopped_client:stop()
   end
   state.live = {}
   state.owned_turns = {}
@@ -3094,6 +3297,11 @@ function M.status()
       generating = generating + 1
     elseif job.phase == "ready" then
       ready = ready + 1
+    end
+  end
+  for _, activity in pairs(state.activities) do
+    if activity.phase == "generating" then
+      generating = generating + 1
     end
   end
   return {
@@ -3118,12 +3326,24 @@ function M.setup(opts)
   opts = opts or {}
   config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
   if opts.client and state.client ~= opts.client then
-    if state.client then
+    local previous_client = state.client
+    if previous_client then
+      clear_jobs(nil, true)
+      clear_activities()
       clear_reviews(nil, "cancel")
       clear_command_requests(nil, nil, "cancel")
-      state.client:stop()
+      state.live = {}
+      state.owned_turns = {}
+      state.owned_threads = {}
+      state.approval_items = {}
+      state.accepted_file_items = {}
+      state.resolved_requests = {}
     end
     state.client = opts.client
+    state.loading = {}
+    if previous_client then
+      previous_client:stop()
+    end
   end
   vim.api.nvim_set_hl(0, "SealPreview", { default = true, link = "DiffAdd" })
   vim.api.nvim_set_hl(0, "SealPreviewHint", { default = true, link = "Comment" })
@@ -3165,6 +3385,9 @@ function M.setup(opts)
         clear_jobs(function(job)
           return job.snapshot.buf == args.buf
         end, true)
+        clear_activities(function(activity)
+          return activity.snapshot.buf == args.buf
+        end)
         return
       end
       local path = vim.api.nvim_buf_get_name(args.buf)
@@ -3214,6 +3437,9 @@ function M.setup(opts)
       clear_jobs(function(job)
         return job.snapshot.buf == args.buf
       end, true)
+      clear_activities(function(activity)
+        return activity.snapshot.buf == args.buf
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("VimLeavePre", { group = group, callback = M.stop })
@@ -3257,10 +3483,12 @@ M._reset = function()
   state.loading = {}
   state.jobs = {}
   state.jobs_by_thread = {}
+  state.activities = {}
   state.job_mappings = {}
   state.spinner_timer = nil
   state.spinner_frame = 1
   state.job_sequence = 0
+  state.activity_sequence = 0
   state.generation = nil
   state.preview = nil
   state.chat = nil

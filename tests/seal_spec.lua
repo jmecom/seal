@@ -177,6 +177,7 @@ function tests.routes_only_known_prefixes()
     interface.instruction:find("no concrete implementation logic", 1, true),
     "interface should prohibit implementation bodies"
   )
+  equal(seal._route("fun add build logging").mode, "agent", "a declaration prefix should require a colon")
   equal(seal._route("fix: this bug").mode, "agent", "unknown colon prefixes should remain freeform")
   equal(seal._route("https://example.com").mode, "agent", "URLs should remain freeform")
   equal(seal._route("  preserve me  ").prompt, "  preserve me  ", "freeform whitespace should be preserved")
@@ -269,6 +270,55 @@ function tests.freeform_steers_an_active_turn()
   equal(steer.params.threadId, "main-thread", "follow-up should steer the existing thread")
   equal(steer.params.expectedTurnId, "main-turn", "steer should guard the active turn id")
   equal(steer.params.input[1].text, "follow up exactly", "steered prompt must remain unchanged")
+  equal(vim.tbl_count(seal._state.activities), 2, "both cursor markers should remain for the shared turn")
+  for _, activity in pairs(seal._state.activities) do
+    equal(activity.turn_id, "main-turn", "steered markers should bind to the active turn")
+  end
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  equal(vim.tbl_count(seal._state.activities), 0, "turn completion should clear every shared marker")
+end
+
+function tests.steer_completion_keeps_the_fallback_turn_marker()
+  setup({ "local value = 1" })
+  seal.submit("first prompt")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+
+  local original_request = fake.request
+  function fake:request(method, params, callback)
+    if method == "turn/steer" then
+      table.insert(self.requests, { method = method, params = params })
+      seal._notification("turn/completed", {
+        threadId = "main-thread",
+        turn = { id = "main-turn", status = "completed" },
+      })
+      callback(nil, { message = "no active turn" })
+      return
+    end
+    if method == "turn/start" and params.threadId == "main-thread" then
+      table.insert(self.requests, { method = method, params = params })
+      callback({ turn = { id = "fallback-turn" } })
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("follow up after completion")
+
+  equal(request(fake, "turn/start").params.threadId, "main-thread", "a stale steer should fall back to turn/start")
+  equal(vim.tbl_count(seal._state.activities), 1, "the fallback turn should keep its cursor marker")
+  local _, activity = next(seal._state.activities)
+  equal(activity.turn_id, "fallback-turn", "the surviving marker should bind to the fallback turn")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "fallback-turn", status = "completed" },
+  })
+  equal(vim.tbl_count(seal._state.activities), 0, "the fallback completion should clear its marker")
 end
 
 function tests.freeform_uses_the_post_format_buffer_and_selection()
@@ -959,6 +1009,12 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
     result = { decision = "accept" },
   }, "Tab should approve the complete multi-file patch")
   truthy(seal._state.reviews["51"] == nil, "an accepted patch should leave the review queue")
+  equal(vim.tbl_count(seal._state.activities), 1, "patch acceptance should keep the turn marker visible")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  equal(vim.tbl_count(seal._state.activities), 0, "the marker should clear only when the turn finishes")
 end
 
 function tests.changed_review_target_cannot_be_accepted()
@@ -1469,6 +1525,273 @@ function tests.duplicate_job_on_the_same_line_is_rejected()
   equal(fake.fork_count, 1, "the duplicate prompt should not create another fork")
   truthy(notifications[#notifications].message:find("already exists", 1, true), "the duplicate should be explained")
   seal.reject(1)
+end
+
+function tests.spinner_renders_before_app_server_is_ready()
+  setup({ "local before = true", "local between = true", "" }, { activity = { interval_ms = 100000 } })
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("A -- temporary<Esc>", true, false, true), "xt", false)
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  local held_start
+  function fake:start(callback)
+    held_start = callback
+  end
+
+  truthy(seal.submit("fun: add build logging"), "the declaration should submit while app-server starts")
+  truthy(held_start ~= nil, "Seal should be waiting for app-server readiness")
+  truthy(request(fake, "thread/start") == nil, "the app-server thread should not exist yet")
+  local job = seal._state.jobs[1]
+  truthy(job and job.phase == "generating", "the declaration job should exist immediately")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local marker = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, { details = true })
+  local text = marker[3].virt_text[1][1] .. marker[3].virt_text[2][1]
+  truthy(text:find("function · add build logging", 1, true), "the immediate spinner should summarize the request")
+  truthy(seal._state.spinner_timer ~= nil, "the spinner animation should start before network readiness")
+
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("i<Esc>", true, false, true), "xt", false)
+  truthy(seal._state.jobs[1] == job, "entering insert mode during startup should preserve the spinner")
+  vim.cmd("undo")
+  truthy(vim.wait(500, function()
+    return seal._state.jobs[1] == job
+      and job.snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "an unrelated undo during startup should preserve and rebase the spinner")
+  seal.reject(job.id)
+end
+
+function tests.insert_leave_noop_formatter_keeps_the_startup_spinner()
+  setup({ "local value = 1", "" }, { activity = { interval_ms = 100000 } })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  local held_start
+  function fake:start(callback)
+    held_start = callback
+  end
+  local format_count = 0
+  local group = vim.api.nvim_create_augroup("SealInsertLeaveFormatterTest", { clear = true })
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    group = group,
+    buffer = 0,
+    once = true,
+    callback = function(args)
+      format_count = format_count + 1
+      local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
+      vim.api.nvim_buf_set_lines(args.buf, 0, -1, false, lines)
+    end,
+  })
+
+  seal.submit("fun: survive the formatter")
+  local job = seal._state.jobs[1]
+  truthy(held_start ~= nil and job ~= nil, "the declaration should wait with a visible spinner")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("i<Esc>", true, false, true), "xt", false)
+
+  equal(format_count, 1, "the InsertLeave formatter should run")
+  truthy(vim.wait(500, function()
+    return seal._state.jobs[1] == job
+      and job.snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "an equivalent full-buffer formatter pass should preserve the startup spinner")
+  vim.api.nvim_del_augroup_by_id(group)
+  seal.reject(job.id)
+end
+
+function tests.agent_spinners_render_before_app_server_is_ready()
+  setup({ "local value = 1" }, { activity = { interval_ms = 100000 } })
+  local held_start
+  function fake:start(callback)
+    held_start = callback
+  end
+
+  truthy(seal.submit("explain the build logger"), "a normal agent prompt should submit")
+  truthy(seal.submit("targeted: fix the build logger"), "a targeted prompt should submit")
+  truthy(held_start ~= nil, "both prompts should be waiting on the same app-server startup")
+  equal(vim.tbl_count(seal._state.activities), 2, "both agent markers should render immediately")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local summaries = {}
+  for _, activity in pairs(seal._state.activities) do
+    local marker = vim.api.nvim_buf_get_extmark_by_id(0, namespace, activity.extmark, { details = true })
+    table.insert(summaries, marker[3].virt_text[2][1])
+  end
+  table.sort(summaries)
+  equal(summaries, {
+    "Codex · explain the build logger",
+    "targeted · fix the build logger",
+  }, "agent spinners should summarize the raw request and route")
+  truthy(
+    seal._state.job_mappings[vim.api.nvim_get_current_buf()] == nil,
+    "informational markers must not install declaration mappings"
+  )
+
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "local edited = true" })
+  seal._tick_activity()
+  equal(vim.tbl_count(seal._state.activities), 2, "editing should not cancel informational markers")
+  seal.stop()
+  equal(vim.tbl_count(seal._state.activities), 0, "stopping Seal should remove informational markers")
+end
+
+function tests.concurrent_initial_prompts_bind_to_the_started_turn()
+  setup({ "local value = 1" }, { activity = { interval_ms = 100000 } })
+  local held_start
+  function fake:start(callback)
+    held_start = callback
+  end
+  local original_request = fake.request
+  local submission_count = 0
+  function fake:request(method, params, callback)
+    if method == "turn/start" and params.threadId == "main-thread" then
+      table.insert(self.requests, { method = method, params = params })
+      submission_count = submission_count + 1
+      callback({ turn = { id = "submission-" .. submission_count } })
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("first startup prompt")
+  seal.submit("second startup prompt")
+  held_start(true)
+
+  equal(submission_count, 2, "both startup prompts should be submitted")
+  equal(vim.tbl_count(seal._state.activities), 2, "both startup prompts should keep their markers")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "actual-turn", status = "inProgress" },
+  })
+  for _, activity in pairs(seal._state.activities) do
+    equal(activity.turn_id, "actual-turn", "turn/started should replace provisional submission IDs")
+  end
+  truthy(seal._state.owned_turns["submission-1"] == nil, "the first provisional ownership should be removed")
+  truthy(seal._state.owned_turns["submission-2"] == nil, "the second provisional ownership should be removed")
+  truthy(seal._state.owned_turns["actual-turn"] ~= nil, "the actual started turn should remain Seal-owned")
+
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "actual-turn", status = "completed" },
+  })
+  equal(vim.tbl_count(seal._state.activities), 0, "the actual completion should clear both startup markers")
+  truthy(seal._state.owned_turns["actual-turn"] == nil, "the actual completion should clear turn ownership")
+end
+
+function tests.session_read_failure_clears_immediate_agent_spinner()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  local held_read
+  function fake:request(method, params, callback)
+    if method == "thread/read" then
+      table.insert(self.requests, { method = method, params = params })
+      held_read = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("explain this file")
+  equal(vim.tbl_count(seal._state.activities), 1, "the marker should exist while session status loads")
+  held_read(nil, { message = "status read failed" })
+  equal(vim.tbl_count(seal._state.activities), 0, "a session read failure should remove the marker")
+  equal(seal._state.spinner_timer, nil, "the failed request should stop the idle spinner timer")
+end
+
+function tests.app_server_start_failure_clears_immediate_spinners()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local held_start
+  function fake:start(callback)
+    held_start = callback
+  end
+
+  seal.submit("fun: add build logging")
+  seal.submit("explain the build logger")
+  equal(vim.tbl_count(seal._state.jobs), 1, "the declaration marker should render while startup is pending")
+  equal(vim.tbl_count(seal._state.activities), 1, "the agent marker should render while startup is pending")
+  held_start(false, { message = "app-server failed" })
+
+  equal(vim.tbl_count(seal._state.jobs), 0, "startup failure should clear the declaration marker")
+  equal(vim.tbl_count(seal._state.activities), 0, "startup failure should clear the agent marker")
+  equal(seal._state.spinner_timer, nil, "startup failure should stop the idle spinner timer")
+end
+
+function tests.delayed_old_client_exit_preserves_restarted_activity()
+  seal._reset()
+  notifications = {}
+  local project = "/tmp/seal-project"
+  local transports = {}
+  seal.setup({
+    transport_factory = function(_, _, on_exit)
+      local transport = {
+        exit = on_exit,
+        send = function()
+          return true
+        end,
+        stop = function() end,
+      }
+      table.insert(transports, transport)
+      return transport
+    end,
+    root = function()
+      return project
+    end,
+    notify = function(message, level)
+      table.insert(notifications, { message = message, level = level })
+    end,
+    keymaps = { prompt = false, chat = false },
+    activity = { interval_ms = 100000 },
+  })
+  vim.cmd("enew!")
+  buffer_sequence = buffer_sequence + 1
+  vim.bo.filetype = "lua"
+  vim.api.nvim_buf_set_name(0, string.format("%s/restart-%d.lua", project, buffer_sequence))
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "local value = 1" })
+
+  seal.submit("old request")
+  equal(#transports, 1, "the first request should start the first client")
+  seal.stop()
+  seal.submit("new request")
+  equal(#transports, 2, "a request after stop should start a new client")
+  local _, activity = next(seal._state.activities)
+  local restarted_loading = seal._state.loading[project]
+  truthy(activity ~= nil and restarted_loading ~= nil, "the restarted request should be pending visibly")
+
+  transports[1].exit(0, true)
+  vim.wait(50, function()
+    return false
+  end, 5)
+
+  equal(seal._state.activities[activity.id], activity, "the old exit callback must not clear the new marker")
+  truthy(seal._state.loading[project] == restarted_loading, "the old session callback must not consume the new load")
+  seal.stop()
+end
+
+function tests.agent_turn_cancels_a_declaration_waiting_for_status()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  local held_read
+  local reads = 0
+  function fake:request(method, params, callback)
+    if method == "thread/read" then
+      reads = reads + 1
+      if reads == 1 then
+        table.insert(self.requests, { method = method, params = params })
+        held_read = callback
+        return
+      end
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: stale pending declaration")
+  truthy(seal._state.jobs[1] ~= nil, "the declaration should have an immediate marker")
+  seal.submit("make a workspace change")
+  equal(vim.tbl_count(seal._state.jobs), 0, "a writable turn should cancel pending declarations in its project")
+
+  held_read({
+    thread = {
+      id = "main-thread",
+      cwd = "/tmp/seal-project",
+      status = { type = "idle" },
+    },
+  })
+  truthy(request(fake, "thread/fork") == nil, "the cancelled declaration must not fork after its status read returns")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
 end
 
 function tests.spinner_is_anchored_and_animates_in_place()
@@ -2125,6 +2448,7 @@ local order = {
   "freeform_uses_main_thread_unchanged",
   "targeted_adds_minimal_change_guidance_to_the_main_thread",
   "freeform_steers_an_active_turn",
+  "steer_completion_keeps_the_fallback_turn_marker",
   "freeform_uses_the_post_format_buffer_and_selection",
   "freeform_maps_context_through_a_full_buffer_format",
   "freeform_keeps_a_selection_expanded_by_formatting",
@@ -2170,6 +2494,14 @@ local order = {
   "turn_started_notification_supplies_the_declaration_turn_id",
   "closed_fork_clears_its_job",
   "duplicate_job_on_the_same_line_is_rejected",
+  "spinner_renders_before_app_server_is_ready",
+  "insert_leave_noop_formatter_keeps_the_startup_spinner",
+  "agent_spinners_render_before_app_server_is_ready",
+  "concurrent_initial_prompts_bind_to_the_started_turn",
+  "session_read_failure_clears_immediate_agent_spinner",
+  "app_server_start_failure_clears_immediate_spinners",
+  "delayed_old_client_exit_preserves_restarted_activity",
+  "agent_turn_cancels_a_declaration_waiting_for_status",
   "spinner_is_anchored_and_animates_in_place",
   "mapping_away_from_marker_preserves_global_behavior",
   "rejecting_one_parallel_job_keeps_its_sibling",
