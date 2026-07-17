@@ -4,7 +4,7 @@ Seal is a small Neovim interface for a real Codex session.
 
 Press one key, enter a prompt, and Seal routes it in one of three ways:
 
-- A normal prompt goes unchanged to a persistent Codex thread and runs in the background. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
+- A normal prompt goes unchanged to a persistent Codex thread and runs in the background. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
 - `targeted:` uses that same writable thread but asks Codex to make the smallest change that satisfies the request, without unrelated cleanup.
 - `fun:`, `type:`, `class:`, and other declaration prefixes create independent temporary read-only forks of that thread. Each fork inherits the conversation and can inspect the repository. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview. Several marked locations can run concurrently.
 
@@ -53,6 +53,8 @@ The default mappings are:
 - `Tab`: accept the ready declaration on the cursor line
 - `Esc`: cancel or reject the Seal job on the cursor line
 
+In a patch review, `Tab` accepts the complete proposed patch, `Esc` rejects it and lets Codex continue, `x` rejects it and stops the turn, and `q` closes the view without deciding.
+
 Commands provide the same operations:
 
 ```vim
@@ -62,6 +64,7 @@ Commands provide the same operations:
 :Seal type: represent an entry in the on-disk cache
 :Seal interface: define the storage API without implementations
 :SealChat
+:SealReview
 :SealAttach
 :SealAccept
 :SealReject
@@ -77,11 +80,15 @@ The current buffer, cursor, file type, and visual selection are attached as edit
 
 Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. It refuses to start a writable turn while another project buffer has unsaved changes. After any main-thread turn, it reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
 
+Normal Seal turns request Codex's `untrusted` approval policy with the user as reviewer. For every Seal-owned file-change approval app-server sends, Seal opens the complete patch in a read-only diff window before answering. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself is not atomic and can partially fail. Seal queues concurrent requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Seal disables acceptance if a target buffer or file differs from the state captured when the review opened.
+
+This is an app-server approval UI, not a universal filesystem barrier. App-server can skip a prompt after another attached client grants session-wide approval, and custom Codex or Seal permission settings can disable prompts. If Codex asks to run an untrusted command, Seal shows its full command and requested scope in a separate dialog and warns that it has no diff preview. An accepted formatter, generator, script, MCP tool, or command can change files directly. Turns started from an attached Codex TUI use that TUI's permissions and are not presented as Seal-reviewed turns. Keep the workspace sandbox enabled; Seal's path checks are a review safeguard, not a replacement for it.
+
 Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
 
 Declaration jobs are anchored to their cursor lines. You can prompt several locations in one or more buffers, continue editing, let the forks finish in any order, and accept each result from its marker. Edits, undo, and formatting away from a marker re-anchor that job; changing its target line cancels it. External file changes and workspace-writing main-thread turns still discard affected jobs rather than applying stale output. Accepted declarations format normally on the next save.
 
-Seal never opens a terminal or Zellij pane. Normal turns can edit the workspace but use a non-interactive approval policy: sandbox escalation and user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
+Seal never opens a terminal or Zellij pane. Permission expansion and structured user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
 
 `SealChat` replaces the current buffer with a read-only conversation view. Press `r` to refresh and `q` to return. It shows persisted user and Codex messages from the main thread while omitting tool activity, editor context attachments, and system instructions. Temporary declaration forks intentionally do not appear in this conversation.
 
@@ -95,7 +102,8 @@ Seal does not block model output based on language-specific AST shapes. Prefixes
 require("seal").setup({
   codex_command = "codex",
   main_sandbox = "workspace-write",
-  main_approval_policy = "never",
+  main_approval_policy = "untrusted",
+  main_approvals_reviewer = "user",
   save_before_agent = true,
   validate_declarations = false,
   activity = {
@@ -138,4 +146,4 @@ The optional smoke test starts a real local app-server and runs two declaration 
 make smoke
 ```
 
-`make protocol-smoke` runs a lower-level app-server resume/fork contract check.
+`make protocol-smoke` runs lower-level app-server resume/fork checks and verifies that a real file stays untouched until its proposed patch is accepted.

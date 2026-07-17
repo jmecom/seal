@@ -1,5 +1,6 @@
 local Client = require("seal.client")
 local Chat = require("seal.chat")
+local Review = require("seal.review")
 
 local M = {}
 local activity_namespace = vim.api.nvim_create_namespace("seal-activity")
@@ -10,7 +11,8 @@ local defaults = {
   bridge = nil,
   max_context_chars = 120000,
   main_sandbox = "workspace-write",
-  main_approval_policy = "never",
+  main_approval_policy = "untrusted",
+  main_approvals_reviewer = "user",
   save_before_agent = true,
   validate_declarations = false,
   activity = {
@@ -70,6 +72,13 @@ local state = {
   chat = nil,
   chat_request = 0,
   owned_turns = {},
+  owned_threads = {},
+  approval_items = {},
+  accepted_file_items = {},
+  reviews = {},
+  command_requests = {},
+  resolved_requests = {},
+  review_sequence = 0,
   file_baselines = {},
   file_conflicts = {},
   sequence = 0,
@@ -787,8 +796,531 @@ local function add_job(job)
   return true
 end
 
+local function approval_item_key(thread_id, turn_id, item_id)
+  return table.concat({ tostring(thread_id or ""), tostring(turn_id or ""), tostring(item_id or "") }, "\0")
+end
+
+local function owned_turn_context(thread_id, turn_id)
+  local owned = state.owned_turns[turn_id]
+  if type(owned) == "table" then
+    return owned
+  end
+  if owned then
+    local session = find_session_by_thread(thread_id)
+    return session and { root = session.root, thread_id = thread_id } or nil
+  end
+  local inherited = state.owned_threads[thread_id]
+  if inherited and turn_id then
+    local context = {
+      root = inherited.root,
+      thread_id = thread_id,
+      parent_turn_id = inherited.parent_turn_id,
+    }
+    state.owned_turns[turn_id] = context
+    return context
+  end
+end
+
+local function direct_thread_owner(thread_id)
+  local inherited = state.owned_threads[thread_id]
+  if inherited then
+    return inherited
+  end
+  local session = find_session_by_thread(thread_id)
+  if session and session.active_turn_id then
+    local owner = owned_turn_context(thread_id, session.active_turn_id)
+    if owner then
+      return { root = owner.root, parent_turn_id = session.active_turn_id }
+    end
+  end
+  for turn_id, owner in pairs(state.owned_turns) do
+    if type(owner) == "table" and owner.thread_id == thread_id then
+      return { root = owner.root, parent_turn_id = turn_id }
+    end
+  end
+end
+
+local function resolve_thread_owner(thread_id, callback, seen)
+  local owner = direct_thread_owner(thread_id)
+  if owner then
+    callback(owner)
+    return
+  end
+  seen = seen or {}
+  if seen[thread_id] or not state.client then
+    callback(nil)
+    return
+  end
+  seen[thread_id] = true
+  local active_client = state.client
+  active_client:request("thread/read", { threadId = thread_id, includeTurns = false }, function(result, err)
+    if state.client ~= active_client or err or not result or not result.thread then
+      callback(nil)
+      return
+    end
+    local parent_thread_id = not_null(result.thread.parentThreadId)
+    if not parent_thread_id then
+      callback(nil)
+      return
+    end
+    resolve_thread_owner(parent_thread_id, function(parent_owner)
+      if not parent_owner then
+        callback(nil)
+        return
+      end
+      local resolved = {
+        root = parent_owner.root,
+        parent_turn_id = parent_owner.parent_turn_id,
+      }
+      state.owned_threads[thread_id] = resolved
+      callback(resolved)
+    end, seen)
+  end)
+end
+
+local function remember_collab_threads(params)
+  local item = params.item
+  if not item or item.type ~= "collabAgentToolCall" then
+    return
+  end
+  local owner = owned_turn_context(params.threadId, params.turnId)
+  if not owner then
+    return
+  end
+  for _, thread_id in ipairs(item.receiverThreadIds or {}) do
+    state.owned_threads[thread_id] = {
+      root = owner.root,
+      parent_turn_id = params.turnId,
+    }
+  end
+end
+
+local function remember_started_thread(thread)
+  local parent_thread_id = thread and not_null(thread.parentThreadId)
+  if not thread or not thread.id or not parent_thread_id then
+    return
+  end
+  local parent_owner = state.owned_threads[parent_thread_id]
+  if not parent_owner then
+    local parent_session = find_session_by_thread(parent_thread_id)
+    local parent_turn_id = parent_session and parent_session.active_turn_id
+    local turn_owner = parent_turn_id and owned_turn_context(parent_thread_id, parent_turn_id)
+    if turn_owner then
+      parent_owner = { root = turn_owner.root, parent_turn_id = parent_turn_id }
+    end
+  end
+  if parent_owner then
+    state.owned_threads[thread.id] = {
+      root = parent_owner.root,
+      parent_turn_id = parent_owner.parent_turn_id,
+    }
+  end
+end
+
+local function review_key(request_id)
+  return tostring(request_id)
+end
+
+local function normalized_change_path(root, path)
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+  local absolute = path:sub(1, 1) == "/" or path:match("^%a:[/\\]")
+  return vim.fs.normalize(absolute and path or (root .. "/" .. path))
+end
+
+local function path_in_root(root, path)
+  local normalized_root = vim.fs.normalize(root):gsub("/+$", "")
+  local normalized = normalized_change_path(root, path)
+  return normalized and normalized:sub(1, #normalized_root + 1) == normalized_root .. "/", normalized
+end
+
+local function change_move_path(change)
+  if type(change.kind) ~= "table" then
+    return nil
+  end
+  return not_null(change.kind.movePath) or not_null(change.kind.move_path)
+end
+
+local function buffer_for_path(path)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.fs.normalize(vim.api.nvim_buf_get_name(buf)) == path then
+      return buf
+    end
+  end
+end
+
+local function review_safety(review)
+  if review.grant_root then
+    return "Codex requested broader write access; use the full Codex TUI to review that request"
+  end
+  if type(review.changes) ~= "table" or #review.changes == 0 then
+    return "Codex did not provide the proposed diff"
+  end
+
+  local targets = {}
+  local seen = {}
+  for _, change in ipairs(review.changes) do
+    if type(change.diff) ~= "string" or change.diff == "" then
+      return "Codex did not provide a complete diff for every changed file"
+    end
+    local paths = { change.path, change_move_path(change) }
+    for _, path in ipairs(paths) do
+      if path then
+        local contained, absolute = path_in_root(review.root, path)
+        if not contained then
+          return "A proposed path is outside the project root: " .. tostring(path)
+        end
+        if not seen[absolute] then
+          seen[absolute] = true
+          local buf = buffer_for_path(absolute)
+          targets[absolute] = {
+            disk = disk_state(absolute),
+            buf = buf,
+            changedtick = buf and vim.api.nvim_buf_get_changedtick(buf) or nil,
+          }
+        end
+      end
+    end
+  end
+  review.targets = targets
+end
+
+local function changed_review_target(review)
+  for path, target in pairs(review.targets or {}) do
+    if not same_disk_state(target.disk, disk_state(path)) then
+      return "A proposed file changed on disk while you were reviewing it: " .. path
+    end
+    local buf = buffer_for_path(path)
+    if buf and vim.api.nvim_get_option_value("modified", { buf = buf }) then
+      return "A proposed file has unsaved editor changes: " .. path
+    end
+    if target.buf and vim.api.nvim_buf_is_valid(target.buf) then
+      if vim.api.nvim_buf_get_changedtick(target.buf) ~= target.changedtick then
+        return "A proposed buffer changed while you were reviewing it: " .. path
+      end
+    elseif buf then
+      return "A proposed file was opened while you were reviewing it; reopen the review to verify it"
+    end
+  end
+end
+
+local function drop_review(review)
+  if state.reviews[review_key(review.request_id)] ~= review then
+    return false
+  end
+  state.reviews[review_key(review.request_id)] = nil
+  if review.view then
+    review.view:close()
+    review.view = nil
+  end
+  return true
+end
+
+local resolve_file_review
+
+local function open_file_review(review)
+  if review.view and vim.api.nvim_win_is_valid(review.view.win) then
+    vim.api.nvim_set_current_win(review.view.win)
+    return true
+  end
+  review.view = nil
+  for _, other in pairs(state.reviews) do
+    if other ~= review and other.view then
+      other.view:close()
+      other.view = nil
+    end
+  end
+  local ok, view = pcall(Review.open, {
+    id = review.request_id,
+    root = review.root,
+    changes = review.changes,
+    warning = review.warning,
+    can_accept = review.warning == nil,
+    on_decision = function(decision)
+      review.view = nil
+      resolve_file_review(review, decision)
+    end,
+    on_defer = function()
+      if state.reviews[review_key(review.request_id)] == review then
+        review.view = nil
+        notify("Patch review deferred; use :SealReview to reopen it")
+      end
+    end,
+  })
+  if not ok then
+    notify("Could not open the Codex patch review: " .. tostring(view), vim.log.levels.ERROR)
+    return false
+  end
+  review.view = view
+  return true
+end
+
+local function schedule_next_review()
+  vim.schedule(function()
+    local next_review
+    for _, pending in pairs(state.reviews) do
+      if not next_review or pending.sequence > next_review.sequence then
+        next_review = pending
+      end
+    end
+    if next_review then
+      open_file_review(next_review)
+    end
+  end)
+end
+
+resolve_file_review = function(review, decision)
+  if state.reviews[review_key(review.request_id)] ~= review then
+    return false
+  end
+  if decision == "accept" then
+    local changed = changed_review_target(review)
+    if changed then
+      review.warning = changed
+      notify(changed, vim.log.levels.WARN)
+      open_file_review(review)
+      return false
+    end
+  end
+  if not state.client or not state.client:respond(review.request_id, { decision = decision }) then
+    notify("Could not send the patch decision to Codex", vim.log.levels.ERROR)
+    if state.stopping then
+      drop_review(review)
+    else
+      open_file_review(review)
+    end
+    return false
+  end
+  drop_review(review)
+  if decision == "accept" then
+    state.accepted_file_items[approval_item_key(review.thread_id, review.turn_id, review.item_id)] = true
+    notify("Codex patch accepted; the turn is continuing")
+  elseif decision == "decline" then
+    notify("Codex patch rejected; the turn is continuing")
+  else
+    notify("Codex patch rejected and the turn was cancelled")
+  end
+  if not state.stopping then
+    schedule_next_review()
+  end
+  return true
+end
+
+local function clear_reviews(predicate, decision)
+  local reviews = {}
+  for _, review in pairs(state.reviews) do
+    if not predicate or predicate(review) then
+      table.insert(reviews, review)
+    end
+  end
+  for _, review in ipairs(reviews) do
+    if decision and state.client then
+      resolve_file_review(review, decision)
+    else
+      drop_review(review)
+    end
+  end
+end
+
+local function remember_approval_item(params)
+  local item = params.item
+  if not item or not item.id then
+    return
+  end
+  local key = approval_item_key(params.threadId, params.turnId, item.id)
+  if item.type == "fileChange" or item.type == "commandExecution" then
+    state.approval_items[key] = vim.deepcopy(item)
+  end
+end
+
+local function update_file_change_item(params)
+  local key = approval_item_key(params.threadId, params.turnId, params.itemId)
+  local item = state.approval_items[key] or { id = params.itemId, type = "fileChange" }
+  item.changes = vim.deepcopy(params.changes or {})
+  state.approval_items[key] = item
+end
+
+local function clear_approval_items(thread_id, turn_id, item_id)
+  if item_id then
+    local key = approval_item_key(thread_id, turn_id, item_id)
+    state.approval_items[key] = nil
+    state.accepted_file_items[key] = nil
+    return
+  end
+  local prefix = tostring(thread_id or "") .. "\0"
+  if turn_id then
+    prefix = prefix .. tostring(turn_id) .. "\0"
+  end
+  for key in pairs(state.approval_items) do
+    if key:sub(1, #prefix) == prefix then
+      state.approval_items[key] = nil
+    end
+  end
+  for key in pairs(state.accepted_file_items) do
+    if key:sub(1, #prefix) == prefix then
+      state.accepted_file_items[key] = nil
+    end
+  end
+end
+
+local function clear_command_requests(thread_id, turn_id, decision)
+  local requests = {}
+  for key, pending in pairs(state.command_requests) do
+    local params = pending.params or {}
+    if (not thread_id or params.threadId == thread_id) and (not turn_id or params.turnId == turn_id) then
+      table.insert(requests, { key = key, request = pending })
+    end
+  end
+  for _, pending in ipairs(requests) do
+    state.command_requests[pending.key] = nil
+    if decision and state.client then
+      state.client:respond(pending.request.id, { decision = decision })
+    end
+  end
+end
+
+local function command_details(params, item)
+  local parts = {}
+  local command = not_null(params.command) or (item and not_null(item.command))
+  if type(command) == "table" then
+    command = table.concat(command, " ")
+  end
+  if command and command ~= "" then
+    table.insert(parts, "Command: " .. tostring(command))
+  end
+  local cwd = not_null(params.cwd) or (item and not_null(item.cwd))
+  if cwd then
+    table.insert(parts, "Working directory: " .. tostring(cwd))
+  end
+  local environment_id = not_null(params.environmentId)
+  if environment_id then
+    table.insert(parts, "Environment: " .. tostring(environment_id))
+  end
+  local reason = not_null(params.reason)
+  if reason then
+    table.insert(parts, "Reason: " .. tostring(reason))
+  end
+  local network = not_null(params.networkApprovalContext)
+  if network then
+    table.insert(parts, "Network request: " .. vim.inspect(network))
+  end
+  local permissions = not_null(params.additionalPermissions)
+  if permissions then
+    table.insert(parts, "Additional permissions: " .. vim.inspect(permissions))
+  end
+  return table.concat(parts, "\n"), command ~= nil or network ~= nil or permissions ~= nil
+end
+
+local function command_decision_choices(params, can_accept)
+  local allowed
+  local advertised = not_null(params.availableDecisions)
+  if type(advertised) == "table" then
+    allowed = {}
+    for _, decision in ipairs(advertised) do
+      if type(decision) == "string" then
+        allowed[decision] = true
+      end
+    end
+  end
+  local function available(decision)
+    return not allowed or allowed[decision] == true
+  end
+  local choices = {}
+  if can_accept and available("accept") then
+    table.insert(choices, { label = "Accept once (no diff preview)", decision = "accept" })
+  end
+  if available("decline") then
+    table.insert(choices, { label = "Decline and continue", decision = "decline" })
+  end
+  if available("cancel") then
+    table.insert(choices, { label = "Decline and stop the turn", decision = "cancel" })
+  end
+  local fallback = allowed and (allowed.cancel and "cancel" or allowed.decline and "decline") or "decline"
+  fallback = fallback or "cancel"
+  if #choices == 0 then
+    table.insert(choices, { label = "Decline unsupported request", decision = fallback })
+  end
+  return choices, fallback
+end
+
+local function request_command_decision(request, item)
+  local key = review_key(request.id)
+  state.command_requests[key] = request
+  local params = request.params or {}
+  local details, can_accept = command_details(params, item)
+  local choices, fallback = command_decision_choices(params, can_accept)
+  local prompt = details ~= "" and ("Codex approval request\n" .. details) or "Codex approval request cannot be displayed"
+  local select = config.select or vim.ui.select
+  local ok, select_error = pcall(select, choices, {
+    prompt = prompt,
+    format_item = function(choice)
+      return choice.label
+    end,
+  }, function(choice)
+    if state.command_requests[key] ~= request then
+      return
+    end
+    local decision = choice and choice.decision or fallback
+    if not state.client or not state.client:respond(request.id, { decision = decision }) then
+      notify("Could not send the command decision to Codex", vim.log.levels.ERROR)
+      return
+    end
+    state.command_requests[key] = nil
+    if decision == "accept" then
+      notify("Codex command accepted; it may change files without a patch preview", vim.log.levels.WARN)
+    elseif decision == "decline" then
+      notify("Codex command declined; the turn is continuing")
+    else
+      notify("Codex command declined and the turn was cancelled")
+    end
+  end)
+  if not ok then
+    if state.client and state.client:respond(request.id, { decision = fallback }) then
+      state.command_requests[key] = nil
+    end
+    notify("Could not open the command approval dialog: " .. tostring(select_error), vim.log.levels.ERROR)
+  end
+end
+
 local function handle_notification(method, params)
+  local notification_turn_id = params.turnId or (params.turn and params.turn.id)
+  if notification_turn_id then
+    owned_turn_context(params.threadId, notification_turn_id)
+  end
+  if method == "item/started" or method == "item/completed" then
+    remember_collab_threads(params)
+  end
+  if method == "item/started" then
+    remember_approval_item(params)
+  elseif method == "item/fileChange/patchUpdated" then
+    update_file_change_item(params)
+  elseif method == "serverRequest/resolved" then
+    state.resolved_requests[review_key(params.requestId)] = true
+    local review = state.reviews[review_key(params.requestId)]
+    if review then
+      local was_visible = review.view and vim.api.nvim_win_is_valid(review.view.win)
+      drop_review(review)
+      if was_visible and not state.stopping then
+        schedule_next_review()
+      end
+    end
+    state.command_requests[review_key(params.requestId)] = nil
+    return
+  elseif method == "item/completed" and params.item then
+    local completed_item_key = approval_item_key(params.threadId, params.turnId, params.item.id)
+    if params.item.type == "fileChange"
+      and params.item.status == "failed"
+      and state.accepted_file_items[completed_item_key]
+    then
+      notify("Codex could not apply the complete reviewed patch; inspect the workspace", vim.log.levels.ERROR)
+    end
+    state.accepted_file_items[completed_item_key] = nil
+    clear_approval_items(params.threadId, params.turnId, params.item.id)
+  end
+
   if method == "thread/started" and params.thread then
+    remember_started_thread(params.thread)
     set_thread_status(params.thread.id, params.thread.status)
     return
   end
@@ -800,6 +1332,13 @@ local function handle_notification(method, params)
       cancel_job(job, false)
       unsubscribe_thread(params.threadId)
       notify("Codex stopped the declaration thread", vim.log.levels.ERROR)
+    end
+    if status == "notLoaded" or status == "systemError" then
+      clear_reviews(function(review)
+        return review.thread_id == params.threadId
+      end)
+      clear_command_requests(params.threadId)
+      state.owned_threads[params.threadId] = nil
     end
     return
   end
@@ -825,6 +1364,11 @@ local function handle_notification(method, params)
       cancel_job(job, false)
       notify("Codex closed the declaration thread", vim.log.levels.ERROR)
     end
+    clear_reviews(function(review)
+      return review.thread_id == params.threadId
+    end)
+    clear_command_requests(params.threadId)
+    state.owned_threads[params.threadId] = nil
     return
   end
   if method == "turn/started" then
@@ -842,6 +1386,8 @@ local function handle_notification(method, params)
     end
   elseif method == "turn/completed" then
     local session = find_session_by_thread(params.threadId)
+    local completed_turn_id = params.turn and params.turn.id or params.turnId
+    local completed_owner = completed_turn_id and state.owned_turns[completed_turn_id]
     if params.turn then
       state.owned_turns[params.turn.id] = nil
     end
@@ -862,6 +1408,21 @@ local function handle_notification(method, params)
         end
       end)
     end
+    clear_reviews(function(review)
+      return review.thread_id == params.threadId
+        and (not completed_turn_id or review.turn_id == completed_turn_id)
+    end)
+    clear_approval_items(params.threadId, completed_turn_id)
+    clear_command_requests(params.threadId, completed_turn_id)
+    local completed_root = session and session.root
+      or (type(completed_owner) == "table" and not completed_owner.parent_turn_id and completed_owner.root)
+    if completed_root then
+      for thread_id, owner in pairs(state.owned_threads) do
+        if owner.root == completed_root then
+          state.owned_threads[thread_id] = nil
+        end
+      end
+    end
   end
 
   local job = state.jobs_by_thread[params.threadId]
@@ -869,7 +1430,6 @@ local function handle_notification(method, params)
     return
   end
 
-  local notification_turn_id = params.turnId or (params.turn and params.turn.id)
   if notification_turn_id and job.turn_id and notification_turn_id ~= job.turn_id then
     return
   end
@@ -893,16 +1453,53 @@ local function handle_notification(method, params)
   end
 end
 
-local function handle_server_request(request)
+local handle_server_request
+
+handle_server_request = function(request)
+  if state.resolved_requests[review_key(request.id)] then
+    return
+  end
   local params = request.params or {}
   local is_generation = state.jobs_by_thread[params.threadId] ~= nil
   local session = find_session_by_thread(params.threadId)
   local turn_id = params.turnId or (session and session.active_turn_id)
-  if not is_generation and (not turn_id or not state.owned_turns[turn_id]) then
+  local owner = owned_turn_context(params.threadId, turn_id)
+  if not is_generation and not owner then
+    resolve_thread_owner(params.threadId, function(resolved)
+      if resolved then
+        handle_server_request(request)
+      end
+    end)
     return
   end
 
-  if request.method == "item/permissions/requestApproval" then
+  if request.method == "item/fileChange/requestApproval" and not is_generation then
+    local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
+    state.review_sequence = state.review_sequence + 1
+    local review = {
+      request_id = request.id,
+      sequence = state.review_sequence,
+      thread_id = params.threadId,
+      turn_id = turn_id,
+      item_id = params.itemId,
+      root = session and session.root or owner.root,
+      changes = vim.deepcopy(item and item.changes or {}),
+      grant_root = not_null(params.grantRoot),
+    }
+    review.warning = review_safety(review)
+    state.reviews[review_key(request.id)] = review
+    if review.warning then
+      notify("Codex patch cannot be accepted safely: " .. review.warning, vim.log.levels.WARN)
+    else
+      notify(string.format("Codex proposed changes to %d file(s)", #review.changes))
+    end
+    open_file_review(review)
+    return
+  elseif request.method == "item/commandExecution/requestApproval" and not is_generation then
+    local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
+    request_command_decision(request, item)
+    return
+  elseif request.method == "item/permissions/requestApproval" then
     state.client:respond(request.id, { permissions = {}, scope = "turn" })
   elseif request.method == "item/commandExecution/requestApproval"
     or request.method == "item/fileChange/requestApproval"
@@ -936,6 +1533,12 @@ local function client()
     on_exit = function(_, expected)
       state.live = {}
       state.owned_turns = {}
+      state.owned_threads = {}
+      state.approval_items = {}
+      state.accepted_file_items = {}
+      state.resolved_requests = {}
+      clear_reviews()
+      clear_command_requests()
       local had_generating = has_generating_jobs()
       clear_jobs(nil, false)
       if had_generating then
@@ -973,6 +1576,7 @@ local function start_thread(root, callback)
     cwd = root,
     sandbox = config.main_sandbox,
     approvalPolicy = config.main_approval_policy,
+    approvalsReviewer = config.main_approvals_reviewer,
   }, function(result, err)
     if err or not result or not result.thread then
       callback(nil, error_message(err, "could not start a Codex thread"))
@@ -1015,7 +1619,12 @@ local function ensure_session(root, callback)
       return
     end
 
-    client():request("thread/resume", { threadId = saved.thread_id, excludeTurns = true }, function(result, err)
+    client():request("thread/resume", {
+      threadId = saved.thread_id,
+      excludeTurns = true,
+      approvalPolicy = config.main_approval_policy,
+      approvalsReviewer = config.main_approvals_reviewer,
+    }, function(result, err)
       if not err and result and result.thread then
         finish_session_load(root, remember_thread(root, result))
       else
@@ -2030,6 +2639,10 @@ local function start_agent(session, snapshot, prompt)
     notify("The source buffer changed while Codex was starting", vim.log.levels.WARN)
     return
   end
+  if session.active_turn_id and not state.owned_turns[session.active_turn_id] then
+    notify("Finish the Codex TUI turn before sending a reviewed Seal prompt", vim.log.levels.WARN)
+    return
+  end
   local modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
   if #modified > 0 then
     notify(
@@ -2094,6 +2707,7 @@ local function start_agent(session, snapshot, prompt)
   if method == "turn/start" then
     params.sandboxPolicy = turn_sandbox_policy(config.main_sandbox)
     params.approvalPolicy = config.main_approval_policy
+    params.approvalsReviewer = config.main_approvals_reviewer
   end
   if session.active_turn_id then
     params.expectedTurnId = session.active_turn_id
@@ -2103,7 +2717,10 @@ local function start_agent(session, snapshot, prompt)
       notify(error_message(err, "could not start Codex turn"), vim.log.levels.ERROR)
     else
       if owns_turn and result and result.turn then
-        state.owned_turns[result.turn.id] = true
+        state.owned_turns[result.turn.id] = {
+          root = session.root,
+          thread_id = session.thread_id,
+        }
       end
       notify("Prompt sent to Codex; use :SealChat to inspect it")
     end
@@ -2117,6 +2734,7 @@ local function start_agent(session, snapshot, prompt)
       params.expectedTurnId = nil
       params.sandboxPolicy = turn_sandbox_policy(config.main_sandbox)
       params.approvalPolicy = config.main_approval_policy
+      params.approvalsReviewer = config.main_approvals_reviewer
       client():request("turn/start", params, function(start_result, start_err)
         report(start_result, start_err, true)
       end)
@@ -2325,6 +2943,30 @@ local function current_project_root(requested_root)
     or root_for_buffer(vim.api.nvim_get_current_buf())
 end
 
+function M.review(requested_root)
+  local root = current_project_root(requested_root)
+  local selected
+  for _, review in pairs(state.reviews) do
+    if review.root == root and (not selected or review.sequence > selected.sequence) then
+      selected = review
+    end
+  end
+  if not selected then
+    for _, request in pairs(state.command_requests) do
+      local params = request.params or {}
+      local owner = owned_turn_context(params.threadId, params.turnId)
+      if owner and owner.root == root then
+        local item = state.approval_items[approval_item_key(params.threadId, params.turnId, params.itemId)]
+        request_command_decision(request, item)
+        return true
+      end
+    end
+    notify("There is no pending Codex approval to review", vim.log.levels.INFO)
+    return false
+  end
+  return open_file_review(selected)
+end
+
 function M.chat(requested_root)
   local root = current_project_root(requested_root)
   ensure_session(root, function(session, err)
@@ -2390,6 +3032,10 @@ function M.new_thread()
         clear_jobs(function(job)
           return job.source_thread_id == previous.thread_id
         end, true)
+        clear_reviews(function(review)
+          return review.thread_id == previous.thread_id
+        end)
+        clear_command_requests(previous.thread_id)
       end
       state.live[root] = nil
       state.sessions[root] = nil
@@ -2421,6 +3067,8 @@ end
 function M.stop()
   state.stopping = true
   clear_jobs(nil, true)
+  clear_reviews(nil, "cancel")
+  clear_command_requests(nil, nil, "cancel")
   stop_spinner_if_idle()
   close_chat()
   if state.client then
@@ -2429,6 +3077,10 @@ function M.stop()
   end
   state.live = {}
   state.owned_turns = {}
+  state.owned_threads = {}
+  state.approval_items = {}
+  state.accepted_file_items = {}
+  state.resolved_requests = {}
   state.stopping = false
 end
 
@@ -2452,6 +3104,7 @@ function M.status()
     preview = ready > 0,
     generating_count = generating,
     preview_count = ready,
+    pending_reviews = vim.tbl_count(state.reviews),
     remote = state.client and state.client:url() or nil,
   }
 end
@@ -2466,6 +3119,8 @@ function M.setup(opts)
   config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
   if opts.client and state.client ~= opts.client then
     if state.client then
+      clear_reviews(nil, "cancel")
+      clear_command_requests(nil, nil, "cancel")
       state.client:stop()
     end
     state.client = opts.client
@@ -2495,6 +3150,7 @@ function M.setup(opts)
     M.reject()
   end, { desc = "Reject Seal declaration" })
   command("SealChat", M.chat, { desc = "Inspect the Seal conversation" })
+  command("SealReview", M.review, { desc = "Review a pending Codex patch" })
   command("SealAttach", M.attach, { desc = "Copy the Codex TUI attach command" })
   command("SealNew", M.new_thread, { desc = "Start a new Seal Codex thread" })
   command("SealStop", M.stop, { desc = "Stop Seal's local app-server" })
@@ -2610,6 +3266,13 @@ M._reset = function()
   state.chat = nil
   state.chat_request = 0
   state.owned_turns = {}
+  state.owned_threads = {}
+  state.approval_items = {}
+  state.accepted_file_items = {}
+  state.resolved_requests = {}
+  state.reviews = {}
+  state.command_requests = {}
+  state.review_sequence = 0
   state.file_baselines = {}
   state.file_conflicts = {}
   state.sequence = 0

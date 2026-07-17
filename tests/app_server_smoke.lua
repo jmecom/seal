@@ -10,16 +10,63 @@ local Client = require("seal.client")
 local completed
 local answer
 local protocol_error
+local file_items = {}
+local patch_approval_seen = false
+local review_file
 
-local client = Client.new({
+local function item_key(params, item_id)
+  return table.concat({ tostring(params.threadId), tostring(params.turnId), tostring(item_id) }, "\0")
+end
+
+local client
+client = Client.new({
   bridge = root .. "/bin/seal-bridge",
   on_notification = function(method, params)
-    if method == "item/completed" and params.item and params.item.type == "agentMessage" then
+    if method == "item/started" and params.item and params.item.type == "fileChange" then
+      file_items[item_key(params, params.item.id)] = params.item
+    elseif method == "item/completed" and params.item and params.item.type == "agentMessage" then
       answer = params.item.text
     elseif method == "turn/completed" then
       completed = params.turn
     elseif method == "error" then
       protocol_error = params.error and params.error.message or "unknown app-server error"
+    end
+  end,
+  on_server_request = function(request_message)
+    local params = request_message.params or {}
+    if request_message.method == "item/fileChange/requestApproval" then
+      local item = file_items[item_key(params, params.itemId)]
+      if not item or type(item.changes) ~= "table" or #item.changes == 0 then
+        protocol_error = "file approval arrived without its proposed changes"
+        client:respond(request_message.id, { decision = "cancel" })
+        return
+      end
+      if review_file and (vim.uv or vim.loop).fs_stat(review_file) then
+        protocol_error = "the reviewed file existed before patch approval"
+        client:respond(request_message.id, { decision = "cancel" })
+        return
+      end
+      local expected_change = false
+      for _, change in ipairs(item.changes) do
+        expected_change = expected_change
+          or (type(change.path) == "string"
+            and vim.fs.basename(change.path) == "seal-review-smoke.txt"
+            and type(change.diff) == "string"
+            and change.diff:find("approved after review", 1, true) ~= nil)
+      end
+      if not expected_change then
+        protocol_error = "the proposed patch did not contain the expected reviewed file"
+        client:respond(request_message.id, { decision = "cancel" })
+        return
+      end
+      patch_approval_seen = true
+      client:respond(request_message.id, { decision = "accept" })
+    elseif request_message.method == "item/commandExecution/requestApproval" then
+      client:respond(request_message.id, { decision = "decline" })
+    elseif request_message.method == "item/permissions/requestApproval" then
+      client:respond(request_message.id, { permissions = {}, scope = "turn" })
+    else
+      client:respond_error(request_message.id, -32601, "unsupported smoke-test request")
     end
   end,
   on_error = function(message)
@@ -65,6 +112,8 @@ if not started then
 end
 
 local source
+local patch_source
+local review_root
 local ok, smoke_error = xpcall(function()
   source = request("thread/start", {
     cwd = root,
@@ -123,14 +172,57 @@ local ok, smoke_error = xpcall(function()
   assert(fork.ephemeral == true, "fork was not ephemeral")
   assert(fork.forkedFromId == source.id, "fork did not copy the source thread")
   request("thread/unsubscribe", { threadId = fork.id })
+
+  review_root = vim.fn.tempname()
+  assert(vim.fn.mkdir(review_root, "p") == 1, "could not create the patch-review smoke directory")
+  review_file = review_root .. "/seal-review-smoke.txt"
+  patch_source = request("thread/start", {
+    cwd = review_root,
+    sandbox = "read-only",
+    approvalPolicy = "untrusted",
+    approvalsReviewer = "user",
+  }).thread
+  completed = nil
+  answer = nil
+  local patch_turn = request("turn/start", {
+    threadId = patch_source.id,
+    clientUserMessageId = "seal-review-smoke",
+    sandboxPolicy = { type = "workspaceWrite", writableRoots = {}, networkAccess = false },
+    approvalPolicy = "untrusted",
+    approvalsReviewer = "user",
+    input = {
+      {
+        type = "text",
+        text = table.concat({
+          "Use the apply_patch tool to add seal-review-smoke.txt in the current directory.",
+          "Its complete contents must be exactly: approved after review",
+          "Do not use shell commands or any other write mechanism. Do not make other changes.",
+        }, " "),
+      },
+    },
+  }).turn
+
+  wait_for("reviewed Codex patch", function()
+    return (completed and completed.id == patch_turn.id) or protocol_error ~= nil
+  end, 120000)
+  assert(not protocol_error, protocol_error)
+  assert(completed.status == "completed", "patch turn status was " .. tostring(completed.status))
+  assert(patch_approval_seen, "Codex changed the file without a file-change approval")
+  assert(vim.deep_equal(vim.fn.readfile(review_file), { "approved after review" }), "approved patch contents differed")
 end, debug.traceback)
 
 if source then
   pcall(request, "thread/delete", { threadId = source.id })
 end
+if patch_source then
+  pcall(request, "thread/delete", { threadId = patch_source.id })
+end
 client:stop()
+if review_root then
+  vim.fn.delete(review_root, "rf")
+end
 
 if not ok then
   error(smoke_error)
 end
-io.stdout:write("real app-server smoke test passed\n")
+io.stdout:write("real app-server and patch approval smoke test passed\n")

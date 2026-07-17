@@ -54,10 +54,12 @@ local function fake_client()
 
   function fake:respond(id, result)
     table.insert(self.responses, { id = id, result = result })
+    return true
   end
 
   function fake:respond_error(id, code, message)
     table.insert(self.responses, { id = id, error = { code = code, message = message } })
+    return true
   end
 
   function fake:stop()
@@ -214,13 +216,15 @@ function tests.freeform_uses_main_thread_unchanged()
   truthy(turn.params.outputSchema == nil, "freeform prompt must not constrain output")
   truthy(turn.params.additionalContext["seal.editor"].value:find("local value = 1", 1, true), "editor context should be attached")
   equal(turn.params.additionalContext["seal.editor"].kind, "untrusted", "repository text must stay outside the developer role")
-  equal(turn.params.approvalPolicy, "never", "background turns must not wait for an unavailable approval UI")
+  equal(turn.params.approvalPolicy, "untrusted", "file patches should pause for native review")
+  equal(turn.params.approvalsReviewer, "user", "Seal should keep approval decisions with the user")
   equal(turn.params.sandboxPolicy, {
     type = "workspaceWrite",
     writableRoots = {},
     networkAccess = false,
   }, "normal turns should use a protocol-valid workspace-writing policy")
-  equal(request(fake, "thread/start").params.approvalPolicy, "never", "the main thread should be non-interactive")
+  equal(request(fake, "thread/start").params.approvalPolicy, "untrusted", "the main thread should review patches")
+  equal(request(fake, "thread/start").params.approvalsReviewer, "user", "the main thread should not auto-review")
   equal(request(fake, "thread/start").params.sandbox, "workspace-write", "the main thread should be workspace-writing")
 end
 
@@ -231,6 +235,8 @@ function tests.targeted_adds_minimal_change_guidance_to_the_main_thread()
   equal(turn.params.threadId, "main-thread", "targeted should use the persistent thread")
   truthy(request(fake, "thread/fork") == nil, "targeted must not create a declaration fork")
   truthy(turn.params.outputSchema == nil, "targeted must not constrain the agent response")
+  equal(turn.params.approvalPolicy, "untrusted", "targeted patches should use the same review gate")
+  equal(turn.params.approvalsReviewer, "user", "targeted reviews should not be delegated")
   truthy(
     turn.params.input[1].text:find("minimum necessary", 1, true),
     "Codex should receive the minimal-change policy"
@@ -256,12 +262,12 @@ function tests.freeform_steers_an_active_turn()
   fake.thread_status = { type = "active", activeFlags = {} }
   seal._notification("turn/started", {
     threadId = "main-thread",
-    turn = { id = "active-turn", status = "inProgress" },
+    turn = { id = "main-turn", status = "inProgress" },
   })
   seal.submit("follow up exactly")
   local steer = request(fake, "turn/steer")
   equal(steer.params.threadId, "main-thread", "follow-up should steer the existing thread")
-  equal(steer.params.expectedTurnId, "active-turn", "steer should guard the active turn id")
+  equal(steer.params.expectedTurnId, "main-turn", "steer should guard the active turn id")
   equal(steer.params.input[1].text, "follow up exactly", "steered prompt must remain unchanged")
 end
 
@@ -841,7 +847,17 @@ function tests.null_thread_settings_are_omitted_from_forks()
 end
 
 function tests.server_request_is_resolved_without_an_interactive_client()
-  setup({ "" })
+  setup({ "" }, {
+    select = function(items, _, callback)
+      for _, item in ipairs(items) do
+        if item.decision == "decline" then
+          callback(item)
+          return
+        end
+      end
+      callback(nil)
+    end,
+  })
   seal._state.live["/tmp/project-a"] = { root = "/tmp/project-a", thread_id = "thread-a" }
   seal._state.owned_turns["seal-turn"] = true
   seal._server_request({
@@ -892,6 +908,453 @@ function tests.server_request_is_resolved_without_an_interactive_client()
     params = { threadId = "thread-a", turnId = "tui-turn" },
   })
   equal(#fake.responses, response_count, "Seal must let the attached TUI answer requests for its own turns")
+end
+
+function tests.multi_file_patch_waits_for_review_and_acceptance()
+  setup({ "local value = 1" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("change the storage implementation")
+  local source_path = vim.api.nvim_buf_get_name(0)
+  local changes = {
+    {
+      path = source_path,
+      kind = { type = "update" },
+      diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+    },
+    {
+      path = "/tmp/seal-project/storage.lua",
+      kind = { type = "add" },
+      diff = "@@ -0,0 +1 @@\n+return {}",
+    },
+  }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "patch-1", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 51,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "patch-1", grantRoot = vim.NIL },
+  })
+
+  local review = seal._state.reviews["51"]
+  truthy(review ~= nil, "the file-change request should remain pending")
+  truthy(vim.api.nvim_win_is_valid(review.view.win), "the proposed patch should open automatically")
+  local rendered = table.concat(vim.api.nvim_buf_get_lines(review.view.buf, 0, -1, false), "\n")
+  truthy(rendered:find("example", 1, true), "the review should show the current file")
+  truthy(rendered:find("storage.lua", 1, true), "the review should show every changed file")
+  equal(#fake.responses, 0, "Codex must stay paused until the user decides")
+
+  vim.fn.maparg("q", "n", false, true).callback()
+  truthy(seal._state.reviews["51"] ~= nil, "closing the view should defer rather than approve the patch")
+  truthy(seal.review("/tmp/seal-project"), ":SealReview should reopen the pending patch")
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  truthy(
+    #fake.responses > 0,
+    "acceptance should answer the app-server request: " .. vim.inspect(notifications[#notifications])
+  )
+  equal(fake.responses[#fake.responses], {
+    id = 51,
+    result = { decision = "accept" },
+  }, "Tab should approve the complete multi-file patch")
+  truthy(seal._state.reviews["51"] == nil, "an accepted patch should leave the review queue")
+end
+
+function tests.changed_review_target_cannot_be_accepted()
+  setup({ "local value = 1" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("change this value")
+  local source = vim.api.nvim_get_current_buf()
+  local source_path = vim.api.nvim_buf_get_name(source)
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = {
+      id = "patch-2",
+      type = "fileChange",
+      status = "inProgress",
+      changes = {
+        {
+          path = source_path,
+          kind = { type = "update" },
+          diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+        },
+      },
+    },
+  })
+  seal._server_request({
+    id = 52,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "patch-2" },
+  })
+
+  vim.api.nvim_buf_set_lines(source, 0, -1, false, { "local user_value = 3" })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  local review = seal._state.reviews["52"]
+  truthy(review and review.warning, "the stale review should become non-acceptable")
+  truthy(vim.fn.maparg("<Tab>", "n", false, true).callback == nil, "the blocked review should remove acceptance")
+  equal(#fake.responses, 0, "a stale diff must not be approved")
+
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+  equal(fake.responses[#fake.responses], {
+    id = 52,
+    result = { decision = "decline" },
+  }, "Esc should safely reject the stale patch")
+end
+
+function tests.unsafe_patch_has_no_accept_mapping()
+  setup({ "" })
+  seal.submit("change a file")
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = {
+      id = "patch-3",
+      type = "fileChange",
+      status = "inProgress",
+      changes = {
+        {
+          path = "/tmp/outside-seal-project.lua",
+          kind = { type = "add" },
+          diff = "@@ -0,0 +1 @@\n+unsafe",
+        },
+      },
+    },
+  })
+  seal._server_request({
+    id = 53,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "patch-3", grantRoot = "/tmp" },
+  })
+
+  local review = seal._state.reviews["53"]
+  truthy(review and review.warning, "broader write access should block acceptance")
+  truthy(vim.fn.maparg("<Tab>", "n", false, true).callback == nil, "unsafe patches should not offer acceptance")
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+  equal(fake.responses[#fake.responses].result.decision, "decline", "unsafe patches should remain rejectable")
+end
+
+function tests.command_approval_warns_about_unpreviewed_writes()
+  local approval_prompt
+  setup({ "" }, {
+    select = function(items, opts, callback)
+      approval_prompt = opts.prompt
+      callback(items[1])
+    end,
+  })
+  seal.submit("run the focused test")
+  local command = "make test " .. string.rep("x", 180) .. " && remove-important-file"
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = {
+      id = "command-1",
+      type = "commandExecution",
+      command = command,
+      cwd = "/tmp/seal-project",
+      status = "inProgress",
+    },
+  })
+  seal._server_request({
+    id = 54,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "command-1",
+      reason = "run the requested test",
+      environmentId = "local-workspace",
+      availableDecisions = { "accept", "decline", "cancel", "acceptForSession" },
+    },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 54,
+    result = { decision = "accept" },
+  }, "an explicitly accepted command should resume Codex")
+  truthy(
+    notifications[#notifications].message:find("without a patch preview", 1, true),
+    "command approval should explain its weaker review boundary"
+  )
+  truthy(approval_prompt:find("remove-important-file", 1, true), "the approval must not truncate a dangerous suffix")
+  truthy(approval_prompt:find("/tmp/seal-project", 1, true), "the approval should show the working directory")
+  truthy(approval_prompt:find("local-workspace", 1, true), "the approval should show the execution environment")
+  truthy(approval_prompt:find("run the requested test", 1, true), "the approval should show Codex's reason")
+end
+
+function tests.command_approval_honors_available_decisions()
+  local labels
+  setup({ "" }, {
+    select = function(items, _, callback)
+      labels = vim.tbl_map(function(item)
+        return item.label
+      end, items)
+      callback(items[1])
+    end,
+  })
+  seal.submit("consider a command")
+  seal._server_request({
+    id = 57,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "command-2",
+      command = "make test",
+      availableDecisions = { "decline", "cancel", "acceptForSession" },
+    },
+  })
+  equal(labels, { "Decline and continue", "Decline and stop the turn" }, "Seal should offer only safe advertised choices")
+  equal(fake.responses[#fake.responses].result.decision, "decline", "the advertised decline should be sent unchanged")
+end
+
+function tests.dismissed_command_uses_the_advertised_cancel()
+  setup({ "" }, {
+    select = function(_, _, callback)
+      callback(nil)
+    end,
+  })
+  seal.submit("consider a command")
+  seal._server_request({
+    id = 59,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "command-3",
+      command = "make test",
+      availableDecisions = { "accept", "cancel" },
+    },
+  })
+  equal(fake.responses[#fake.responses].result.decision, "cancel", "dismissing the dialog should use advertised cancel")
+end
+
+function tests.external_resolution_surfaces_the_next_patch_review()
+  setup({ "" })
+  seal.submit("make two changes")
+  seal._state.live["/tmp/second-project"] = {
+    root = "/tmp/second-project",
+    thread_id = "second-thread",
+    active_turn_id = "second-turn",
+  }
+  seal._state.owned_turns["second-turn"] = {
+    root = "/tmp/second-project",
+    thread_id = "second-thread",
+  }
+  for index = 1, 2 do
+    local item_id = "queued-patch-" .. index
+    local thread_id = index == 1 and "main-thread" or "second-thread"
+    local turn_id = index == 1 and "main-turn" or "second-turn"
+    local project = index == 1 and "/tmp/seal-project" or "/tmp/second-project"
+    seal._notification("item/started", {
+      threadId = thread_id,
+      turnId = turn_id,
+      item = {
+        id = item_id,
+        type = "fileChange",
+        status = "inProgress",
+        changes = {
+          {
+            path = string.format("%s/queued-%d.lua", project, index),
+            kind = { type = "add" },
+            diff = "@@ -0,0 +1 @@\n+return true",
+          },
+        },
+      },
+    })
+    seal._server_request({
+      id = 60 + index,
+      method = "item/fileChange/requestApproval",
+      params = { threadId = thread_id, turnId = turn_id, itemId = item_id },
+    })
+  end
+  truthy(seal._state.reviews["62"].view ~= nil, "the newest queued review should be visible")
+  seal._notification("serverRequest/resolved", { requestId = 62 })
+  truthy(vim.wait(500, function()
+    local review = seal._state.reviews["61"]
+    return review and review.view and vim.api.nvim_win_is_valid(review.view.win)
+  end, 5), "external resolution should surface the next queued review")
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+end
+
+function tests.review_mode_does_not_steer_a_tui_owned_turn()
+  setup({ "" })
+  seal.submit("establish the Seal turn")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  fake.thread_status = { type = "active", activeFlags = {} }
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "tui-turn", status = "inProgress" },
+  })
+  seal.submit("do not inherit the TUI policy")
+  truthy(request(fake, "turn/steer") == nil, "Seal must not steer a turn whose review policy it did not establish")
+  truthy(notifications[#notifications].message:find("TUI turn", 1, true), "the policy boundary should be explained")
+end
+
+function tests.seal_owned_child_thread_can_request_patch_review()
+  setup({ "" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("delegate a focused change")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+  seal._notification("thread/started", {
+    thread = {
+      id = "child-thread",
+      parentThreadId = "main-thread",
+      status = { type = "active", activeFlags = {} },
+    },
+  })
+  seal._notification("turn/started", {
+    threadId = "child-thread",
+    turn = { id = "child-turn", status = "inProgress" },
+  })
+  seal._notification("item/started", {
+    threadId = "child-thread",
+    turnId = "child-turn",
+    item = {
+      id = "child-patch",
+      type = "fileChange",
+      status = "inProgress",
+      changes = {
+        {
+          path = "/tmp/seal-project/child.lua",
+          kind = { type = "add" },
+          diff = "@@ -0,0 +1 @@\n+return true",
+        },
+      },
+    },
+  })
+  seal._server_request({
+    id = 55,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "child-thread", turnId = "child-turn", itemId = "child-patch" },
+  })
+
+  local review = seal._state.reviews["55"]
+  truthy(review and review.root == "/tmp/seal-project", "a Seal-owned child should inherit the main review root")
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+  equal(fake.responses[#fake.responses].result.decision, "decline", "child patches should use the same review decision")
+end
+
+function tests.child_approval_recovers_parent_ancestry_after_a_race()
+  setup({ "" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("delegate immediately")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+  local original_request = fake.request
+  function fake:request(method, params, callback)
+    if method == "thread/read" and params.threadId == "racy-child" then
+      table.insert(self.requests, { method = method, params = params })
+      callback({
+        thread = {
+          id = "racy-child",
+          parentThreadId = "main-thread",
+          status = { type = "active", activeFlags = {} },
+        },
+      })
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+  seal._notification("item/started", {
+    threadId = "racy-child",
+    turnId = "racy-child-turn",
+    item = {
+      id = "racy-patch",
+      type = "fileChange",
+      status = "inProgress",
+      changes = {
+        {
+          path = "/tmp/seal-project/racy.lua",
+          kind = { type = "add" },
+          diff = "@@ -0,0 +1 @@\n+return true",
+        },
+      },
+    },
+  })
+  seal._server_request({
+    id = 58,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "racy-child", turnId = "racy-child-turn", itemId = "racy-patch" },
+  })
+
+  local review = seal._state.reviews["58"]
+  truthy(review and review.root == "/tmp/seal-project", "thread/read ancestry should recover child ownership")
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+end
+
+function tests.resolved_child_request_does_not_reopen_after_ancestry_lookup()
+  setup({ "" })
+  seal.submit("delegate immediately")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "inProgress" },
+  })
+  local original_request = fake.request
+  local held_read
+  function fake:request(method, params, callback)
+    if method == "thread/read" and params.threadId == "delayed-child" then
+      table.insert(self.requests, { method = method, params = params })
+      held_read = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+  seal._server_request({
+    id = 63,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "delayed-child", turnId = "delayed-turn", itemId = "delayed-patch" },
+  })
+  truthy(held_read ~= nil, "the child request should wait for ancestry")
+  seal._notification("serverRequest/resolved", { requestId = 63 })
+  held_read({
+    thread = {
+      id = "delayed-child",
+      parentThreadId = "main-thread",
+      status = { type = "active", activeFlags = {} },
+    },
+  })
+  truthy(seal._state.reviews["63"] == nil, "a resolved request must not reopen after delayed ancestry")
+end
+
+function tests.tui_owned_child_thread_is_not_claimed_by_seal()
+  setup({ "" })
+  seal.submit("establish the main thread")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "tui-turn", status = "inProgress" },
+  })
+  seal._notification("thread/started", {
+    thread = {
+      id = "tui-child-thread",
+      parentThreadId = "main-thread",
+      status = { type = "active", activeFlags = {} },
+    },
+  })
+  seal._notification("turn/started", {
+    threadId = "tui-child-thread",
+    turn = { id = "tui-child-turn", status = "inProgress" },
+  })
+  local response_count = #fake.responses
+  seal._server_request({
+    id = 56,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "tui-child-thread", turnId = "tui-child-turn", itemId = "tui-child-patch" },
+  })
+  equal(#fake.responses, response_count, "the attached TUI should retain control of its child's approvals")
+  truthy(seal._state.reviews["56"] == nil, "Seal should not open a review for a TUI-owned child")
 end
 
 function tests.parallel_pending_forks_both_start()
@@ -1610,6 +2073,27 @@ function tests.javascript_arrow_function_is_accepted()
   truthy(valid, reason or "a JavaScript arrow function should validate as one function")
 end
 
+function tests.interface_equivalents_are_accepted()
+  setup({ "" }, { validate_declarations = true })
+  vim.bo.filetype = "rust"
+  local snapshot = seal._capture()
+  local rust_valid, rust_reason = seal._validate_declaration(snapshot, {
+    "pub trait Storage {",
+    "    fn load(&self, key: &str) -> String;",
+    "}",
+  }, "interface")
+  truthy(rust_valid, rust_reason or "a Rust trait should satisfy an interface request")
+
+  vim.bo.filetype = "go"
+  snapshot = seal._capture()
+  local go_valid, go_reason = seal._validate_declaration(snapshot, {
+    "type Storage interface {",
+    "    Load(key string) string",
+    "}",
+  }, "interface")
+  truthy(go_valid, go_reason or "a Go interface declaration should validate through its type wrapper")
+end
+
 function tests.prompt_keeps_originating_snapshot()
   setup({ "original" })
   local deliver
@@ -1669,6 +2153,18 @@ local order = {
   "thread_setting_changes_flow_into_forks",
   "null_thread_settings_are_omitted_from_forks",
   "server_request_is_resolved_without_an_interactive_client",
+  "multi_file_patch_waits_for_review_and_acceptance",
+  "changed_review_target_cannot_be_accepted",
+  "unsafe_patch_has_no_accept_mapping",
+  "command_approval_warns_about_unpreviewed_writes",
+  "command_approval_honors_available_decisions",
+  "dismissed_command_uses_the_advertised_cancel",
+  "external_resolution_surfaces_the_next_patch_review",
+  "review_mode_does_not_steer_a_tui_owned_turn",
+  "seal_owned_child_thread_can_request_patch_review",
+  "child_approval_recovers_parent_ancestry_after_a_race",
+  "resolved_child_request_does_not_reopen_after_ancestry_lookup",
+  "tui_owned_child_thread_is_not_claimed_by_seal",
   "parallel_pending_forks_both_start",
   "cancel_before_turn_start_response_uses_startup_interrupt",
   "turn_started_notification_supplies_the_declaration_turn_id",
@@ -1706,6 +2202,7 @@ local order = {
   "wrong_declaration_kind_is_rejected",
   "wrapper_with_multiple_functions_is_rejected",
   "javascript_arrow_function_is_accepted",
+  "interface_equivalents_are_accepted",
   "prompt_keeps_originating_snapshot",
 }
 
