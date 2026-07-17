@@ -2,7 +2,7 @@ local Client = require("seal.client")
 local Chat = require("seal.chat")
 
 local M = {}
-local namespace = vim.api.nvim_create_namespace("seal-preview")
+local activity_namespace = vim.api.nvim_create_namespace("seal-activity")
 local context_namespace = vim.api.nvim_create_namespace("seal-context")
 
 local defaults = {
@@ -13,6 +13,11 @@ local defaults = {
   main_approval_policy = "never",
   save_before_agent = true,
   validate_declarations = true,
+  activity = {
+    interval_ms = 80,
+    max_summary_cells = 56,
+    frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+  },
   keymaps = {
     prompt = "<leader>ai",
     chat = "<leader>ac",
@@ -38,6 +43,14 @@ local state = {
   sessions = {},
   live = {},
   loading = {},
+  jobs = {},
+  jobs_by_thread = {},
+  job_mappings = {},
+  internal_ticks = {},
+  spinner_timer = nil,
+  spinner_frame = 1,
+  job_sequence = 0,
+  -- Kept as aliases for callers that only need the old single-job booleans.
   generation = nil,
   preview = nil,
   chat = nil,
@@ -324,20 +337,171 @@ local function turn_sandbox_policy(mode)
   return nil
 end
 
-local function remove_preview_ui(preview)
-  if vim.api.nvim_buf_is_valid(preview.buf) then
-    pcall(vim.api.nvim_buf_del_extmark, preview.buf, namespace, preview.extmark)
-    for _, mapping in ipairs(preview.mappings or {}) do
-      pcall(vim.keymap.del, "n", mapping.lhs, { buffer = preview.buf })
+local function previous_buffer_map(buf, lhs)
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+    if mapping.lhs == lhs then
+      return mapping
+    end
+  end
+end
+
+local function global_map(lhs)
+  for _, mapping in ipairs(vim.api.nvim_get_keymap("n")) do
+    if mapping.lhs == lhs then
+      return mapping
+    end
+  end
+end
+
+local function sync_job_aliases()
+  state.generation = nil
+  state.preview = nil
+  for _, job in pairs(state.jobs) do
+    if job.phase == "generating" and not state.generation then
+      state.generation = job
+    elseif job.phase == "ready" and not state.preview then
+      state.preview = job
+    end
+  end
+end
+
+local function has_generating_jobs()
+  for _, job in pairs(state.jobs) do
+    if job.phase == "generating" then
+      return true
+    end
+  end
+  return false
+end
+
+local function has_buffer_jobs(buf)
+  for _, job in pairs(state.jobs) do
+    if job.snapshot.buf == buf then
+      return true
+    end
+  end
+  return false
+end
+
+local function job_position(job)
+  local buf = job.snapshot.buf
+  if not job.extmark or not vim.api.nvim_buf_is_valid(buf) then
+    return nil
+  end
+  local ok, position = pcall(vim.api.nvim_buf_get_extmark_by_id, buf, activity_namespace, job.extmark, {})
+  if not ok or #position ~= 2 then
+    return nil
+  end
+  return position
+end
+
+local function summary_text(kind, prompt)
+  local text = vim.trim((prompt or ""):gsub("[%c%s]+", " "))
+  local summary = kind .. " · " .. text
+  local limit = math.max(8, config.activity.max_summary_cells or 56)
+  if vim.fn.strdisplaywidth(summary) <= limit then
+    return summary
+  end
+  local parts = {}
+  local width = 0
+  for index = 0, vim.fn.strchars(summary) - 1 do
+    local char = vim.fn.strcharpart(summary, index, 1)
+    local char_width = vim.fn.strdisplaywidth(char)
+    if width + char_width > limit - 1 then
+      break
+    end
+    table.insert(parts, char)
+    width = width + char_width
+  end
+  return table.concat(parts) .. "…"
+end
+
+local function stop_spinner_if_idle()
+  if has_generating_jobs() or not state.spinner_timer then
+    return
+  end
+  pcall(vim.fn.timer_stop, state.spinner_timer)
+  state.spinner_timer = nil
+  state.spinner_frame = 1
+end
+
+local function render_spinner(job)
+  local buf = job.snapshot.buf
+  if job.phase ~= "generating" or not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+  local position = job_position(job) or { job.snapshot.row, job.snapshot.column }
+  local frames = config.activity.frames or {}
+  local frame = frames[state.spinner_frame] or "⠋"
+  local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, buf, activity_namespace, position[1], position[2], {
+    id = job.extmark,
+    right_gravity = false,
+    strict = false,
+    virt_text = {
+      { " " .. frame .. " ", "SealSpinner" },
+      { job.summary, "SealSpinnerSummary" },
+    },
+    virt_text_pos = "inline",
+    hl_mode = "combine",
+    priority = 200,
+  })
+  if not ok then
+    return false
+  end
+  job.extmark = extmark
+  return true
+end
+
+local cancel_job
+
+function M._tick_activity()
+  local frames = config.activity.frames or {}
+  state.spinner_frame = state.spinner_frame % math.max(1, #frames) + 1
+  local stale = {}
+  for _, job in pairs(state.jobs) do
+    if job.phase == "generating" and not render_spinner(job) then
+      table.insert(stale, job)
+    end
+  end
+  for _, job in ipairs(stale) do
+    cancel_job(job, true)
+  end
+  stop_spinner_if_idle()
+end
+
+local function ensure_spinner()
+  if state.spinner_timer or not has_generating_jobs() then
+    return
+  end
+  local timer
+  timer = vim.fn.timer_start(config.activity.interval_ms or 80, function()
+    if state.spinner_timer == timer then
+      M._tick_activity()
+    end
+  end, { ["repeat"] = -1 })
+  state.spinner_timer = timer
+end
+
+local function restore_job_mappings(buf)
+  local mappings = state.job_mappings[buf]
+  state.job_mappings[buf] = nil
+  if not mappings or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  for _, mapping in ipairs(mappings) do
+    local current = previous_buffer_map(buf, mapping.lhs)
+    if current and current.callback == mapping.callback then
+      pcall(vim.keymap.del, "n", mapping.lhs, { buffer = buf })
       if mapping.previous then
         local previous = mapping.previous
         local rhs = previous.callback or previous.rhs
         if type(rhs) == "function" or type(rhs) == "string" then
           pcall(vim.keymap.set, "n", mapping.lhs, rhs, {
-            buffer = preview.buf,
+            buffer = buf,
             desc = previous.desc,
             expr = previous.expr == 1,
             nowait = previous.nowait == 1,
+            replace_keycodes = previous.replace_keycodes == 1,
             remap = previous.noremap == 0,
             silent = previous.silent == 1,
           })
@@ -347,13 +511,157 @@ local function remove_preview_ui(preview)
   end
 end
 
-local function clear_preview()
-  local preview = state.preview
-  state.preview = nil
-  if not preview then
+local function job_at_cursor(buf)
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local exact = {}
+  for _, job in pairs(state.jobs) do
+    if job.snapshot.buf == buf then
+      local position = job_position(job)
+      if position and position[1] == row then
+        table.insert(exact, job)
+      end
+    end
+  end
+  table.sort(exact, function(left, right)
+    return left.id > right.id
+  end)
+  if #exact > 0 then
+    return exact[1]
+  end
+  return nil
+end
+
+local function mapping_feed_mode(mapping)
+  return mapping and mapping.noremap == 0 and "m" or "n"
+end
+
+local function feed_mapping_keys(keys, mapping, count, expression_result)
+  if count > 0 then
+    keys = tostring(count) .. keys
+  end
+  if not expression_result or not mapping or mapping.replace_keycodes == 1 then
+    keys = vim.api.nvim_replace_termcodes(keys, true, false, true)
+  end
+  vim.api.nvim_feedkeys(keys, mapping_feed_mode(mapping), false)
+end
+
+local function replay_mapping(mapping, lhs, count)
+  if mapping and type(mapping.callback) == "function" then
+    local result = mapping.callback()
+    if mapping.expr == 1 and type(result) == "string" and result ~= "" then
+      feed_mapping_keys(result, mapping, count, true)
+    end
+    return
+  end
+  local keys
+  if mapping and mapping.expr == 1 and mapping.rhs and mapping.rhs ~= "" then
+    local ok, result = pcall(vim.api.nvim_eval, mapping.rhs)
+    keys = ok and type(result) == "string" and result or lhs
+  else
+    keys = mapping and mapping.rhs and mapping.rhs ~= "" and mapping.rhs or lhs
+  end
+  feed_mapping_keys(keys, mapping, count, mapping and mapping.expr == 1)
+end
+
+local function ensure_job_mappings(buf)
+  if state.job_mappings[buf] then
+    return
+  end
+  local mappings = {}
+  for _, lhs in ipairs({ "<Tab>", "<Esc>" }) do
+    local key = lhs
+    local previous = previous_buffer_map(buf, key)
+    local mapping = {
+      lhs = key,
+      previous = previous,
+      fallback = previous or global_map(key),
+    }
+    local callback = function()
+      local count = vim.v.count
+      local job = job_at_cursor(buf)
+      if not job then
+        replay_mapping(mapping.fallback, key, count)
+      elseif key == "<Tab>" then
+        M.accept(job.id)
+      else
+        M.reject(job.id)
+      end
+    end
+    mapping.callback = callback
+    table.insert(mappings, mapping)
+    vim.keymap.set("n", key, callback, {
+      buffer = buf,
+      nowait = true,
+      silent = true,
+      desc = key == "<Tab>" and "Accept Seal result" or "Reject Seal job",
+    })
+  end
+  state.job_mappings[buf] = mappings
+end
+
+local function detach_job(job)
+  if state.jobs[job.id] ~= job then
     return false
   end
-  remove_preview_ui(preview)
+  state.jobs[job.id] = nil
+  if job.fork_id and state.jobs_by_thread[job.fork_id] == job then
+    state.jobs_by_thread[job.fork_id] = nil
+  end
+  if job.extmark and vim.api.nvim_buf_is_valid(job.snapshot.buf) then
+    pcall(vim.api.nvim_buf_del_extmark, job.snapshot.buf, activity_namespace, job.extmark)
+  end
+  sync_job_aliases()
+  if not has_buffer_jobs(job.snapshot.buf) then
+    restore_job_mappings(job.snapshot.buf)
+  end
+  stop_spinner_if_idle()
+  return true
+end
+
+cancel_job = function(job, interrupt)
+  local was_generating = job.phase == "generating"
+  local fork_id = job.fork_id
+  local turn_id = job.turn_id
+  if not detach_job(job) then
+    return false
+  end
+  job.cancelled = true
+  if interrupt and was_generating and fork_id and state.client then
+    job.interrupt_requested = true
+    -- Codex treats an empty turn ID as a startup interrupt. This closes the
+    -- race where the turn is running but turn/start has not replied yet.
+    state.client:request("turn/interrupt", {
+      threadId = fork_id,
+      turnId = turn_id or "",
+    }, function()
+      unsubscribe_thread(fork_id)
+    end)
+  end
+  return true
+end
+
+local function clear_jobs(predicate, interrupt)
+  local jobs = {}
+  for _, job in pairs(state.jobs) do
+    if not predicate or predicate(job) then
+      table.insert(jobs, job)
+    end
+  end
+  for _, job in ipairs(jobs) do
+    cancel_job(job, interrupt)
+  end
+  return #jobs > 0
+end
+
+local function add_job(job)
+  state.jobs[job.id] = job
+  sync_job_aliases()
+  ensure_job_mappings(job.snapshot.buf)
+  if not render_spinner(job) then
+    detach_job(job)
+    return false
+  end
+  ensure_spinner()
   return true
 end
 
@@ -364,6 +672,13 @@ local function handle_notification(method, params)
   end
   if method == "thread/status/changed" then
     set_thread_status(params.threadId, params.status)
+    local job = state.jobs_by_thread[params.threadId]
+    local status = params.status and params.status.type
+    if job and (status == "notLoaded" or status == "systemError") then
+      cancel_job(job, false)
+      unsubscribe_thread(params.threadId)
+      notify("Codex stopped the declaration thread", vim.log.levels.ERROR)
+    end
     return
   end
   if method == "thread/settings/updated" then
@@ -383,12 +698,19 @@ local function handle_notification(method, params)
   end
   if method == "thread/closed" then
     set_thread_status(params.threadId, { type = "notLoaded" })
+    local job = state.jobs_by_thread[params.threadId]
+    if job then
+      cancel_job(job, false)
+      notify("Codex closed the declaration thread", vim.log.levels.ERROR)
+    end
     return
   end
   if method == "turn/started" then
     local session = find_session_by_thread(params.threadId)
     if session and params.turn then
-      M.reject()
+      clear_jobs(function(job)
+        return job.source_thread_id == session.thread_id
+      end, true)
       session.active_turn_id = params.turn.id
       if refresh_chat then
         vim.schedule(function()
@@ -420,38 +742,38 @@ local function handle_notification(method, params)
     end
   end
 
-  local generation = state.generation
-  if not generation or params.threadId ~= generation.fork_id then
+  local job = state.jobs_by_thread[params.threadId]
+  if not job or job.phase ~= "generating" then
     return
   end
 
-  if params.turnId and generation.turn_id and params.turnId ~= generation.turn_id then
+  local notification_turn_id = params.turnId or (params.turn and params.turn.id)
+  if notification_turn_id and job.turn_id and notification_turn_id ~= job.turn_id then
     return
   end
-  if params.turnId and not generation.turn_id then
-    generation.turn_id = params.turnId
+  if notification_turn_id and not job.turn_id then
+    job.turn_id = notification_turn_id
   end
 
   if method == "item/completed" then
     local item = params.item or {}
     if item.type == "agentMessage" then
-      generation.answer = item.text
-      generation.answer_phase = item.phase
+      job.answer = item.text
+      job.answer_phase = item.phase
     end
   elseif method == "turn/completed" then
-    generation.turn_status = params.turn and params.turn.status or "failed"
+    job.turn_status = params.turn and params.turn.status or "failed"
     vim.schedule(function()
-      M._finish_generation(generation)
+      M._finish_generation(job)
     end)
   elseif method == "error" then
-    generation.notification_error = params.error and params.error.message or "Codex turn failed"
+    job.notification_error = params.error and params.error.message or "Codex turn failed"
   end
 end
 
 local function handle_server_request(request)
   local params = request.params or {}
-  local generation = state.generation
-  local is_generation = generation and params.threadId == generation.fork_id
+  local is_generation = state.jobs_by_thread[params.threadId] ~= nil
   local session = find_session_by_thread(params.threadId)
   local turn_id = params.turnId or (session and session.active_turn_id)
   if not is_generation and (not turn_id or not state.owned_turns[turn_id]) then
@@ -492,8 +814,9 @@ local function client()
     on_exit = function(_, expected)
       state.live = {}
       state.owned_turns = {}
-      if state.generation then
-        state.generation = nil
+      local had_generating = has_generating_jobs()
+      clear_jobs(nil, false)
+      if had_generating then
         notify("Declaration generation stopped with the app-server", vim.log.levels.WARN)
       end
       if not expected and not state.stopping then
@@ -592,6 +915,9 @@ local function with_session_status(root, callback)
       threadId = session.thread_id,
       includeTurns = false,
     }, function(result, read_err)
+      if state.live[root] ~= session then
+        return
+      end
       if read_err or not result or not result.thread then
         notify(error_message(read_err, "could not read Codex thread"), vim.log.levels.ERROR)
         return
@@ -1181,98 +1507,101 @@ local function validate_declaration(snapshot, lines, kind)
   return valid, reason
 end
 
-local function previous_buffer_map(buf, lhs)
-  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
-    if mapping.lhs == lhs then
-      return mapping
-    end
-  end
-end
-
-local function render_preview(snapshot, lines)
-  if not snapshot_valid(snapshot) then
+local function render_preview(job, lines)
+  local snapshot = job.snapshot
+  if state.jobs[job.id] ~= job or not snapshot_valid(snapshot) then
     notify("The buffer or file changed while Codex was working; result discarded", vim.log.levels.WARN)
+    cancel_job(job, false)
     return false
   end
 
-  clear_preview()
+  local position = job_position(job)
+  if not position then
+    cancel_job(job, false)
+    return false
+  end
+  snapshot.row = position[1]
+  snapshot.column = position[2]
   local virtual_lines = {}
   for _, line in ipairs(lines) do
     table.insert(virtual_lines, { { line, "SealPreview" } })
   end
-  local extmark = vim.api.nvim_buf_set_extmark(snapshot.buf, namespace, snapshot.row, 0, {
+  local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, snapshot.buf, activity_namespace, position[1], position[2], {
+    id = job.extmark,
+    right_gravity = false,
+    strict = false,
     virt_lines = virtual_lines,
     virt_lines_above = true,
-    virt_text = { { "  Tab accept · Esc reject", "SealPreviewHint" } },
-    virt_text_pos = "right_align",
+    virt_text = {
+      { " ✓ ", "SealReady" },
+      { job.summary .. " · Tab accept · Esc reject", "SealPreviewHint" },
+    },
+    virt_text_pos = "eol",
     priority = 200,
   })
-
-  local mappings = {}
-  for _, mapping in ipairs({ { lhs = "<Tab>", callback = M.accept }, { lhs = "<Esc>", callback = M.reject } }) do
-    table.insert(mappings, {
-      lhs = mapping.lhs,
-      previous = previous_buffer_map(snapshot.buf, mapping.lhs),
-    })
-    vim.keymap.set("n", mapping.lhs, mapping.callback, {
-      buffer = snapshot.buf,
-      nowait = true,
-      silent = true,
-      desc = mapping.lhs == "<Tab>" and "Accept Seal result" or "Reject Seal result",
-    })
+  if not ok then
+    cancel_job(job, false)
+    return false
   end
-
-  state.preview = {
-    buf = snapshot.buf,
-    changedtick = snapshot.changedtick,
-    file = snapshot.file,
-    file_stamp = snapshot.file_stamp,
-    file_digest = snapshot.file_digest,
-    row = snapshot.row,
-    replace_blank = snapshot.replace_blank,
-    lines = lines,
-    extmark = extmark,
-    mappings = mappings,
-  }
+  job.extmark = extmark
+  job.phase = "ready"
+  job.lines = lines
+  sync_job_aliases()
+  stop_spinner_if_idle()
   notify("Declaration ready: Tab accepts, Esc rejects")
   return true
 end
 
-function M._finish_generation(generation)
-  if state.generation ~= generation then
+function M._finish_generation(job)
+  if state.jobs[job.id] ~= job or job.phase ~= "generating" then
     return
   end
-  state.generation = nil
-  unsubscribe_thread(generation.fork_id)
-  if generation.cancelled then
+  if job.fork_id and state.jobs_by_thread[job.fork_id] == job then
+    state.jobs_by_thread[job.fork_id] = nil
+  end
+  unsubscribe_thread(job.fork_id)
+  if job.cancelled then
+    cancel_job(job, false)
     return
   end
-  if generation.turn_status ~= "completed" then
-    notify(generation.notification_error or "Codex did not complete the declaration", vim.log.levels.ERROR)
+  if job.turn_status ~= "completed" then
+    notify(job.notification_error or "Codex did not complete the declaration", vim.log.levels.ERROR)
+    cancel_job(job, false)
     return
   end
-  if not generation.answer then
+  if not job.answer then
     notify("Codex completed without returning a declaration", vim.log.levels.ERROR)
+    cancel_job(job, false)
     return
   end
 
-  local answer = strip_fence(generation.answer)
+  local answer = strip_fence(job.answer)
   local ok, decoded = pcall(vim.json.decode, answer)
   if not ok or type(decoded) ~= "table" or type(decoded.code) ~= "string" then
     notify("Codex returned an invalid declaration payload", vim.log.levels.ERROR)
+    cancel_job(job, false)
     return
   end
-  local lines = normalize_code(decoded.code, generation.snapshot.base_indent)
+  local position = job_position(job)
+  if not position then
+    cancel_job(job, false)
+    return
+  end
+  job.snapshot.row = position[1]
+  job.snapshot.column = position[2]
+  local lines = normalize_code(decoded.code, job.snapshot.base_indent)
   if #lines == 0 then
     notify("Codex returned an empty declaration", vim.log.levels.ERROR)
+    cancel_job(job, false)
     return
   end
-  local valid, reason = validate_declaration(generation.snapshot, lines, generation.kind)
+  local valid, reason = validate_declaration(job.snapshot, lines, job.kind)
   if not valid then
     notify("Declaration rejected: " .. reason, vim.log.levels.ERROR)
+    cancel_job(job, false)
     return
   end
-  render_preview(generation.snapshot, lines)
+  render_preview(job, lines)
 end
 
 local function start_declaration(session, snapshot, route)
@@ -1291,7 +1620,13 @@ local function start_declaration(session, snapshot, route)
       return
     end
   end
-  M.reject()
+  for _, existing in pairs(state.jobs) do
+    local position = job_position(existing)
+    if existing.snapshot.buf == snapshot.buf and position and position[1] == snapshot.row then
+      notify("A Seal job already exists on this line", vim.log.levels.WARN)
+      return
+    end
+  end
 
   local declaration_prompt = table.concat({
     "Generate one focused code declaration for Seal.",
@@ -1305,35 +1640,38 @@ local function start_declaration(session, snapshot, route)
     route.prompt,
   }, " ")
 
-  local generation = {
+  state.job_sequence = state.job_sequence + 1
+  local job = {
+    id = state.job_sequence,
+    phase = "generating",
     snapshot = snapshot,
     source_thread_id = session.thread_id,
     kind = route.kind,
+    summary = summary_text(route.kind, route.prompt),
   }
-  state.generation = generation
+  if not add_job(job) then
+    notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
+    return
+  end
   notify("Codex is generating one " .. route.kind .. "…")
 
   local function start_turn(result, err)
-    if state.generation ~= generation then
+    if state.jobs[job.id] ~= job or job.phase ~= "generating" then
       if result and result.thread then
         unsubscribe_thread(result.thread.id)
       end
       return
     end
     if err or not result or not result.thread then
-      state.generation = nil
+      cancel_job(job, false)
       notify(error_message(err, "could not create a declaration thread"), vim.log.levels.ERROR)
       return
     end
 
-    generation.fork_id = result.thread.id
-    if generation.cancelled then
-      state.generation = nil
-      unsubscribe_thread(generation.fork_id)
-      return
-    end
+    job.fork_id = result.thread.id
+    state.jobs_by_thread[job.fork_id] = job
     client():request("turn/start", {
-      threadId = generation.fork_id,
+      threadId = job.fork_id,
       clientUserMessageId = next_client_id(),
       input = { { type = "text", text = declaration_prompt } },
       additionalContext = additional_context(snapshot),
@@ -1344,32 +1682,18 @@ local function start_declaration(session, snapshot, route)
         additionalProperties = false,
       },
     }, function(turn_result, turn_err)
-      if state.generation ~= generation then
-        if turn_result and turn_result.turn and generation.fork_id then
-          client():request("turn/interrupt", {
-            threadId = generation.fork_id,
-            turnId = turn_result.turn.id,
-          }, function()
-            unsubscribe_thread(generation.fork_id)
-          end)
-        else
-          unsubscribe_thread(generation.fork_id)
+      if state.jobs[job.id] ~= job or job.phase ~= "generating" then
+        if not job.interrupt_requested then
+          unsubscribe_thread(job.fork_id)
         end
         return
       end
       if turn_err or not turn_result or not turn_result.turn then
-        state.generation = nil
-        unsubscribe_thread(generation.fork_id)
+        cancel_job(job, true)
         notify(error_message(turn_err, "could not start declaration turn"), vim.log.levels.ERROR)
         return
       end
-      generation.turn_id = turn_result.turn.id
-      if generation.cancelled then
-        client():request("turn/interrupt", {
-          threadId = generation.fork_id,
-          turnId = generation.turn_id,
-        }, function() end)
-      end
+      job.turn_id = turn_result.turn.id
     end)
   end
 
@@ -1398,7 +1722,7 @@ local function start_declaration(session, snapshot, route)
     threadId = session.thread_id,
     excludeTurns = true,
   }), function(result, err)
-    if state.generation ~= generation then
+    if state.jobs[job.id] ~= job or job.phase ~= "generating" then
       if result and result.thread then
         unsubscribe_thread(result.thread.id)
       end
@@ -1558,7 +1882,6 @@ local function start_agent(session, snapshot, prompt)
     )
     return
   end
-  M.reject()
   if config.save_before_agent and snapshot.modified and vim.api.nvim_buf_is_valid(snapshot.buf) then
     local source_file = snapshot.file
     local anchors = anchor_snapshot(snapshot)
@@ -1600,6 +1923,11 @@ local function start_agent(session, snapshot, prompt)
       return
     end
   end
+  -- Once the workspace-writing request is sent, declarations derived from
+  -- this chat can become stale. Keep them until all save/format checks pass.
+  clear_jobs(function(job)
+    return job.source_thread_id == session.thread_id
+  end, true)
   local method = session.active_turn_id and "turn/steer" or "turn/start"
   local params = {
     threadId = session.thread_id,
@@ -1684,48 +2012,102 @@ function M.prompt(opts)
   end)
 end
 
-function M.accept()
-  local preview = state.preview
-  if not preview then
+local function selected_job(job_id)
+  if type(job_id) == "number" then
+    return state.jobs[job_id]
+  end
+  return job_at_cursor(vim.api.nvim_get_current_buf())
+end
+
+local function rebase_job(job, changedtick)
+  local position = job_position(job)
+  if not position or not vim.api.nvim_buf_is_valid(job.snapshot.buf) then
     return false
   end
-  if vim.api.nvim_get_current_buf() ~= preview.buf then
+  local line = vim.api.nvim_buf_get_lines(job.snapshot.buf, position[1], position[1] + 1, false)[1] or ""
+  if line ~= job.snapshot.line then
+    return false
+  end
+  local row_delta = position[1] - job.snapshot.row
+  job.snapshot.row = position[1]
+  job.snapshot.column = math.min(position[2], #line)
+  job.snapshot.changedtick = changedtick
+  job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = job.snapshot.buf })
+  if job.snapshot.selection_range and row_delta ~= 0 then
+    job.snapshot.selection_range.line1 = job.snapshot.selection_range.line1 + row_delta
+    job.snapshot.selection_range.line2 = job.snapshot.selection_range.line2 + row_delta
+  end
+  return true
+end
+
+local function rebase_jobs_after_insert(buf)
+  local changedtick = vim.api.nvim_buf_get_changedtick(buf)
+  state.internal_ticks[buf] = changedtick
+  local stale = {}
+  for _, job in pairs(state.jobs) do
+    if job.snapshot.buf == buf and not rebase_job(job, changedtick) then
+      table.insert(stale, job)
+    end
+  end
+  for _, job in ipairs(stale) do
+    cancel_job(job, true)
+  end
+end
+
+function M.accept(job_id)
+  local job = selected_job(job_id)
+  if not job then
+    return false
+  end
+  if job.phase ~= "ready" then
+    notify("That Seal job is still generating", vim.log.levels.INFO)
+    return false
+  end
+  local snapshot = job.snapshot
+  if vim.api.nvim_get_current_buf() ~= snapshot.buf then
     notify("Return to the source buffer before accepting", vim.log.levels.WARN)
     return false
   end
-  if not vim.api.nvim_buf_is_valid(preview.buf)
-    or vim.api.nvim_buf_get_name(preview.buf) ~= preview.file
-    or vim.api.nvim_buf_get_changedtick(preview.buf) ~= preview.changedtick
-    or not file_unchanged(preview.file, preview.file_stamp, preview.file_digest)
-  then
-    clear_preview()
+  local position = job_position(job)
+  if position then
+    snapshot.row = position[1]
+    snapshot.column = position[2]
+  end
+  if not snapshot_valid(snapshot) then
+    cancel_job(job, false)
     notify("The buffer or file changed; result discarded", vim.log.levels.WARN)
     return false
   end
+  local valid, reason = validate_declaration(snapshot, job.lines, job.kind)
+  if not valid then
+    cancel_job(job, false)
+    notify("Declaration rejected after another edit: " .. reason, vim.log.levels.ERROR)
+    return false
+  end
 
-  state.preview = nil
-  remove_preview_ui(preview)
-  local last = preview.replace_blank and preview.row + 1 or preview.row
-  vim.api.nvim_buf_set_lines(preview.buf, preview.row, last, false, preview.lines)
+  local buf = snapshot.buf
+  local row = snapshot.row
+  local last = snapshot.replace_blank and row + 1 or row
+  cancel_job(job, false)
+  local ok, insert_error = pcall(vim.api.nvim_buf_set_lines, buf, row, last, false, job.lines)
+  if not ok then
+    notify("Could not insert the declaration: " .. tostring(insert_error), vim.log.levels.ERROR)
+    return false
+  end
+  rebase_jobs_after_insert(buf)
   notify("Declaration inserted")
   return true
 end
 
-function M.reject()
-  local changed = clear_preview()
-  local generation = state.generation
-  if generation then
-    changed = true
-    state.generation = nil
-    generation.cancelled = true
-    if generation.fork_id and generation.turn_id then
-      client():request("turn/interrupt", {
-        threadId = generation.fork_id,
-        turnId = generation.turn_id,
-      }, function()
-        unsubscribe_thread(generation.fork_id)
-      end)
-    end
+function M.reject(job_id)
+  local job = selected_job(job_id)
+  if not job then
+    return false
+  end
+  local generating = job.phase == "generating"
+  local changed = cancel_job(job, true)
+  if changed then
+    notify(generating and "Seal job cancelled" or "Declaration discarded")
   end
   return changed
 end
@@ -1798,6 +2180,11 @@ function M.new_thread()
     end
 
     local function start_new()
+      if previous then
+        clear_jobs(function(job)
+          return job.source_thread_id == previous.thread_id
+        end, true)
+      end
       state.live[root] = nil
       state.sessions[root] = nil
       close_chat()
@@ -1827,8 +2214,8 @@ end
 
 function M.stop()
   state.stopping = true
-  M.reject()
-  state.generation = nil
+  clear_jobs(nil, true)
+  stop_spinner_if_idle()
   close_chat()
   if state.client then
     state.client:stop()
@@ -1842,12 +2229,23 @@ end
 function M.status()
   local root = current_project_root()
   local session = state.live[root]
+  local generating = 0
+  local ready = 0
+  for _, job in pairs(state.jobs) do
+    if job.phase == "generating" then
+      generating = generating + 1
+    elseif job.phase == "ready" then
+      ready = ready + 1
+    end
+  end
   return {
     root = root,
     thread_id = session and session.thread_id or nil,
     thread_status = session and session.status or nil,
-    generating = state.generation ~= nil,
-    preview = state.preview ~= nil,
+    generating = generating > 0,
+    preview = ready > 0,
+    generating_count = generating,
+    preview_count = ready,
     remote = state.client and state.client:url() or nil,
   }
 end
@@ -1868,6 +2266,9 @@ function M.setup(opts)
   end
   vim.api.nvim_set_hl(0, "SealPreview", { default = true, link = "DiffAdd" })
   vim.api.nvim_set_hl(0, "SealPreviewHint", { default = true, link = "Comment" })
+  vim.api.nvim_set_hl(0, "SealSpinner", { default = true, link = "DiagnosticInfo" })
+  vim.api.nvim_set_hl(0, "SealSpinnerSummary", { default = true, link = "Comment" })
+  vim.api.nvim_set_hl(0, "SealReady", { default = true, link = "DiagnosticOk" })
 
   command("Seal", function(args)
     local context = { range = args.range, line1 = args.line1, line2 = args.line2 }
@@ -1881,8 +2282,12 @@ function M.setup(opts)
       M.prompt(context)
     end
   end, { nargs = "*", range = true, desc = "Prompt Codex through Seal" })
-  command("SealAccept", M.accept, { desc = "Accept Seal declaration" })
-  command("SealReject", M.reject, { desc = "Reject Seal declaration" })
+  command("SealAccept", function()
+    M.accept()
+  end, { desc = "Accept Seal declaration" })
+  command("SealReject", function()
+    M.reject()
+  end, { desc = "Reject Seal declaration" })
   command("SealChat", M.chat, { desc = "Inspect the Seal conversation" })
   command("SealAttach", M.attach, { desc = "Copy the Codex TUI attach command" })
   command("SealNew", M.new_thread, { desc = "Start a new Seal Codex thread" })
@@ -1893,28 +2298,69 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd({ "BufReadPost", "BufWritePost" }, {
     group = group,
     callback = function(args)
-      remember_file_baseline(args.buf)
+      if args.event == "BufReadPost" then
+        remember_file_baseline(args.buf)
+        clear_jobs(function(job)
+          return job.snapshot.buf == args.buf
+        end, true)
+        return
+      end
+      local path = vim.api.nvim_buf_get_name(args.buf)
+      local changedtick = vim.api.nvim_buf_get_changedtick(args.buf)
+      local current_disk = disk_state(path)
+      local matches_disk = buffer_matches_disk(args.buf, path)
+      if matches_disk then
+        remember_file_baseline(args.buf)
+      end
+      local stale = {}
+      for _, job in pairs(state.jobs) do
+        if job.snapshot.buf == args.buf then
+          if job.snapshot.changedtick ~= changedtick or not matches_disk then
+            table.insert(stale, job)
+          else
+            job.snapshot.file_stamp = current_disk.stamp
+            job.snapshot.file_digest = current_disk.digest
+            job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = args.buf })
+          end
+        end
+      end
+      for _, job in ipairs(stale) do
+        cancel_job(job, true)
+      end
     end,
   })
-  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP", "BufWipeout" }, {
+  vim.api.nvim_create_autocmd({
+    "TextChanged",
+    "TextChangedI",
+    "TextChangedP",
+    "BufFilePost",
+    "BufUnload",
+    "BufDelete",
+    "BufWipeout",
+  }, {
     group = group,
     callback = function(args)
-      local preview = state.preview
-      local generation = state.generation
       local chat = state.chat
-      if args.event == "BufWipeout" then
+      local buffer_closed = args.event == "BufUnload" or args.event == "BufDelete" or args.event == "BufWipeout"
+      if buffer_closed then
         state.file_baselines[args.buf] = nil
         state.file_conflicts[args.buf] = nil
+        state.internal_ticks[args.buf] = nil
       end
-      if chat and chat.buf == args.buf then
+      if chat and chat.buf == args.buf and buffer_closed then
         state.chat = nil
         state.chat_request = state.chat_request + 1
       end
-      if preview and preview.buf == args.buf then
-        clear_preview()
-      elseif generation and generation.snapshot.buf == args.buf then
-        M.reject()
+      local internal_tick = state.internal_ticks[args.buf]
+      if internal_tick and args.event:find("TextChanged", 1, true) then
+        state.internal_ticks[args.buf] = nil
+        if vim.api.nvim_buf_is_valid(args.buf) and vim.api.nvim_buf_get_changedtick(args.buf) == internal_tick then
+          return
+        end
       end
+      clear_jobs(function(job)
+        return job.snapshot.buf == args.buf
+      end, true)
     end,
   })
   vim.api.nvim_create_autocmd("VimLeavePre", { group = group, callback = M.stop })
@@ -1956,6 +2402,13 @@ M._reset = function()
   state.sessions = {}
   state.live = {}
   state.loading = {}
+  state.jobs = {}
+  state.jobs_by_thread = {}
+  state.job_mappings = {}
+  state.internal_ticks = {}
+  state.spinner_timer = nil
+  state.spinner_frame = 1
+  state.job_sequence = 0
   state.generation = nil
   state.preview = nil
   state.chat = nil

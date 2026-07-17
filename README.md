@@ -5,7 +5,7 @@ Seal is a small Neovim interface for a real Codex session.
 Press one key, enter a prompt, and Seal routes it in one of two ways:
 
 - A normal prompt goes unchanged to a persistent Codex thread and runs in the background. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
-- `fun:`, `type:`, `class:`, and other declaration prefixes create a temporary read-only fork of that thread. The fork sees the existing chat and repository, returns one declaration, and Seal previews it inline. Press `Tab` to insert it or `Esc` to discard it.
+- `fun:`, `type:`, `class:`, and other declaration prefixes create independent temporary read-only forks of that thread. Each fork inherits the conversation and can inspect the repository. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview. Several marked locations can run concurrently.
 
 Codex owns the agent loop, tools, conversation history, and compaction. Seal keeps only one thread ID per project root in the current Neovim process.
 
@@ -49,8 +49,8 @@ The default mappings are:
 
 - `<leader>ai`: open the Seal prompt
 - `<leader>ac`: inspect the backing Codex conversation
-- `Tab`: accept a declaration while its preview is visible
-- `Esc`: reject a declaration while its preview is visible
+- `Tab`: accept the ready declaration on the cursor line
+- `Esc`: cancel or reject the Seal job on the cursor line
 
 Commands provide the same operations:
 
@@ -74,7 +74,7 @@ Normal saves run through the editor's usual `BufWritePre` hooks, including forma
 
 Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
 
-Declaration previews never modify or save the buffer. They are discarded if the buffer or underlying file changes, if completion/formatting edits occur, or if a workspace-writing main-thread turn starts. Accepted declarations format normally on the next save.
+Declaration jobs are anchored to their cursor lines. You can prompt several locations in one or more buffers, let the forks finish in any order, and accept each result from its marker. Accepting one result rebases non-overlapping jobs in the same buffer. Ordinary edits, completion/formatting edits, file changes, and workspace-writing main-thread turns cancel affected jobs rather than applying stale output. Accepted declarations format normally on the next save.
 
 Seal never opens a terminal or Zellij pane. Normal turns can edit the workspace but use a non-interactive approval policy: sandbox escalation and user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
 
@@ -93,6 +93,10 @@ require("seal").setup({
   main_approval_policy = "never",
   save_before_agent = true,
   validate_declarations = true,
+  activity = {
+    interval_ms = 80,
+    max_summary_cells = 56,
+  },
   keymaps = {
     prompt = "<leader>ai",
     chat = "<leader>ac",
@@ -115,7 +119,7 @@ Each Neovim process starts its own project thread, avoiding two editors concurre
 make check
 ```
 
-The optional smoke test starts a real local app-server and runs the complete declaration flow through an inline preview:
+The optional smoke test starts a real local app-server and runs two declaration flows in parallel through inline previews:
 
 ```sh
 make smoke

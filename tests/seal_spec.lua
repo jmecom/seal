@@ -40,6 +40,8 @@ local function fake_client()
     responses = {},
     stopped = false,
     thread_start_count = 0,
+    fork_count = 0,
+    declaration_turn_count = 0,
   }
 
   function fake:start(callback)
@@ -89,11 +91,18 @@ local function fake_client()
       if self.fork_error then
         callback(nil, { message = "no rollout found for thread id" })
       else
-        callback({ thread = { id = "fork-thread", status = { type = "idle" }, ephemeral = true } })
+        self.fork_count = self.fork_count + 1
+        local id = self.fork_count == 1 and "fork-thread" or "fork-thread-" .. self.fork_count
+        callback({ thread = { id = id, status = { type = "idle" }, ephemeral = true } })
       end
     elseif method == "turn/start" then
-      local declaration = params.threadId == "fork-thread" or params.threadId == "empty-fork"
-      callback({ turn = { id = declaration and "fork-turn" or "main-turn" } })
+      if params.threadId == "main-thread" then
+        callback({ turn = { id = "main-turn" } })
+      else
+        self.declaration_turn_count = self.declaration_turn_count + 1
+        local id = self.declaration_turn_count == 1 and "fork-turn" or "fork-turn-" .. self.declaration_turn_count
+        callback({ turn = { id = id } })
+      end
     else
       callback({})
     end
@@ -107,7 +116,7 @@ local fake
 local copied
 local buffer_sequence = 0
 
-local function setup(lines, overrides)
+local function setup(lines, overrides, before_setup)
   seal._reset()
   notifications = {}
   copied = nil
@@ -123,6 +132,9 @@ local function setup(lines, overrides)
     end,
     keymaps = { prompt = false, chat = false },
   }
+  if before_setup then
+    before_setup()
+  end
   seal.setup(vim.tbl_deep_extend("force", options, overrides or {}))
   vim.cmd("enew!")
   local current = vim.api.nvim_get_current_buf()
@@ -142,6 +154,7 @@ local function setup(lines, overrides)
 end
 
 local tests = {}
+local complete_declaration
 
 function tests.routes_only_known_prefixes()
   setup()
@@ -477,6 +490,39 @@ function tests.post_write_buffer_wipe_aborts_without_an_error()
   vim.fn.delete(path)
 end
 
+function tests.disk_only_formatter_cancels_a_stale_declaration()
+  local rewrite_disk = false
+  local formatter_group
+  setup({ "local buffered = true" }, { activity = { interval_ms = 100000 } }, function()
+    formatter_group = vim.api.nvim_create_augroup("SealDiskOnlyFormatterTest", { clear = true })
+    vim.api.nvim_create_autocmd("BufWritePost", {
+      group = formatter_group,
+      callback = function(args)
+        if rewrite_disk then
+          vim.fn.writefile({ "local formatted_on_disk = true" }, vim.api.nvim_buf_get_name(args.buf))
+        end
+      end,
+    })
+  end)
+  local path = vim.fn.tempname() .. ".lua"
+  vim.api.nvim_buf_set_name(0, path)
+  vim.cmd("silent write")
+  seal.submit("fun: remains safe across formatting")
+  truthy(seal._state.jobs[1] ~= nil, "the declaration should be running before the write")
+
+  rewrite_disk = true
+  vim.cmd("silent write")
+
+  truthy(seal._state.jobs[1] == nil, "a disk-only formatter must invalidate the stale buffer job")
+  equal(
+    vim.api.nvim_buf_get_lines(0, 0, -1, false),
+    { "local buffered = true" },
+    "the safety check should not silently replace the editor buffer"
+  )
+  vim.api.nvim_del_augroup_by_id(formatter_group)
+  vim.fn.delete(path)
+end
+
 function tests.completed_attached_tui_turn_reloads_external_edits()
   setup({ "local original = true" }, { save_before_agent = true })
   local path = vim.fn.tempname() .. ".lua"
@@ -794,8 +840,8 @@ function tests.server_request_is_resolved_without_an_interactive_client()
   equal(#fake.responses, response_count, "Seal must let the attached TUI answer requests for its own turns")
 end
 
-function tests.superseded_fork_is_unsubscribed()
-  setup({ "" })
+function tests.parallel_pending_forks_both_start()
+  setup({ "", "" })
   local original_request = fake.request
   local held_fork
   function fake:request(method, params, callback)
@@ -808,10 +854,257 @@ function tests.superseded_fork_is_unsubscribed()
   end
 
   seal.submit("fun: first")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
   seal.submit("fun: second")
-  held_fork({ thread = { id = "superseded-fork", ephemeral = true } })
-  local unsubscribe = request(fake, "thread/unsubscribe")
-  equal(unsubscribe.params.threadId, "superseded-fork", "superseded fork should be detached")
+  held_fork({ thread = { id = "delayed-fork", ephemeral = true } })
+
+  local started = {}
+  for _, item in ipairs(fake.requests) do
+    if item.method == "turn/start" then
+      started[item.params.threadId] = true
+    end
+  end
+  truthy(started["fork-thread"], "the second prompt should start while the first fork is pending")
+  truthy(started["delayed-fork"], "the delayed first fork should still start")
+  equal(vim.tbl_count(seal._state.jobs), 2, "both declaration jobs should remain active")
+end
+
+function tests.cancel_before_turn_start_response_uses_startup_interrupt()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  local held_turn
+  function fake:request(method, params, callback)
+    if method == "turn/start" and params.threadId == "fork-thread" then
+      table.insert(self.requests, { method = method, params = params })
+      held_turn = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: cancel during startup")
+  truthy(held_turn ~= nil, "the declaration turn response should be held")
+  equal(seal._state.jobs[1].turn_id, nil, "the job should not know its turn ID yet")
+  seal.reject(1)
+
+  local interrupt = request(fake, "turn/interrupt")
+  equal(interrupt.params.threadId, "fork-thread", "startup cancellation should target the fork")
+  equal(interrupt.params.turnId, "", "an empty turn ID should interrupt startup before the response arrives")
+  held_turn({ turn = { id = "late-turn" } })
+  local interrupts = 0
+  for _, item in ipairs(fake.requests) do
+    if item.method == "turn/interrupt" then
+      interrupts = interrupts + 1
+    end
+  end
+  equal(interrupts, 1, "the late turn/start response must not trigger a second interrupt")
+end
+
+function tests.turn_started_notification_supplies_the_declaration_turn_id()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  local held_turn
+  function fake:request(method, params, callback)
+    if method == "turn/start" and params.threadId == "fork-thread" then
+      table.insert(self.requests, { method = method, params = params })
+      held_turn = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: cancel from notification")
+  seal._notification("turn/started", {
+    threadId = "fork-thread",
+    turn = { id = "notification-turn", status = "inProgress" },
+  })
+  equal(
+    seal._state.jobs[1].turn_id,
+    "notification-turn",
+    "the real turn/started payload should bind the fork's turn ID"
+  )
+  seal.reject(1)
+  equal(
+    request(fake, "turn/interrupt").params.turnId,
+    "notification-turn",
+    "cancellation should immediately interrupt the notified turn"
+  )
+  held_turn({ turn = { id = "notification-turn" } })
+end
+
+function tests.closed_fork_clears_its_job()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: interrupted by a closed fork")
+  local source = vim.api.nvim_get_current_buf()
+
+  seal._notification("thread/closed", { threadId = "fork-thread" })
+
+  truthy(seal._state.jobs[1] == nil, "a closed fork must not leave a declaration job behind")
+  equal(seal._state.spinner_timer, nil, "a closed fork should stop the last spinner")
+  equal(seal._state.job_mappings[source], nil, "a closed fork should restore source-buffer mappings")
+end
+
+function tests.duplicate_job_on_the_same_line_is_rejected()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: first")
+  seal.submit("fun: second")
+  equal(vim.tbl_count(seal._state.jobs), 1, "one cursor line should have only one unambiguous job")
+  equal(fake.fork_count, 1, "the duplicate prompt should not create another fork")
+  truthy(notifications[#notifications].message:find("already exists", 1, true), "the duplicate should be explained")
+  seal.reject(1)
+end
+
+function tests.spinner_is_anchored_and_animates_in_place()
+  setup({ "local value = 1" }, { activity = { interval_ms = 10 } })
+  vim.api.nvim_win_set_cursor(0, { 1, 6 })
+  seal.submit("fun:   load   the saved state")
+  local job = seal._state.jobs[1]
+  truthy(job ~= nil, "declaration submission should create a job")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local before = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, { details = true })
+  equal({ before[1], before[2] }, { 0, 6 }, "the spinner should stay at the captured cursor")
+  local before_text = before[3].virt_text[1][1] .. before[3].virt_text[2][1]
+  truthy(before_text:find("function · load the saved state", 1, true), "the spinner should summarize the prompt")
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  truthy(seal._state.jobs[1] ~= nil, "Tab should not accept a job that is still generating")
+  truthy(notifications[#notifications].message:find("still generating", 1, true), "pending Tab should explain its state")
+
+  local after
+  local after_text
+  truthy(vim.wait(1000, function()
+    after = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, { details = true })
+    after_text = after[3].virt_text[1][1] .. after[3].virt_text[2][1]
+    return after_text ~= before_text
+  end, 5), "the real spinner timer should advance the frame")
+  equal({ after[1], after[2] }, { 0, 6 }, "animation must update the existing anchored extmark")
+
+  local timer = seal._state.spinner_timer
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+  truthy(seal._state.jobs[1] == nil, "Esc should cancel the pending job under the cursor")
+  equal(vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, {}), {}, "cancellation should remove the marker")
+  equal(vim.fn.timer_info(timer), {}, "the shared spinner timer should stop with the last running job")
+end
+
+function tests.mapping_away_from_marker_preserves_global_behavior()
+  setup({ "", "move here now" }, { activity = { interval_ms = 100000 } })
+  local calls = 0
+  vim.keymap.set("n", "<Tab>", function()
+    calls = calls + 1
+    return "l"
+  end, { expr = true })
+  seal.submit("fun: stay on the first line")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("3<Tab>", true, false, true), "xt", false)
+  truthy(vim.wait(500, function()
+    return calls == 1 and vim.api.nvim_win_get_cursor(0)[2] == 3
+  end, 5), "Tab away from a marker should preserve the global expression mapping and its count")
+  truthy(seal._state.jobs[1] ~= nil, "Tab on another line must not accept or cancel the only Seal job")
+
+  seal.reject(1)
+  vim.keymap.del("n", "<Tab>")
+end
+
+function tests.rejecting_one_parallel_job_keeps_its_sibling()
+  setup({ "", "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: first")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: second")
+
+  truthy(seal.reject(1), "the first job should be rejected")
+  local interrupt = request(fake, "turn/interrupt")
+  equal(interrupt.params.threadId, "fork-thread", "only the selected fork should be interrupted")
+  equal(interrupt.params.turnId, "fork-turn", "the selected turn should be interrupted")
+  truthy(seal._state.jobs[2] ~= nil, "the sibling job should keep running")
+  truthy(seal._state.spinner_timer ~= nil, "the shared timer should remain for the sibling")
+  seal.reject(2)
+end
+
+function tests.parallel_jobs_share_and_restore_buffer_mappings()
+  setup({ "", "" }, { activity = { interval_ms = 100000 } })
+  local previous_tab = function() end
+  local previous_escape = function() end
+  vim.keymap.set("n", "<Tab>", previous_tab, { buffer = 0 })
+  vim.keymap.set("n", "<Esc>", previous_escape, { buffer = 0 })
+
+  seal.submit("fun: first")
+  local seal_tab = vim.fn.maparg("<Tab>", "n", false, true).callback
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: second")
+  equal(vim.fn.maparg("<Tab>", "n", false, true).callback, seal_tab, "the second job should reuse one dispatcher")
+
+  seal.reject(1)
+  equal(vim.fn.maparg("<Tab>", "n", false, true).callback, seal_tab, "the dispatcher should remain for one sibling")
+  seal.reject(2)
+  equal(vim.fn.maparg("<Tab>", "n", false, true).callback, previous_tab, "the original Tab mapping should be restored")
+  equal(vim.fn.maparg("<Esc>", "n", false, true).callback, previous_escape, "the original Esc mapping should be restored")
+end
+
+function tests.closed_source_buffer_discards_ready_jobs_and_mappings()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local source = vim.api.nvim_get_current_buf()
+  seal.submit("fun: close with the buffer")
+  complete_declaration("function close_with_the_buffer() end")
+  truthy(seal._state.jobs[1] ~= nil, "the ready job should exist before the buffer closes")
+
+  vim.api.nvim_buf_delete(source, { force = true })
+
+  truthy(seal._state.jobs[1] == nil, "BufDelete should discard a ready job")
+  equal(seal._state.job_mappings[source], nil, "BufDelete should release the job mapping state")
+end
+
+function tests.mapping_installed_during_a_job_is_not_clobbered()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: pending")
+  local newer_tab = function() end
+  vim.keymap.set("n", "<Tab>", newer_tab, { buffer = 0 })
+  seal.reject(1)
+  equal(vim.fn.maparg("<Tab>", "n", false, true).callback, newer_tab, "Seal cleanup should preserve a newer mapping")
+end
+
+function tests.mapping_restoration_preserves_replace_keycodes()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local previous_tab = function()
+    return "l"
+  end
+  vim.keymap.set("n", "<Tab>", previous_tab, {
+    buffer = 0,
+    expr = true,
+    replace_keycodes = false,
+  })
+  equal(
+    vim.fn.maparg("<Tab>", "n", false, true).replace_keycodes,
+    nil,
+    "the fixture should start with keycode replacement disabled"
+  )
+
+  seal.submit("fun: preserve the previous mapping")
+  seal.reject(1)
+
+  local restored = vim.fn.maparg("<Tab>", "n", false, true)
+  equal(restored.callback, previous_tab, "Seal should restore the original expression callback")
+  equal(restored.replace_keycodes, nil, "Seal should preserve replace_keycodes=false")
+end
+
+function tests.buffer_edit_cancels_only_jobs_in_that_buffer()
+  setup({ "", "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: first")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: second")
+
+  local other = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(other, "/tmp/seal-project/parallel-other.lua")
+  vim.api.nvim_set_option_value("filetype", "lua", { buf = other })
+  vim.api.nvim_buf_set_lines(other, 0, -1, false, { "" })
+  seal.submit("fun: other buffer", { buf = other, cursor = { 1, 0 } })
+  equal(vim.tbl_count(seal._state.jobs), 3, "all three jobs should be active")
+
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
+  equal(vim.tbl_count(seal._state.jobs), 1, "the edit should cancel both jobs in the changed buffer")
+  truthy(seal._state.jobs[3] ~= nil, "the other buffer's job should remain active")
+
+  seal.reject(3)
+  vim.api.nvim_buf_delete(other, { force = true })
 end
 
 function tests.new_thread_interrupts_and_detaches_old_thread()
@@ -831,20 +1124,161 @@ function tests.new_thread_interrupts_and_detaches_old_thread()
   equal(fake.thread_start_count, 2, "new thread should start after cleanup")
 end
 
-local function complete_declaration(code)
+complete_declaration = function(code, thread_id, turn_id)
+  thread_id = thread_id or "fork-thread"
+  turn_id = turn_id or "fork-turn"
   seal._notification("item/completed", {
-    threadId = "fork-thread",
-    turnId = "fork-turn",
+    threadId = thread_id,
+    turnId = turn_id,
     item = { type = "agentMessage", phase = "final_answer", text = vim.json.encode({ code = code }) },
   })
   seal._notification("turn/completed", {
-    threadId = "fork-thread",
-    turnId = "fork-turn",
-    turn = { id = "fork-turn", status = "completed" },
+    threadId = thread_id,
+    turnId = turn_id,
+    turn = { id = turn_id, status = "completed" },
   })
   vim.wait(1000, function()
-    return seal._state.preview ~= nil
+    for _, job in pairs(seal._state.jobs) do
+      if job.fork_id == thread_id then
+        return job.phase == "ready"
+      end
+    end
+    return true
   end)
+end
+
+function tests.late_turn_start_response_does_not_interrupt_a_ready_result()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  local held_turn
+  function fake:request(method, params, callback)
+    if method == "turn/start" and params.threadId == "fork-thread" then
+      table.insert(self.requests, { method = method, params = params })
+      held_turn = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: finish before the response")
+  complete_declaration("function finish_before_the_response() end")
+  truthy(seal._state.jobs[1] and seal._state.jobs[1].phase == "ready", "the notifications should finish the job")
+  held_turn({ turn = { id = "fork-turn" } })
+  equal(request(fake, "turn/interrupt"), nil, "a delayed start response must not interrupt a completed turn")
+  seal.reject(1)
+end
+
+function tests.parallel_jobs_dispatch_in_their_own_buffers()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local first_buf = vim.api.nvim_get_current_buf()
+  seal.submit("fun: first buffer declaration")
+
+  local second_buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(second_buf, "/tmp/seal-project/parallel-second-buffer.lua")
+  vim.api.nvim_set_option_value("filetype", "lua", { buf = second_buf })
+  vim.api.nvim_buf_set_lines(second_buf, 0, -1, false, { "" })
+  seal.submit("fun: second buffer declaration", { buf = second_buf, cursor = { 1, 0 } })
+  complete_declaration("function first_buffer_declaration() end", "fork-thread", "fork-turn")
+  complete_declaration("function second_buffer_declaration() end", "fork-thread-2", "fork-turn-2")
+
+  vim.api.nvim_set_current_buf(second_buf)
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  equal(
+    vim.api.nvim_buf_get_lines(second_buf, 0, -1, false),
+    { "function second_buffer_declaration() end" },
+    "Tab should accept only the marker in the current buffer"
+  )
+  truthy(seal._state.jobs[1] ~= nil, "accepting the second buffer must preserve the first buffer's job")
+
+  vim.api.nvim_set_current_buf(first_buf)
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  equal(
+    vim.api.nvim_buf_get_lines(first_buf, 0, -1, false),
+    { "function first_buffer_declaration() end" },
+    "the first buffer should accept its own marker independently"
+  )
+  truthy(vim.tbl_isempty(seal._state.jobs), "both buffer-local jobs should be finished")
+  vim.api.nvim_buf_delete(second_buf, { force = true })
+end
+
+function tests.failed_freeform_preflight_keeps_other_buffer_preview()
+  setup({ "local before = true" }, { save_before_agent = true, activity = { interval_ms = 100000 } })
+  local source = vim.api.nvim_get_current_buf()
+  local path = vim.fn.tempname() .. ".lua"
+  vim.api.nvim_buf_set_name(source, path)
+  local other = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(other, "/tmp/seal-project/preflight-preview.lua")
+  vim.api.nvim_set_option_value("filetype", "lua", { buf = other })
+  vim.api.nvim_buf_set_lines(other, 0, -1, false, { "" })
+  seal.submit("fun: keep this preview", { buf = other, cursor = { 1, 0 } })
+  complete_declaration("function keep_this_preview() end")
+  local job = seal._state.jobs[1]
+  truthy(job and job.phase == "ready", "the other buffer should have a ready preview")
+
+  local group = vim.api.nvim_create_augroup("SealFailedFreeformPreflightTest", { clear = true })
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = group,
+    buffer = source,
+    callback = function(args)
+      vim.api.nvim_buf_set_lines(args.buf, 0, -1, false, { "local after = true" })
+      vim.api.nvim_set_option_value("modified", false, { buf = args.buf })
+    end,
+  })
+  seal.submit("make a workspace change")
+
+  local main_turns = 0
+  for _, item in ipairs(fake.requests) do
+    if item.method == "turn/start" and item.params.threadId == "main-thread" then
+      main_turns = main_turns + 1
+    end
+  end
+  equal(main_turns, 0, "the workspace-writing turn should fail its save preflight")
+  equal(seal._state.jobs[1], job, "a failed freeform preflight should preserve an unrelated ready preview")
+
+  seal.reject(1)
+  vim.api.nvim_del_augroup_by_id(group)
+  vim.api.nvim_buf_delete(other, { force = true })
+  vim.fn.delete(path)
+end
+
+function tests.parallel_results_complete_and_accept_out_of_order()
+  setup({ "", "local between = true", "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: first declaration")
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  seal.submit("fun: second declaration")
+
+  complete_declaration("function second_declaration() end", "fork-thread-2", "fork-turn-2")
+  equal(seal._state.jobs[2].phase, "ready", "the second result should become independently ready")
+  equal(seal._state.jobs[1].phase, "generating", "the first result should keep spinning")
+  complete_declaration("function first_declaration()\n  return true\nend", "fork-thread", "fork-turn")
+  equal(seal._state.jobs[1].phase, "ready", "the first result should become ready later")
+  equal(seal._state.spinner_timer, nil, "the timer should stop when every job is ready")
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  truthy(seal._state.jobs[1] == nil, "Tab should accept the ready result under the cursor")
+  local second = seal._state.jobs[2]
+  truthy(second ~= nil, "accepting the upper result should preserve a non-overlapping sibling")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local second_position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, second.extmark, {})
+  equal(second_position[1], 4, "the lower result should reanchor after a multi-line insertion above it")
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
+  truthy(seal._state.jobs[2] ~= nil, "the controlled TextChanged event should preserve the rebased sibling")
+
+  vim.api.nvim_win_set_cursor(0, { second_position[1] + 1, 0 })
+  vim.cmd("SealAccept")
+  truthy(seal._state.jobs[2] == nil, ":SealAccept should accept the rebased result under the cursor")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {
+    "function first_declaration()",
+    "  return true",
+    "end",
+    "local between = true",
+    "function second_declaration() end",
+  }, "both independent declarations should be inserted at their marked locations")
+  equal(vim.tbl_count(seal._state.jobs), 0, "accepting both results should clear both jobs")
+  equal(seal._state.job_mappings[vim.api.nvim_get_current_buf()], nil, "buffer mappings should restore after the last job")
 end
 
 function tests.preview_accepts_as_one_edit()
@@ -1075,6 +1509,7 @@ local order = {
   "post_write_buffer_mutation_blocks_freeform_turn",
   "post_write_other_buffer_mutation_blocks_freeform_turn",
   "post_write_buffer_wipe_aborts_without_an_error",
+  "disk_only_formatter_cancels_a_stale_declaration",
   "completed_attached_tui_turn_reloads_external_edits",
   "completed_turn_does_not_check_unrelated_projects",
   "completed_turn_preserves_a_modified_external_conflict",
@@ -1088,8 +1523,24 @@ local order = {
   "thread_setting_changes_flow_into_forks",
   "null_thread_settings_are_omitted_from_forks",
   "server_request_is_resolved_without_an_interactive_client",
-  "superseded_fork_is_unsubscribed",
+  "parallel_pending_forks_both_start",
+  "cancel_before_turn_start_response_uses_startup_interrupt",
+  "turn_started_notification_supplies_the_declaration_turn_id",
+  "closed_fork_clears_its_job",
+  "duplicate_job_on_the_same_line_is_rejected",
+  "spinner_is_anchored_and_animates_in_place",
+  "mapping_away_from_marker_preserves_global_behavior",
+  "rejecting_one_parallel_job_keeps_its_sibling",
+  "parallel_jobs_share_and_restore_buffer_mappings",
+  "closed_source_buffer_discards_ready_jobs_and_mappings",
+  "mapping_installed_during_a_job_is_not_clobbered",
+  "mapping_restoration_preserves_replace_keycodes",
+  "buffer_edit_cancels_only_jobs_in_that_buffer",
   "new_thread_interrupts_and_detaches_old_thread",
+  "late_turn_start_response_does_not_interrupt_a_ready_result",
+  "parallel_jobs_dispatch_in_their_own_buffers",
+  "failed_freeform_preflight_keeps_other_buffer_preview",
+  "parallel_results_complete_and_accept_out_of_order",
   "preview_accepts_as_one_edit",
   "reject_leaves_buffer_untouched",
   "freeform_clears_an_existing_preview",
