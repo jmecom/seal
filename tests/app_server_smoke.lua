@@ -75,6 +75,8 @@ local ok, smoke_error = xpcall(function()
   local turn = request("turn/start", {
     threadId = source.id,
     clientUserMessageId = "seal-smoke",
+    sandboxPolicy = { type = "workspaceWrite", writableRoots = {}, networkAccess = false },
+    approvalPolicy = "never",
     input = {
       { type = "text", text = "Write a Lua function named seal_smoke that returns true. Do not call tools." },
     },
@@ -96,6 +98,18 @@ local ok, smoke_error = xpcall(function()
   assert(answer, "turn completed without an agent message")
   local decoded = vim.json.decode(answer)
   assert(type(decoded.code) == "string" and decoded.code:find("seal_smoke", 1, true), "invalid structured code")
+
+  local history = request("thread/read", { threadId = source.id, includeTurns = true }).thread
+  assert(#history.turns > 0, "thread/read did not return the completed turn")
+  local saw_user = false
+  local saw_agent = false
+  for _, history_turn in ipairs(history.turns) do
+    for _, item in ipairs(history_turn.items) do
+      saw_user = saw_user or item.type == "userMessage"
+      saw_agent = saw_agent or item.type == "agentMessage"
+    end
+  end
+  assert(saw_user and saw_agent, "thread/read did not return the user and agent messages")
 
   local fork = request("thread/fork", {
     threadId = source.id,

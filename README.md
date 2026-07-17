@@ -4,7 +4,7 @@ Seal is a small Neovim interface for a real Codex session.
 
 Press one key, enter a prompt, and Seal routes it in one of two ways:
 
-- A normal prompt goes unchanged to a persistent Codex thread. Seal opens a Codex TUI on the right, attached to the same live app-server thread, so approvals and follow-up conversation use the normal terminal interface.
+- A normal prompt goes unchanged to a persistent Codex thread and runs in the background. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
 - `fun:`, `type:`, `class:`, and other declaration prefixes create a temporary read-only fork of that thread. The fork sees the existing chat and repository, returns one declaration, and Seal previews it inline. Press `Tab` to insert it or `Esc` to discard it.
 
 Codex owns the agent loop, tools, conversation history, and compaction. Seal keeps only one thread ID per project root in the current Neovim process.
@@ -47,8 +47,8 @@ require("seal").setup()
 
 The default mappings are:
 
-- `<leader>ss`: open the Seal prompt
-- `<leader>st`: open or focus the shared Codex terminal
+- `<leader>ai`: open the Seal prompt
+- `<leader>ac`: inspect the backing Codex conversation
 - `Tab`: accept a declaration while its preview is visible
 - `Esc`: reject a declaration while its preview is visible
 
@@ -58,7 +58,8 @@ Commands provide the same operations:
 :Seal explain why this test is failing
 :Seal fun: load the saved state from disk
 :Seal type: represent an entry in the on-disk cache
-:SealTerminal
+:SealChat
+:SealAttach
 :SealAccept
 :SealReject
 :SealNew
@@ -69,6 +70,12 @@ Recognized declaration prefixes are `fun`, `fn`, `function`, `type`, `class`, `m
 
 The current buffer, cursor, file type, and visual selection are attached as editor context. Normal agent prompts save the current modified buffer first so Codex does not edit an older on-disk version. Declaration forks are read-only and can use an unsaved buffer snapshot safely.
 
+Seal never opens a terminal or Zellij pane. Normal turns can edit the workspace but use a non-interactive approval policy: sandbox escalation and user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
+
+`SealChat` replaces the current buffer with a read-only conversation view. Press `r` to refresh and `q` to return. It shows persisted user and Codex messages from the main thread while omitting tool activity, editor context attachments, and system instructions. Temporary declaration forks intentionally do not appear in this conversation.
+
+The backing session is a normal Codex app-server thread. To use the full Codex TUI for that exact conversation, run `:SealAttach`, switch to your existing Zellij terminal pane, and paste the copied command. Seal only copies the `codex resume --remote ...` command; it never creates or controls the pane.
+
 Before showing a declaration, Seal parses the proposed full buffer with Tree-sitter and verifies that the inserted range contains one syntax unit of the requested kind. A parser for the current file type must be installed. Set `validate_declarations = false` only if you prefer manual preview review for an unsupported language.
 
 ## Configure
@@ -76,12 +83,13 @@ Before showing a declaration, Seal parses the proposed full buffer with Tree-sit
 ```lua
 require("seal").setup({
   codex_command = "codex",
+  main_sandbox = "workspace-write",
+  main_approval_policy = "never",
   save_before_agent = true,
   validate_declarations = true,
-  terminal_width = 0.42,
   keymaps = {
-    prompt = "<leader>ss",
-    terminal = "<leader>st",
+    prompt = "<leader>ai",
+    chat = "<leader>ac",
   },
   prefixes = {
     fun = "function",
@@ -91,7 +99,7 @@ require("seal").setup({
 })
 ```
 
-The model and reasoning level come from the Codex thread. Change them normally from the terminal TUI; declaration forks inherit them.
+The model, reasoning level, sandbox, and other defaults come from the normal Codex configuration. Declaration forks inherit the main thread's model settings.
 
 Each Neovim process starts its own project thread, avoiding two editors concurrently resuming and mutating the same Codex rollout. Codex still persists the transcript in its own session storage, where the normal CLI can find it later.
 

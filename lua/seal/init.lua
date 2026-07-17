@@ -1,4 +1,5 @@
 local Client = require("seal.client")
+local Chat = require("seal.chat")
 
 local M = {}
 local namespace = vim.api.nvim_create_namespace("seal-preview")
@@ -7,12 +8,13 @@ local defaults = {
   codex_command = "codex",
   bridge = nil,
   max_context_chars = 120000,
+  main_sandbox = "workspace-write",
+  main_approval_policy = "never",
   save_before_agent = true,
   validate_declarations = true,
-  terminal_width = 0.42,
   keymaps = {
-    prompt = "<leader>ss",
-    terminal = "<leader>st",
+    prompt = "<leader>ai",
+    chat = "<leader>ac",
   },
   prefixes = {
     fun = "function",
@@ -37,10 +39,14 @@ local state = {
   loading = {},
   generation = nil,
   preview = nil,
-  terminal = nil,
+  chat = nil,
+  chat_request = 0,
+  owned_turns = {},
   sequence = 0,
   stopping = false,
 }
+
+local refresh_chat
 
 local function notify(message, level)
   if config.notify then
@@ -100,6 +106,19 @@ end
 
 local function not_null(value)
   return value ~= vim.NIL and value or nil
+end
+
+local function turn_sandbox_policy(mode)
+  if mode == "read-only" then
+    return { type = "readOnly", networkAccess = false }
+  end
+  if mode == "workspace-write" then
+    return { type = "workspaceWrite", writableRoots = {}, networkAccess = false }
+  end
+  if mode == "danger-full-access" then
+    return { type = "dangerFullAccess" }
+  end
+  return nil
 end
 
 local function remove_preview_ui(preview)
@@ -167,11 +186,25 @@ local function handle_notification(method, params)
     local session = find_session_by_thread(params.threadId)
     if session and params.turn then
       session.active_turn_id = params.turn.id
+      if refresh_chat then
+        vim.schedule(function()
+          refresh_chat(params.threadId)
+        end)
+      end
     end
   elseif method == "turn/completed" then
     local session = find_session_by_thread(params.threadId)
+    if params.turn then
+      state.owned_turns[params.turn.id] = nil
+    end
     if session and (not session.active_turn_id or not params.turn or session.active_turn_id == params.turn.id) then
       session.active_turn_id = nil
+      notify("Codex turn finished; use :SealChat to inspect it")
+      if refresh_chat then
+        vim.schedule(function()
+          refresh_chat(params.threadId)
+        end)
+      end
     end
   end
 
@@ -206,23 +239,28 @@ end
 local function handle_server_request(request)
   local params = request.params or {}
   local generation = state.generation
-  if generation and params.threadId == generation.fork_id then
-    if request.method == "item/permissions/requestApproval" then
-      state.client:respond(request.id, { permissions = {} })
-    elseif request.method == "item/commandExecution/requestApproval"
-      or request.method == "item/fileChange/requestApproval"
-    then
-      state.client:respond(request.id, { decision = "decline" })
-    else
-      state.client:respond_error(request.id, -32601, "Seal does not support this request")
-    end
+  local is_generation = generation and params.threadId == generation.fork_id
+  local session = find_session_by_thread(params.threadId)
+  local turn_id = params.turnId or (session and session.active_turn_id)
+  if not is_generation and (not turn_id or not state.owned_turns[turn_id]) then
     return
   end
 
-  local session = find_session_by_thread(params.threadId)
+  if request.method == "item/permissions/requestApproval" then
+    state.client:respond(request.id, { permissions = {}, scope = "turn" })
+  elseif request.method == "item/commandExecution/requestApproval"
+    or request.method == "item/fileChange/requestApproval"
+  then
+    state.client:respond(request.id, { decision = "decline" })
+  elseif request.method == "item/tool/requestUserInput" then
+    state.client:respond(request.id, { answers = {} })
+  elseif request.method == "mcpServer/elicitation/request" then
+    state.client:respond(request.id, { action = "decline" })
+  else
+    state.client:respond_error(request.id, -32601, "Seal does not support interactive requests")
+  end
   if session then
-    notify("Codex needs input in the terminal")
-    M.terminal(session.root)
+    notify("Codex requested interactive input; Seal declined it", vim.log.levels.WARN)
   end
 end
 
@@ -241,6 +279,7 @@ local function client()
     end,
     on_exit = function(_, expected)
       state.live = {}
+      state.owned_turns = {}
       if state.generation then
         state.generation = nil
         notify("Declaration generation stopped with the app-server", vim.log.levels.WARN)
@@ -273,7 +312,11 @@ local function remember_thread(root, result)
 end
 
 local function start_thread(root, callback)
-  client():request("thread/start", { cwd = root }, function(result, err)
+  client():request("thread/start", {
+    cwd = root,
+    sandbox = config.main_sandbox,
+    approvalPolicy = config.main_approval_policy,
+  }, function(result, err)
     if err or not result or not result.thread then
       callback(nil, error_message(err, "could not start a Codex thread"))
       return
@@ -403,14 +446,28 @@ end
 
 local function capture_snapshot(opts)
   opts = opts or {}
-  local buf = opts.buf or vim.api.nvim_get_current_buf()
+  local current_buf = vim.api.nvim_get_current_buf()
+  local from_chat = not opts.buf
+    and state.chat
+    and state.chat.buf == current_buf
+    and state.chat.return_buf
+    and vim.api.nvim_buf_is_valid(state.chat.return_buf)
+  local buf = from_chat and state.chat.return_buf or opts.buf or current_buf
   local win = opts.win or vim.api.nvim_get_current_win()
-  local cursor = vim.api.nvim_win_get_cursor(win)
+  local cursor
+  if opts.cursor then
+    cursor = opts.cursor
+  elseif from_chat then
+    local source_window = vim.fn.bufwinid(buf)
+    cursor = source_window ~= -1 and vim.api.nvim_win_get_cursor(source_window) or state.chat.return_cursor or { 1, 0 }
+  else
+    cursor = vim.api.nvim_win_get_cursor(win)
+  end
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local row = cursor[1]
   local current_line = lines[row] or ""
   local selection
-  if opts.range and opts.range > 0 then
+  if not from_chat and opts.range and opts.range > 0 then
     local selected_lines = vim.api.nvim_buf_get_lines(buf, opts.line1 - 1, opts.line2, false)
     local selection_budget = math.floor(math.max(0, config.max_context_chars) / 2)
     selection = truncate_text(table.concat(selected_lines, "\n"), selection_budget)
@@ -980,85 +1037,117 @@ local function start_declaration(session, snapshot, route)
   end)
 end
 
-local function terminal_command(session)
-  return {
-    config.codex_command,
-    "resume",
-    "--remote",
-    client():url(),
-    session.thread_id,
-  }
-end
-
-local function close_terminal()
-  local terminal = state.terminal
-  state.terminal = nil
-  if not terminal then
+local function close_chat()
+  local chat = state.chat
+  state.chat = nil
+  state.chat_request = state.chat_request + 1
+  if not chat or not vim.api.nvim_buf_is_valid(chat.buf) then
     return
   end
-  if terminal.job and terminal.job > 0 then
-    pcall(vim.fn.jobstop, terminal.job)
+  if vim.api.nvim_get_current_buf() == chat.buf
+    and chat.return_buf
+    and vim.api.nvim_buf_is_valid(chat.return_buf)
+  then
+    pcall(vim.api.nvim_set_current_buf, chat.return_buf)
+    if chat.return_cursor then
+      pcall(vim.api.nvim_win_set_cursor, vim.api.nvim_get_current_win(), chat.return_cursor)
+    end
   end
-  if terminal.buf and vim.api.nvim_buf_is_valid(terminal.buf) then
-    pcall(vim.api.nvim_buf_delete, terminal.buf, { force = true })
+  pcall(vim.api.nvim_buf_delete, chat.buf, { force = true })
+end
+
+local function render_chat(session, thread, open)
+  local chat = state.chat
+  if not chat or not vim.api.nvim_buf_is_valid(chat.buf) or chat.thread_id ~= thread.id then
+    close_chat()
+    local buf = vim.api.nvim_create_buf(false, true)
+    chat = {
+      buf = buf,
+      root = session.root,
+      thread_id = thread.id,
+      return_buf = vim.api.nvim_get_current_buf(),
+      return_cursor = vim.api.nvim_win_get_cursor(vim.api.nvim_get_current_win()),
+    }
+    state.chat = chat
+    pcall(vim.api.nvim_buf_set_name, buf, "seal://chat/" .. thread.id)
+    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+    vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+    vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+    vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+    vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+    vim.keymap.set("n", "q", close_chat, { buffer = buf, silent = true, desc = "Close Seal chat" })
+    vim.keymap.set("n", "r", function()
+      M.chat(session.root)
+    end, { buffer = buf, silent = true, desc = "Refresh Seal chat" })
+  elseif open and vim.api.nvim_get_current_buf() ~= chat.buf then
+    chat.return_buf = vim.api.nvim_get_current_buf()
+    chat.return_cursor = vim.api.nvim_win_get_cursor(vim.api.nvim_get_current_win())
+  end
+
+  local window = vim.fn.bufwinid(chat.buf)
+  local old_count = vim.api.nvim_buf_line_count(chat.buf)
+  local follow = window ~= -1 and vim.api.nvim_win_get_cursor(window)[1] >= old_count
+  vim.api.nvim_set_option_value("modifiable", true, { buf = chat.buf })
+  vim.api.nvim_buf_set_lines(chat.buf, 0, -1, false, Chat.render(thread))
+  vim.api.nvim_set_option_value("modifiable", false, { buf = chat.buf })
+  if follow and window ~= -1 then
+    vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(chat.buf), 0 })
+  end
+
+  if open then
+    if window ~= -1 then
+      vim.api.nvim_set_current_win(window)
+    else
+      vim.api.nvim_set_current_buf(chat.buf)
+    end
   end
 end
 
-local function open_terminal(session)
-  local command = terminal_command(session)
-  if config.terminal then
-    config.terminal({ command = command, cwd = session.root, thread_id = session.thread_id })
-    return true
-  end
-
-  local existing = state.terminal
-  if existing
-    and existing.job
-    and existing.thread_id == session.thread_id
-    and vim.api.nvim_buf_is_valid(existing.buf)
-  then
-    local win = vim.fn.bufwinid(existing.buf)
-    if win == -1 then
-      vim.cmd("botright vsplit")
-      win = vim.api.nvim_get_current_win()
-      vim.api.nvim_win_set_buf(win, existing.buf)
+local function read_chat(session, open)
+  local expected_chat = not open and state.chat or nil
+  state.chat_request = state.chat_request + 1
+  local request_id = state.chat_request
+  client():request("thread/read", {
+    threadId = session.thread_id,
+    includeTurns = true,
+  }, function(result, err)
+    if request_id ~= state.chat_request then
+      return
     end
-    vim.api.nvim_set_current_win(win)
-    vim.cmd("startinsert")
-    return true
-  end
-  close_terminal()
+    if not open and state.chat ~= expected_chat then
+      return
+    end
+    if state.live[session.root] ~= session then
+      return
+    end
+    local message = error_message(err, "could not read Codex chat")
+    if err and message:find("includeTurns is unavailable before first user message", 1, true) then
+      render_chat(session, {
+        id = session.thread_id,
+        cwd = session.root,
+        status = session.status,
+        turns = {},
+      }, open)
+      return
+    end
+    if err or not result or not result.thread then
+      notify(message, vim.log.levels.ERROR)
+      return
+    end
+    session.status = result.thread.status
+    render_chat(session, result.thread, open)
+  end)
+end
 
-  vim.cmd("botright vsplit")
-  local win = vim.api.nvim_get_current_win()
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(win, buf)
-  local width = config.terminal_width
-  if width > 0 and width < 1 then
-    width = math.floor(vim.o.columns * width)
+refresh_chat = function(thread_id)
+  local chat = state.chat
+  if not chat or not vim.api.nvim_buf_is_valid(chat.buf) or chat.thread_id ~= thread_id then
+    return
   end
-  pcall(vim.api.nvim_win_set_width, win, math.max(20, math.floor(width)))
-  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
-
-  local job = vim.fn.jobstart(command, {
-    cwd = session.root,
-    term = true,
-    on_exit = function()
-      vim.schedule(function()
-        if state.terminal and state.terminal.buf == buf then
-          state.terminal.job = nil
-        end
-      end)
-    end,
-  })
-  if job <= 0 then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    notify("Could not open the Codex terminal", vim.log.levels.ERROR)
-    return false
+  local session = find_session_by_thread(thread_id)
+  if session then
+    read_chat(session, false)
   end
-  state.terminal = { buf = buf, win = win, job = job, thread_id = session.thread_id }
-  vim.cmd("startinsert")
-  return true
 end
 
 local function start_agent(session, snapshot, prompt)
@@ -1080,10 +1169,6 @@ local function start_agent(session, snapshot, prompt)
       return
     end
   end
-  if not open_terminal(session) then
-    return
-  end
-
   local method = session.active_turn_id and "turn/steer" or "turn/start"
   local params = {
     threadId = session.thread_id,
@@ -1091,12 +1176,21 @@ local function start_agent(session, snapshot, prompt)
     input = { { type = "text", text = prompt } },
     additionalContext = additional_context(snapshot),
   }
+  if method == "turn/start" then
+    params.sandboxPolicy = turn_sandbox_policy(config.main_sandbox)
+    params.approvalPolicy = config.main_approval_policy
+  end
   if session.active_turn_id then
     params.expectedTurnId = session.active_turn_id
   end
-  local function report(_, err)
+  local function report(result, err, owns_turn)
     if err then
       notify(error_message(err, "could not start Codex turn"), vim.log.levels.ERROR)
+    else
+      if owns_turn and result and result.turn then
+        state.owned_turns[result.turn.id] = true
+      end
+      notify("Prompt sent to Codex; use :SealChat to inspect it")
     end
   end
   client():request(method, params, function(result, err)
@@ -1106,10 +1200,14 @@ local function start_agent(session, snapshot, prompt)
       and (message:find("no active turn", 1, true) or message:find("expected active turn", 1, true))
     then
       params.expectedTurnId = nil
-      client():request("turn/start", params, report)
+      params.sandboxPolicy = turn_sandbox_policy(config.main_sandbox)
+      params.approvalPolicy = config.main_approval_policy
+      client():request("turn/start", params, function(start_result, start_err)
+        report(start_result, start_err, true)
+      end)
       return
     end
-    report(result, err)
+    report(result, err, method == "turn/start")
   end)
 end
 
@@ -1129,8 +1227,7 @@ function M.submit(text, opts)
   with_session_status(snapshot.root, function(session, thread_status)
     if route.mode == "declaration" then
       if thread_status ~= "idle" then
-        notify("Finish the active Codex turn before generating a declaration", vim.log.levels.WARN)
-        M.terminal(session.root)
+        notify("Finish the active Codex turn before generating a declaration; use :SealChat to inspect it", vim.log.levels.WARN)
         return
       end
       start_declaration(session, snapshot, route)
@@ -1196,21 +1293,62 @@ function M.reject()
   return changed
 end
 
-function M.terminal(requested_root)
-  local root = type(requested_root) == "string"
+local function current_project_root(requested_root)
+  return type(requested_root) == "string"
       and requested_root
+    or (state.chat and state.chat.buf == vim.api.nvim_get_current_buf() and state.chat.root)
     or root_for_buffer(vim.api.nvim_get_current_buf())
+end
+
+function M.chat(requested_root)
+  local root = current_project_root(requested_root)
   ensure_session(root, function(session, err)
     if not session then
       notify(error_message(err, "could not create a Codex session"), vim.log.levels.ERROR)
       return
     end
-    open_terminal(session)
+    read_chat(session, true)
+  end)
+end
+
+function M.attach(requested_root)
+  local root = current_project_root(requested_root)
+  ensure_session(root, function(session, err)
+    if not session then
+      notify(error_message(err, "could not create a Codex session"), vim.log.levels.ERROR)
+      return
+    end
+    local args = {
+      config.codex_command,
+      "resume",
+      "--remote",
+      client():url(),
+      session.thread_id,
+    }
+    local escaped = {}
+    for _, arg in ipairs(args) do
+      table.insert(escaped, vim.fn.shellescape(tostring(arg)))
+    end
+    local attach = table.concat(escaped, " ")
+    local ok, copy_error
+    if config.copy then
+      ok, copy_error = pcall(config.copy, attach)
+    else
+      ok, copy_error = pcall(function()
+        vim.fn.setreg("+", attach)
+        vim.fn.setreg('"', attach)
+      end)
+    end
+    if not ok then
+      notify("Could not copy the Codex attach command: " .. tostring(copy_error), vim.log.levels.ERROR)
+      return
+    end
+    notify("Copied the Codex attach command; paste it in your Zellij pane")
   end)
 end
 
 function M.new_thread()
-  local root = root_for_buffer(vim.api.nvim_get_current_buf())
+  local root = current_project_root()
   client():start(function(ok, err)
     if not ok then
       notify(error_message(err, "could not start Codex"), vim.log.levels.ERROR)
@@ -1218,22 +1356,20 @@ function M.new_thread()
     end
     local previous = state.live[root]
     if previous and previous.status and previous.status.type == "active" and not previous.active_turn_id then
-      notify("Interrupt the active Codex turn from its terminal before starting a new thread", vim.log.levels.WARN)
-      open_terminal(previous)
+      notify("Wait for the active Codex turn before starting a new thread", vim.log.levels.WARN)
       return
     end
 
     local function start_new()
       state.live[root] = nil
       state.sessions[root] = nil
-      close_terminal()
+      close_chat()
       start_thread(root, function(session, start_err)
         if not session then
           notify(error_message(start_err, "could not start a new thread"), vim.log.levels.ERROR)
           return
         end
         notify("Started a new Codex thread")
-        open_terminal(session)
       end)
     end
 
@@ -1256,17 +1392,18 @@ function M.stop()
   state.stopping = true
   M.reject()
   state.generation = nil
-  close_terminal()
+  close_chat()
   if state.client then
     state.client:stop()
     state.client = nil
   end
   state.live = {}
+  state.owned_turns = {}
   state.stopping = false
 end
 
 function M.status()
-  local root = root_for_buffer(vim.api.nvim_get_current_buf())
+  local root = current_project_root()
   local session = state.live[root]
   return {
     root = root,
@@ -1306,9 +1443,11 @@ function M.setup(opts)
   end, { nargs = "*", range = true, desc = "Prompt Codex through Seal" })
   command("SealAccept", M.accept, { desc = "Accept Seal declaration" })
   command("SealReject", M.reject, { desc = "Reject Seal declaration" })
-  command("SealTerminal", M.terminal, { desc = "Open the Seal Codex terminal" })
+  command("SealChat", M.chat, { desc = "Inspect the Seal conversation" })
+  command("SealAttach", M.attach, { desc = "Copy the Codex TUI attach command" })
   command("SealNew", M.new_thread, { desc = "Start a new Seal Codex thread" })
   command("SealStop", M.stop, { desc = "Stop Seal's local app-server" })
+  pcall(vim.api.nvim_del_user_command, "SealTerminal")
 
   local group = vim.api.nvim_create_augroup("Seal", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "BufWipeout" }, {
@@ -1316,6 +1455,11 @@ function M.setup(opts)
     callback = function(args)
       local preview = state.preview
       local generation = state.generation
+      local chat = state.chat
+      if chat and chat.buf == args.buf then
+        state.chat = nil
+        state.chat_request = state.chat_request + 1
+      end
       if preview and preview.buf == args.buf then
         clear_preview()
       elseif generation and generation.snapshot.buf == args.buf then
@@ -1333,8 +1477,8 @@ function M.setup(opts)
       M.prompt({ range = 2, line1 = first, line2 = last })
     end, { desc = "Seal prompt with selection" })
   end
-  if config.keymaps.terminal then
-    vim.keymap.set("n", config.keymaps.terminal, M.terminal, { desc = "Seal terminal" })
+  if config.keymaps.chat then
+    vim.keymap.set("n", config.keymaps.chat, M.chat, { desc = "Seal chat" })
   end
   return M
 end
@@ -1355,7 +1499,9 @@ M._reset = function()
   state.loading = {}
   state.generation = nil
   state.preview = nil
-  state.terminal = nil
+  state.chat = nil
+  state.chat_request = 0
+  state.owned_turns = {}
   state.sequence = 0
   state.stopping = false
   config = vim.deepcopy(defaults)

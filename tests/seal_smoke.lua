@@ -13,15 +13,12 @@ seal.setup({
   root = function()
     return root
   end,
-  terminal = function()
-    error("declaration generation should not open the terminal")
-  end,
   notify = function(message, level)
     if level == vim.log.levels.ERROR then
       table.insert(errors, message)
     end
   end,
-  keymaps = { prompt = false, terminal = false },
+  keymaps = { prompt = false, chat = false },
 })
 
 vim.cmd("enew!")

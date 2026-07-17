@@ -77,7 +77,14 @@ local function fake_client()
     elseif method == "thread/resume" then
       callback(nil, { message = "missing" })
     elseif method == "thread/read" then
-      callback({ thread = { id = params.threadId, status = self.thread_status or { type = "idle" } } })
+      callback({
+        thread = {
+          id = params.threadId,
+          cwd = "/tmp/seal-project",
+          status = self.thread_status or { type = "idle" },
+          turns = params.includeTurns and (self.thread_turns or {}) or {},
+        },
+      })
     elseif method == "thread/fork" then
       if self.fork_error then
         callback(nil, { message = "no rollout found for thread id" })
@@ -96,14 +103,14 @@ local function fake_client()
 end
 
 local notifications
-local terminals
 local fake
+local copied
 local buffer_sequence = 0
 
 local function setup(lines, overrides)
   seal._reset()
   notifications = {}
-  terminals = {}
+  copied = nil
   fake = fake_client()
   local options = {
     client = fake,
@@ -111,13 +118,10 @@ local function setup(lines, overrides)
     root = function()
       return "/tmp/seal-project"
     end,
-    terminal = function(spec)
-      table.insert(terminals, spec)
-    end,
     notify = function(message, level)
       table.insert(notifications, { message = message, level = level })
     end,
-    keymaps = { prompt = false, terminal = false },
+    keymaps = { prompt = false, chat = false },
   }
   seal.setup(vim.tbl_deep_extend("force", options, overrides or {}))
   vim.cmd("enew!")
@@ -181,14 +185,14 @@ function tests.freeform_uses_main_thread_unchanged()
   truthy(turn.params.outputSchema == nil, "freeform prompt must not constrain output")
   truthy(turn.params.additionalContext["seal.editor"].value:find("local value = 1", 1, true), "editor context should be attached")
   equal(turn.params.additionalContext["seal.editor"].kind, "untrusted", "repository text must stay outside the developer role")
-  equal(#terminals, 1, "freeform prompt should open the terminal")
-  equal(terminals[1].command, {
-    "codex",
-    "resume",
-    "--remote",
-    "ws://127.0.0.1:4567",
-    "main-thread",
-  }, "terminal must attach to the live app-server thread")
+  equal(turn.params.approvalPolicy, "never", "background turns must not wait for an unavailable approval UI")
+  equal(turn.params.sandboxPolicy, {
+    type = "workspaceWrite",
+    writableRoots = {},
+    networkAccess = false,
+  }, "normal turns should use a protocol-valid workspace-writing policy")
+  equal(request(fake, "thread/start").params.approvalPolicy, "never", "the main thread should be non-interactive")
+  equal(request(fake, "thread/start").params.sandbox, "workspace-write", "the main thread should be workspace-writing")
 end
 
 function tests.freeform_steers_an_active_turn()
@@ -206,6 +210,86 @@ function tests.freeform_steers_an_active_turn()
   equal(steer.params.input[1].text, "follow up exactly", "steered prompt must remain unchanged")
 end
 
+function tests.chat_reads_and_renders_the_backing_thread()
+  setup({ "local value = 1" })
+  seal.submit("explain the value")
+  fake.thread_turns = {
+    {
+      id = "turn-1",
+      status = "completed",
+      items = {
+        { id = "user-1", type = "userMessage", content = { { type = "text", text = "explain the value" } } },
+        { id = "tool-1", type = "commandExecution", command = "secret noisy command", status = "completed" },
+        { id = "agent-1", type = "agentMessage", phase = "final_answer", text = "It is the cached value." },
+      },
+    },
+  }
+
+  local source = vim.api.nvim_get_current_buf()
+  seal.chat()
+  local read = request(fake, "thread/read")
+  equal(read.params.includeTurns, true, "chat should request persisted turns and items")
+  truthy(vim.api.nvim_get_current_buf() ~= source, "chat should open a scratch buffer")
+  equal(vim.bo.buftype, "nofile", "chat should not be backed by a file")
+  equal(vim.bo.modifiable, false, "chat should be read-only")
+  equal(vim.bo.readonly, true, "chat should reject file-style edits")
+  local rendered = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  truthy(rendered:find("## You\n\nexplain the value", 1, true), "chat should render the user message")
+  truthy(rendered:find("## Codex\n\nIt is the cached value.", 1, true), "chat should render the Codex answer")
+  truthy(not rendered:find("secret noisy command", 1, true), "chat should omit tool activity")
+  seal.submit("follow up from chat")
+  local follow_up = request(fake, "turn/start", 2)
+  equal(follow_up.params.threadId, "main-thread", "prompting from chat should reuse its backing thread")
+  truthy(follow_up.params.additionalContext["seal.editor"].value:find("example-", 1, true), "chat prompts should retain the source buffer context")
+  vim.fn.maparg("q", "n", false, true).callback()
+  equal(vim.api.nvim_get_current_buf(), source, "closing chat should return to the source buffer")
+end
+
+function tests.attach_copies_the_real_tui_command()
+  setup({ "" }, {
+    copy = function(value)
+      copied = value
+    end,
+  })
+  seal.attach()
+  truthy(copied:find("codex", 1, true), "attach command should invoke Codex")
+  truthy(copied:find("resume", 1, true), "attach command should resume the live thread")
+  truthy(copied:find("--remote", 1, true), "attach command should use the app-server transport")
+  truthy(copied:find("ws://127.0.0.1:4567", 1, true), "attach command should use Seal's live endpoint")
+  truthy(copied:find("main-thread", 1, true), "attach command should target the backing chat thread")
+end
+
+function tests.wiped_chat_ignores_a_delayed_refresh()
+  setup({ "" })
+  seal.submit("start the chat")
+  seal.chat()
+  local source = seal._state.chat.return_buf
+  local original_request = fake.request
+  local held_read
+  function fake:request(method, params, callback)
+    if method == "thread/read" and params.includeTurns then
+      table.insert(self.requests, { method = method, params = params })
+      held_read = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.chat()
+  truthy(held_read ~= nil, "refresh should be held for the race test")
+  vim.api.nvim_set_current_buf(source)
+  held_read({
+    thread = {
+      id = "main-thread",
+      cwd = "/tmp/seal-project",
+      status = { type = "idle" },
+      turns = {},
+    },
+  })
+  truthy(seal._state.chat == nil, "a delayed refresh must not reopen a wiped chat")
+  equal(vim.api.nvim_get_current_buf(), source, "a delayed refresh must not steal focus")
+end
+
 function tests.declaration_waits_for_active_main_turn()
   setup({ "" })
   seal.submit("first prompt")
@@ -216,7 +300,7 @@ function tests.declaration_waits_for_active_main_turn()
   })
   seal.submit("fun: wait for consistency")
   truthy(request(fake, "thread/fork") == nil, "declaration must not fork an in-progress transcript")
-  equal(terminals[#terminals].thread_id, "main-thread", "busy declaration should focus the owning terminal")
+  truthy(notifications[#notifications].message:find(":SealChat", 1, true), "busy declaration should point to the chat")
 end
 
 function tests.declaration_uses_safe_ephemeral_fork()
@@ -237,7 +321,6 @@ function tests.declaration_uses_safe_ephemeral_fork()
   truthy(turn.params.input[1].text:find("exactly one function", 1, true), "turn should carry the declaration contract")
   truthy(turn.params.input[1].text:find("load the durable state", 1, true), "turn should carry the user's intent")
   equal(turn.params.outputSchema.required, { "code" }, "declaration should require structured code")
-  equal(#terminals, 0, "declaration mode should stay in the editor")
 end
 
 function tests.first_declaration_handles_empty_main_thread()
@@ -299,17 +382,58 @@ function tests.null_thread_settings_are_omitted_from_forks()
   truthy(fork.params.serviceTier == nil, "null service tier should be omitted")
 end
 
-function tests.server_request_opens_owning_project_terminal()
+function tests.server_request_is_resolved_without_an_interactive_client()
   setup({ "" })
   seal._state.live["/tmp/project-a"] = { root = "/tmp/project-a", thread_id = "thread-a" }
-  seal._state.live["/tmp/project-b"] = { root = "/tmp/project-b", thread_id = "thread-b" }
+  seal._state.owned_turns["seal-turn"] = true
   seal._server_request({
     id = 41,
     method = "item/commandExecution/requestApproval",
-    params = { threadId = "thread-a" },
+    params = { threadId = "thread-a", turnId = "seal-turn" },
   })
-  equal(terminals[#terminals].cwd, "/tmp/project-a", "approval should open the terminal for its own thread")
-  equal(terminals[#terminals].thread_id, "thread-a", "approval should attach the requesting thread")
+  equal(fake.responses[#fake.responses], {
+    id = 41,
+    result = { decision = "decline" },
+  }, "approval should be declined instead of hanging")
+  truthy(notifications[#notifications].message:find("declined", 1, true), "the declined interaction should be visible")
+
+  seal._server_request({
+    id = 42,
+    method = "item/permissions/requestApproval",
+    params = { threadId = "thread-a", turnId = "seal-turn" },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 42,
+    result = { permissions = {}, scope = "turn" },
+  }, "permission requests should receive a protocol-valid empty grant")
+
+  seal._server_request({
+    id = 43,
+    method = "item/tool/requestUserInput",
+    params = { threadId = "thread-a", turnId = "seal-turn" },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 43,
+    result = { answers = {} },
+  }, "user-input requests should receive a protocol-valid empty response")
+
+  seal._server_request({
+    id = 44,
+    method = "mcpServer/elicitation/request",
+    params = { threadId = "thread-a", turnId = "seal-turn" },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 44,
+    result = { action = "decline" },
+  }, "MCP elicitation should receive a protocol-valid decline")
+
+  local response_count = #fake.responses
+  seal._server_request({
+    id = 45,
+    method = "item/commandExecution/requestApproval",
+    params = { threadId = "thread-a", turnId = "tui-turn" },
+  })
+  equal(#fake.responses, response_count, "Seal must let the attached TUI answer requests for its own turns")
 end
 
 function tests.superseded_fork_is_unsubscribed()
@@ -475,16 +599,13 @@ function tests.prompt_keeps_originating_snapshot()
     root = function()
       return "/tmp/seal-project"
     end,
-    terminal = function(spec)
-      table.insert(terminals, spec)
-    end,
     notify = function(message, level)
       table.insert(notifications, { message = message, level = level })
     end,
     input = function(_, callback)
       deliver = callback
     end,
-    keymaps = { prompt = false, terminal = false },
+    keymaps = { prompt = false, chat = false },
   })
   seal.prompt()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "edited while prompting" })
@@ -499,12 +620,15 @@ local order = {
   "visual_selection_shares_the_context_budget",
   "freeform_uses_main_thread_unchanged",
   "freeform_steers_an_active_turn",
+  "chat_reads_and_renders_the_backing_thread",
+  "attach_copies_the_real_tui_command",
+  "wiped_chat_ignores_a_delayed_refresh",
   "declaration_waits_for_active_main_turn",
   "declaration_uses_safe_ephemeral_fork",
   "first_declaration_handles_empty_main_thread",
   "thread_setting_changes_flow_into_forks",
   "null_thread_settings_are_omitted_from_forks",
-  "server_request_opens_owning_project_terminal",
+  "server_request_is_resolved_without_an_interactive_client",
   "superseded_fork_is_unsubscribed",
   "new_thread_interrupts_and_detaches_old_thread",
   "preview_accepts_as_one_edit",
