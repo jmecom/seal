@@ -42,6 +42,7 @@ local function fake_client()
     thread_start_count = 0,
     fork_count = 0,
     declaration_turn_count = 0,
+    main_turn_count = 0,
   }
 
   function fake:start(callback)
@@ -99,12 +100,16 @@ local function fake_client()
       end
     elseif method == "turn/start" then
       if params.threadId == "main-thread" then
-        callback({ turn = { id = "main-turn" } })
+        self.main_turn_count = self.main_turn_count + 1
+        local id = self.main_turn_count == 1 and "main-turn" or "main-turn-" .. self.main_turn_count
+        callback({ turn = { id = id } })
       else
         self.declaration_turn_count = self.declaration_turn_count + 1
         local id = self.declaration_turn_count == 1 and "fork-turn" or "fork-turn-" .. self.declaration_turn_count
         callback({ turn = { id = id } })
       end
+    elseif method == "thread/settings/update" then
+      callback({})
     else
       callback({})
     end
@@ -259,7 +264,33 @@ function tests.targeted_adds_minimal_change_guidance_to_the_main_thread()
   truthy(request(fake, "thread/start") == nil, "an empty targeted prompt should not open a thread")
 end
 
-function tests.freeform_steers_an_active_turn()
+function tests.refactor_adds_minimal_behavior_preserving_guidance()
+  setup({ "local value = 1" })
+  truthy(seal.submit("REFACTOR: extract the parsing branch"), "refactor prompt should submit")
+  local turn = request(fake, "turn/start")
+  equal(turn.params.threadId, "main-thread", "refactor should use the persistent thread")
+  truthy(turn.params.outputSchema == nil, "refactor must not constrain the agent response")
+  equal(turn.params.approvalPolicy, "untrusted", "refactor patches should use the normal review gate")
+  truthy(
+    turn.params.input[1].text:find("smallest structural change necessary", 1, true),
+    "refactor should request the smallest structural change"
+  )
+  truthy(
+    turn.params.input[1].text:find("Preserve existing behavior and public APIs", 1, true),
+    "refactor should preserve behavior and public APIs by default"
+  )
+  truthy(
+    turn.params.input[1].text:find("extract the parsing branch", 1, true),
+    "refactor should include the user's request"
+  )
+  truthy(not turn.params.input[1].text:find("REFACTOR:", 1, true), "the control prefix should not reach Codex")
+
+  setup({ "" })
+  truthy(not seal.submit("refactor:   "), "an empty refactor prompt should not submit")
+  truthy(request(fake, "thread/start") == nil, "an empty refactor prompt should not open a thread")
+end
+
+function tests.freeform_queues_behind_an_active_turn()
   setup({ "local value = 1" })
   seal.submit("first prompt")
   fake.thread_status = { type = "active", activeFlags = {} }
@@ -268,59 +299,62 @@ function tests.freeform_steers_an_active_turn()
     turn = { id = "main-turn", status = "inProgress" },
   })
   seal.submit("follow up exactly")
-  local steer = request(fake, "turn/steer")
-  equal(steer.params.threadId, "main-thread", "follow-up should steer the existing thread")
-  equal(steer.params.expectedTurnId, "main-turn", "steer should guard the active turn id")
-  equal(steer.params.input[1].text, "follow up exactly", "steered prompt must remain unchanged")
-  equal(vim.tbl_count(seal._state.activities), 2, "both cursor markers should remain for the shared turn")
-  for _, activity in pairs(seal._state.activities) do
-    equal(activity.turn_id, "main-turn", "steered markers should bind to the active turn")
-  end
+  truthy(request(fake, "turn/steer") == nil, "Seal should never steer a queued prompt into another request")
+  equal(fake.main_turn_count, 1, "the second prompt should wait for the active turn")
+  equal(vim.tbl_count(seal._state.activities), 2, "both cursor markers should remain visible")
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
   })
-  equal(vim.tbl_count(seal._state.activities), 0, "turn completion should clear every shared marker")
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the queued prompt should start after the first turn")
+  local second = request(fake, "turn/start")
+  equal(second.params.threadId, "main-thread", "the queued prompt should use the same thread")
+  equal(second.params.input[1].text, "follow up exactly", "the queued prompt must remain unchanged")
+  equal(vim.tbl_count(seal._state.activities), 1, "only the queued prompt marker should remain")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn-2", status = "completed" },
+  })
+  equal(vim.tbl_count(seal._state.activities), 0, "the second completion should clear its marker")
 end
 
-function tests.steer_completion_keeps_the_fallback_turn_marker()
+function tests.late_start_response_does_not_consume_the_next_queued_marker()
   setup({ "local value = 1" })
-  seal.submit("first prompt")
-  seal._notification("turn/started", {
-    threadId = "main-thread",
-    turn = { id = "main-turn", status = "inProgress" },
-  })
-
   local original_request = fake.request
+  local first_callback
   function fake:request(method, params, callback)
-    if method == "turn/steer" then
+    if method == "turn/start" and params.threadId == "main-thread" and not first_callback then
       table.insert(self.requests, { method = method, params = params })
-      seal._notification("turn/completed", {
-        threadId = "main-thread",
-        turn = { id = "main-turn", status = "completed" },
-      })
-      callback(nil, { message = "no active turn" })
-      return
-    end
-    if method == "turn/start" and params.threadId == "main-thread" then
-      table.insert(self.requests, { method = method, params = params })
-      callback({ turn = { id = "fallback-turn" } })
+      first_callback = callback
       return
     end
     return original_request(self, method, params, callback)
   end
 
+  seal.submit("first prompt")
+  local first_client_id = request(fake, "turn/start").params.clientUserMessageId
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = {
+      id = "actual-turn",
+      status = "inProgress",
+      items = { { type = "userMessage", clientId = first_client_id } },
+    },
+  })
   seal.submit("follow up after completion")
-
-  equal(request(fake, "turn/start").params.threadId, "main-thread", "a stale steer should fall back to turn/start")
-  equal(vim.tbl_count(seal._state.activities), 1, "the fallback turn should keep its cursor marker")
-  local _, activity = next(seal._state.activities)
-  equal(activity.turn_id, "fallback-turn", "the surviving marker should bind to the fallback turn")
   seal._notification("turn/completed", {
     threadId = "main-thread",
-    turn = { id = "fallback-turn", status = "completed" },
+    turn = { id = "actual-turn", status = "completed" },
   })
-  equal(vim.tbl_count(seal._state.activities), 0, "the fallback completion should clear its marker")
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 1
+  end, 5), "the next queued turn should start")
+  equal(vim.tbl_count(seal._state.activities), 1, "the next queued marker should remain")
+  first_callback({ turn = { id = "actual-turn" } })
+  local _, activity = next(seal._state.activities)
+  equal(activity.turn_id, "main-turn", "the late response must not overwrite the next turn")
 end
 
 function tests.freeform_uses_the_post_format_buffer_and_selection()
@@ -736,6 +770,14 @@ function tests.chat_reads_and_renders_the_backing_thread()
   truthy(rendered:find("## Codex\n\nIt is the cached value.", 1, true), "chat should render the Codex answer")
   truthy(not rendered:find("secret noisy command", 1, true), "chat should omit tool activity")
   seal.submit("follow up from chat")
+  equal(fake.main_turn_count, 1, "a chat follow-up should queue behind the active turn")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the chat follow-up should start after the active turn")
   local follow_up = request(fake, "turn/start", 2)
   equal(follow_up.params.threadId, "main-thread", "prompting from chat should reuse its backing thread")
   truthy(follow_up.params.additionalContext["seal.editor"].value:find("example-", 1, true), "chat prompts should retain the source buffer context")
@@ -788,7 +830,7 @@ function tests.wiped_chat_ignores_a_delayed_refresh()
   equal(vim.api.nvim_get_current_buf(), source, "a delayed refresh must not steal focus")
 end
 
-function tests.declaration_forks_during_active_main_turn()
+function tests.declaration_queues_during_active_main_turn()
   setup({ "" })
   seal.submit("targeted: make the surrounding change")
   fake.thread_status = { type = "active", activeFlags = {} }
@@ -797,38 +839,42 @@ function tests.declaration_forks_during_active_main_turn()
     turn = { id = "main-turn", status = "inProgress" },
   })
   seal.submit("fun: run alongside the targeted turn")
-  local fork = request(fake, "thread/fork")
-  truthy(fork ~= nil, "a declaration should fork while the targeted turn is in progress")
-  equal(fork.params.threadId, "main-thread", "the parallel declaration should retain the backing chat context")
-  equal(request(fake, "turn/start").params.threadId, "fork-thread", "the declaration should start on its fork")
+  truthy(request(fake, "thread/fork") == nil, "a declaration should not fork the backing chat")
+  equal(fake.main_turn_count, 1, "the declaration should wait for the targeted turn")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the declaration should start after the targeted turn")
+  equal(request(fake, "turn/start").params.threadId, "main-thread", "the declaration should reuse the backing chat")
+  complete_declaration("function run_after_targeted() end")
   seal.reject(1)
 end
 
-function tests.declaration_uses_safe_ephemeral_fork()
+function tests.declaration_uses_shared_read_only_turn()
   setup({ "  " })
   truthy(seal.submit("fun: load the durable state"), "declaration prompt should submit")
-  local fork = request(fake, "thread/fork")
-  equal(fork.params.threadId, "main-thread", "fork should copy the persistent chat")
-  equal(fork.params.ephemeral, true, "declaration fork should be ephemeral")
-  equal(fork.params.sandbox, "read-only", "declaration fork should be read-only")
-  equal(fork.params.approvalPolicy, "never", "declaration fork must not wait for approvals")
-  equal(fork.params.excludeTurns, true, "fork response should omit copied transcript payloads")
-  equal(fork.params.model, "gpt-test", "fork should inherit the main thread model")
-  equal(fork.params.config.model_reasoning_effort, "high", "fork should inherit reasoning effort")
-  truthy(fork.params.developerInstructions == nil, "fork should preserve the main thread's developer configuration")
+  truthy(request(fake, "thread/fork") == nil, "declarations should not fork the persistent chat")
 
   local turn = request(fake, "turn/start")
-  equal(turn.params.threadId, "fork-thread", "declaration should run on the fork")
+  equal(turn.params.threadId, "main-thread", "declaration should run in the persistent chat")
+  equal(turn.params.sandboxPolicy, { type = "readOnly", networkAccess = false }, "declaration should be read-only")
+  equal(turn.params.approvalPolicy, "never", "declaration should not wait for tool approvals")
   truthy(turn.params.input[1].text:find("exactly one function", 1, true), "turn should carry the declaration contract")
   truthy(turn.params.input[1].text:find("load the durable state", 1, true), "turn should carry the user's intent")
   equal(turn.params.outputSchema.required, { "code" }, "declaration should require structured code")
+  local restored = request(fake, "thread/settings/update")
+  equal(restored.params.sandboxPolicy.type, "workspaceWrite", "declaration should restore the shared thread sandbox")
+  equal(restored.params.approvalPolicy, "untrusted", "declaration should restore the review policy")
 end
 
 function tests.interface_prefix_requests_api_without_implementation()
   setup({ "" })
   truthy(seal.submit("INTERFACE: storage backend"), "interface prompt should submit")
   local turn = request(fake, "turn/start")
-  equal(turn.params.threadId, "fork-thread", "interface should run on an ephemeral fork")
+  equal(turn.params.threadId, "main-thread", "interface should run in the persistent chat")
   truthy(turn.params.input[1].text:find("exactly one interface", 1, true), "interface should keep the declaration contract")
   truthy(
     turn.params.input[1].text:find("no concrete implementation logic", 1, true),
@@ -842,9 +888,8 @@ function tests.interface_prefix_requests_api_without_implementation()
   equal(turn.params.outputSchema.required, { "code" }, "interface should retain structured declaration output")
 end
 
-function tests.first_declaration_handles_empty_main_thread()
+function tests.first_declaration_starts_the_shared_thread()
   setup({ "" })
-  fake.fork_error = true
   seal.submit("type: cached value")
   local starts = {}
   for _, item in ipairs(fake.requests) do
@@ -852,13 +897,11 @@ function tests.first_declaration_handles_empty_main_thread()
       table.insert(starts, item)
     end
   end
-  equal(#starts, 2, "an empty main thread should fall back to a new declaration thread")
-  equal(starts[2].params.ephemeral, true, "fallback declaration thread should be ephemeral")
-  equal(starts[2].params.sandbox, "read-only", "fallback declaration thread should be read-only")
-  equal(request(fake, "turn/start").params.threadId, "empty-fork", "declaration should run on the fallback thread")
+  equal(#starts, 1, "a declaration should create only the persistent project thread")
+  equal(request(fake, "turn/start").params.threadId, "main-thread", "declaration should run on that thread")
 end
 
-function tests.thread_setting_changes_flow_into_forks()
+function tests.thread_setting_changes_stay_on_the_shared_thread()
   setup({ "" })
   seal.submit("establish the main thread")
   seal._notification("thread/settings/updated", {
@@ -870,35 +913,177 @@ function tests.thread_setting_changes_flow_into_forks()
       effort = "ultra",
       summary = "detailed",
       personality = "pragmatic",
+      approvalPolicy = "on-request",
+      approvalsReviewer = "auto_review",
+      sandboxPolicy = { type = "dangerFullAccess" },
+      activePermissionProfile = vim.NIL,
     },
   })
   seal.submit("fun: inherit settings")
-  local fork = request(fake, "thread/fork")
-  equal(fork.params.model, "gpt-updated", "fork should use the current TUI model")
-  equal(fork.params.serviceTier, "priority", "fork should use the current service tier")
-  equal(fork.params.config.model_reasoning_effort, "ultra", "fork should use the current effort")
-  equal(fork.params.config.model_reasoning_summary, "detailed", "fork should use the current summary mode")
-  equal(fork.params.config.personality, "pragmatic", "fork should use the current personality")
+  equal(fake.main_turn_count, 1, "the declaration should queue behind the establishing turn")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the declaration should start on the updated shared thread")
+  local turn = request(fake, "turn/start")
+  equal(turn.params.threadId, "main-thread", "updated thread settings should be inherited without a fork")
+  truthy(turn.params.model == nil, "the turn should inherit the thread's current model")
+  local restored = request(fake, "thread/settings/update")
+  equal(restored.params.approvalPolicy, "on-request", "the declaration should preserve the TUI approval policy")
+  equal(restored.params.approvalsReviewer, "auto_review", "the declaration should preserve the TUI reviewer")
+  equal(restored.params.sandboxPolicy, { type = "dangerFullAccess" }, "the declaration should preserve the TUI sandbox")
 end
 
-function tests.null_thread_settings_are_omitted_from_forks()
+function tests.declaration_restores_main_thread_settings()
   setup({ "" })
-  seal.submit("establish the main thread")
+  seal.submit("establish the shared thread")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
   seal._notification("thread/settings/updated", {
     threadId = "main-thread",
     threadSettings = {
-      model = "gpt-updated",
-      modelProvider = "openai",
-      serviceTier = vim.NIL,
-      effort = vim.NIL,
-      summary = vim.NIL,
-      personality = vim.NIL,
+      approvalPolicy = "never",
+      approvalsReviewer = "guardian_subagent",
+      sandboxPolicy = { type = "dangerFullAccess" },
+      activePermissionProfile = { id = "yolo", extends = vim.NIL },
     },
   })
-  seal.submit("fun: null-safe settings")
-  local fork = request(fake, "thread/fork")
-  truthy(fork.params.config == nil, "JSON null settings must not become invalid config overrides")
-  truthy(fork.params.serviceTier == nil, "null service tier should be omitted")
+  seal.submit("fun: restore settings")
+  local restored = request(fake, "thread/settings/update")
+  equal(restored.params.threadId, "main-thread", "settings should be restored on the shared thread")
+  equal(restored.params.approvalPolicy, "never", "the active TUI approval policy should survive")
+  equal(restored.params.approvalsReviewer, "guardian_subagent", "the active TUI reviewer should survive")
+  equal(restored.params.permissions, "yolo", "the active TUI permission profile should survive")
+  truthy(restored.params.sandboxPolicy == nil, "a named permission profile must not be combined with a sandbox")
+end
+
+function tests.declaration_turn_declines_file_changes()
+  setup({ "" })
+  seal.submit("fun: remain read-only")
+  seal._server_request({
+    id = 40,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "unexpected-patch" },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 40,
+    result = { decision = "decline" },
+  }, "a declaration turn must not open a writable patch review")
+  truthy(seal._state.reviews["40"] == nil, "the read-only declaration should not create a review")
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { type = "collabAgentToolCall", receiverThreadIds = { "declaration-child" } },
+  })
+  seal._server_request({
+    id = 41,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "declaration-child", turnId = "declaration-child-turn", itemId = "child-patch" },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 41,
+    result = { decision = "decline" },
+  }, "a declaration subagent must remain read-only")
+  seal.reject(1)
+end
+
+function tests.declaration_retries_after_a_tui_turn_wins_the_start_race()
+  setup({ "" })
+  local original_request = fake.request
+  local held_start
+  function fake:request(method, params, callback)
+    if method == "turn/start" and params.threadId == "main-thread" and not held_start then
+      table.insert(self.requests, { method = method, params = params })
+      held_start = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: wait for the TUI")
+  local job = seal._state.jobs[1]
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = {
+      id = "tui-race-turn",
+      status = "inProgress",
+      items = { { type = "userMessage", clientId = "tui-client" } },
+    },
+  })
+  equal(job.turn_id, nil, "an unrelated TUI notification must not claim the declaration")
+  truthy(seal._state.owned_turns["tui-race-turn"] == nil, "Seal must not claim the TUI turn")
+
+  held_start(nil, { message = "thread already has an active turn" })
+  equal(job.thread_id, nil, "the declaration should return to the queue")
+  truthy(request(fake, "turn/interrupt") == nil, "the TUI turn must not be interrupted")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "tui-race-turn", status = "completed" },
+  })
+  truthy(vim.wait(1000, function()
+    return job.turn_id == "main-turn"
+  end, 5), "the declaration should retry after the TUI turn")
+  complete_declaration("function after_tui() end")
+  seal.reject(1)
+end
+
+function tests.stale_status_read_does_not_block_the_queue()
+  setup({ "" })
+  local original_request = fake.request
+  local held_read
+  function fake:request(method, params, callback)
+    if method == "thread/read" and not held_read then
+      table.insert(self.requests, { method = method, params = params })
+      held_read = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: survive stale status")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "short-tui-turn", status = "inProgress", items = {} },
+  })
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "short-tui-turn", status = "completed" },
+  })
+  held_read({
+    thread = {
+      id = "main-thread",
+      status = { type = "active", activeFlags = {} },
+    },
+  })
+  equal(fake.main_turn_count, 1, "the stale active response must not block the declaration")
+  seal.reject(1)
+end
+
+function tests.failed_settings_restore_blocks_the_next_turn()
+  setup({ "", "" })
+  local original_request = fake.request
+  function fake:request(method, params, callback)
+    if method == "thread/settings/update" then
+      table.insert(self.requests, { method = method, params = params })
+      callback(nil, { message = "settings restore failed" })
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: first")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: second")
+  complete_declaration("function first() end")
+  equal(fake.main_turn_count, 1, "the second turn must not start with declaration permissions")
+  truthy(seal._state.live["/tmp/seal-project"].settings_blocked, "the unsafe thread should remain blocked")
+  equal(seal._state.jobs[1].phase, "ready", "the completed declaration should still reach preview")
+  equal(seal._state.jobs[2].phase, "generating", "the queued declaration should remain pending")
 end
 
 function tests.server_request_is_resolved_without_an_interactive_client()
@@ -1062,9 +1247,11 @@ function tests.prompting_from_patch_review_targets_the_source_buffer()
   equal(vim.api.nvim_get_current_buf(), source, "submitting should return to the source buffer")
   equal(vim.bo.modifiable, true, "Seal must not leave the source buffer read-only")
   equal(seal._state.jobs[1].snapshot.buf, source, "the declaration should belong to the source buffer")
-  truthy(request(fake, "thread/fork") ~= nil, "the declaration should fork during the active targeted turn")
+  truthy(request(fake, "thread/fork") == nil, "the declaration should stay in the backing chat")
+  equal(seal._state.jobs[1].thread_id, nil, "the declaration should wait for the active targeted turn")
 
   seal.reject(1)
+  truthy(request(fake, "turn/interrupt") == nil, "rejecting a queued declaration should not interrupt the targeted turn")
   seal.review("/tmp/seal-project")
   vim.fn.maparg("<Esc>", "n", false, true).callback()
 end
@@ -1363,7 +1550,7 @@ function tests.external_resolution_surfaces_the_next_patch_review()
   vim.fn.maparg("<Esc>", "n", false, true).callback()
 end
 
-function tests.review_mode_does_not_steer_a_tui_owned_turn()
+function tests.seal_prompt_waits_for_a_tui_owned_turn()
   setup({ "" })
   seal.submit("establish the Seal turn")
   seal._notification("turn/completed", {
@@ -1377,7 +1564,15 @@ function tests.review_mode_does_not_steer_a_tui_owned_turn()
   })
   seal.submit("do not inherit the TUI policy")
   truthy(request(fake, "turn/steer") == nil, "Seal must not steer a turn whose review policy it did not establish")
-  truthy(notifications[#notifications].message:find("TUI turn", 1, true), "the policy boundary should be explained")
+  equal(fake.main_turn_count, 1, "the Seal prompt should wait for the TUI turn")
+  equal(vim.tbl_count(seal._state.activities), 1, "the queued Seal prompt should remain visible")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "tui-turn", status = "completed" },
+  })
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the Seal prompt should start after the TUI turn")
 end
 
 function tests.seal_owned_child_thread_can_request_patch_review()
@@ -1543,33 +1738,25 @@ function tests.tui_owned_child_thread_is_not_claimed_by_seal()
   truthy(seal._state.reviews["56"] == nil, "Seal should not open a review for a TUI-owned child")
 end
 
-function tests.parallel_pending_forks_both_start()
+function tests.declarations_run_fifo_on_the_shared_thread()
   setup({ "", "" })
-  local original_request = fake.request
-  local held_fork
-  function fake:request(method, params, callback)
-    if method == "thread/fork" and not held_fork then
-      table.insert(self.requests, { method = method, params = params })
-      held_fork = callback
-      return
-    end
-    return original_request(self, method, params, callback)
-  end
-
   seal.submit("fun: first")
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
   seal.submit("fun: second")
-  held_fork({ thread = { id = "delayed-fork", ephemeral = true } })
+  equal(fake.main_turn_count, 1, "only the first declaration should start")
+  truthy(request(fake, "thread/fork") == nil, "neither declaration should fork")
+  equal(vim.tbl_count(seal._state.jobs), 2, "both declaration markers should remain visible")
 
-  local started = {}
-  for _, item in ipairs(fake.requests) do
-    if item.method == "turn/start" then
-      started[item.params.threadId] = true
-    end
-  end
-  truthy(started["fork-thread"], "the second prompt should start while the first fork is pending")
-  truthy(started["delayed-fork"], "the delayed first fork should still start")
-  equal(vim.tbl_count(seal._state.jobs), 2, "both declaration jobs should remain active")
+  complete_declaration("function first() end")
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the second declaration should start after the first")
+  equal(seal._state.jobs[1].phase, "ready", "the first preview should remain ready")
+  equal(seal._state.jobs[2].phase, "generating", "the second declaration should now be active")
+  complete_declaration("function second() end")
+  equal(seal._state.jobs[2].phase, "ready", "the second declaration should produce its own preview")
+  seal.reject(1)
+  seal.reject(2)
 end
 
 function tests.cancel_before_turn_start_response_uses_startup_interrupt()
@@ -1577,7 +1764,7 @@ function tests.cancel_before_turn_start_response_uses_startup_interrupt()
   local original_request = fake.request
   local held_turn
   function fake:request(method, params, callback)
-    if method == "turn/start" and params.threadId == "fork-thread" then
+    if method == "turn/start" and params.threadId == "main-thread" then
       table.insert(self.requests, { method = method, params = params })
       held_turn = callback
       return
@@ -1591,7 +1778,7 @@ function tests.cancel_before_turn_start_response_uses_startup_interrupt()
   seal.reject(1)
 
   local interrupt = request(fake, "turn/interrupt")
-  equal(interrupt.params.threadId, "fork-thread", "startup cancellation should target the fork")
+  equal(interrupt.params.threadId, "main-thread", "startup cancellation should target the shared thread")
   equal(interrupt.params.turnId, "", "an empty turn ID should interrupt startup before the response arrives")
   held_turn({ turn = { id = "late-turn" } })
   local interrupts = 0
@@ -1601,6 +1788,7 @@ function tests.cancel_before_turn_start_response_uses_startup_interrupt()
     end
   end
   equal(interrupts, 1, "the late turn/start response must not trigger a second interrupt")
+  truthy(request(fake, "thread/unsubscribe") == nil, "cancellation must not detach the persistent thread")
 end
 
 function tests.turn_started_notification_supplies_the_declaration_turn_id()
@@ -1608,7 +1796,7 @@ function tests.turn_started_notification_supplies_the_declaration_turn_id()
   local original_request = fake.request
   local held_turn
   function fake:request(method, params, callback)
-    if method == "turn/start" and params.threadId == "fork-thread" then
+    if method == "turn/start" and params.threadId == "main-thread" then
       table.insert(self.requests, { method = method, params = params })
       held_turn = callback
       return
@@ -1617,14 +1805,19 @@ function tests.turn_started_notification_supplies_the_declaration_turn_id()
   end
 
   seal.submit("fun: cancel from notification")
+  local client_id = request(fake, "turn/start").params.clientUserMessageId
   seal._notification("turn/started", {
-    threadId = "fork-thread",
-    turn = { id = "notification-turn", status = "inProgress" },
+    threadId = "main-thread",
+    turn = {
+      id = "notification-turn",
+      status = "inProgress",
+      items = { { type = "userMessage", clientId = client_id } },
+    },
   })
   equal(
     seal._state.jobs[1].turn_id,
     "notification-turn",
-    "the real turn/started payload should bind the fork's turn ID"
+    "the real turn/started payload should bind the declaration turn ID"
   )
   seal.reject(1)
   equal(
@@ -1635,16 +1828,18 @@ function tests.turn_started_notification_supplies_the_declaration_turn_id()
   held_turn({ turn = { id = "notification-turn" } })
 end
 
-function tests.closed_fork_clears_its_job()
-  setup({ "" }, { activity = { interval_ms = 100000 } })
-  seal.submit("fun: interrupted by a closed fork")
+function tests.closed_shared_thread_clears_its_jobs()
+  setup({ "", "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("fun: interrupted by a closed thread")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: queued on the closed thread")
   local source = vim.api.nvim_get_current_buf()
 
-  seal._notification("thread/closed", { threadId = "fork-thread" })
+  seal._notification("thread/closed", { threadId = "main-thread" })
 
-  truthy(seal._state.jobs[1] == nil, "a closed fork must not leave a declaration job behind")
-  equal(seal._state.spinner_timer, nil, "a closed fork should stop the last spinner")
-  equal(seal._state.job_mappings[source], nil, "a closed fork should restore source-buffer mappings")
+  truthy(vim.tbl_isempty(seal._state.jobs), "a closed shared thread must not leave declaration jobs behind")
+  equal(seal._state.spinner_timer, nil, "a closed thread should stop the last spinner")
+  equal(seal._state.job_mappings[source], nil, "a closed thread should restore source-buffer mappings")
 end
 
 function tests.duplicate_job_on_the_same_line_is_rejected()
@@ -1652,7 +1847,8 @@ function tests.duplicate_job_on_the_same_line_is_rejected()
   seal.submit("fun: first")
   seal.submit("fun: second")
   equal(vim.tbl_count(seal._state.jobs), 1, "one cursor line should have only one unambiguous job")
-  equal(fake.fork_count, 1, "the duplicate prompt should not create another fork")
+  equal(fake.main_turn_count, 1, "the duplicate prompt should not create another turn")
+  truthy(request(fake, "thread/fork") == nil, "the declaration should not fork")
   truthy(notifications[#notifications].message:find("already exists", 1, true), "the duplicate should be explained")
   seal.reject(1)
 end
@@ -1756,7 +1952,7 @@ function tests.agent_spinners_render_before_app_server_is_ready()
   equal(vim.tbl_count(seal._state.activities), 0, "stopping Seal should remove informational markers")
 end
 
-function tests.concurrent_initial_prompts_bind_to_the_started_turn()
+function tests.concurrent_initial_prompts_run_fifo()
   setup({ "local value = 1" }, { activity = { interval_ms = 100000 } })
   local held_start
   function fake:start(callback)
@@ -1778,25 +1974,31 @@ function tests.concurrent_initial_prompts_bind_to_the_started_turn()
   seal.submit("second startup prompt")
   held_start(true)
 
-  equal(submission_count, 2, "both startup prompts should be submitted")
+  equal(submission_count, 1, "only the first startup prompt should be submitted")
   equal(vim.tbl_count(seal._state.activities), 2, "both startup prompts should keep their markers")
   seal._notification("turn/started", {
     threadId = "main-thread",
-    turn = { id = "actual-turn", status = "inProgress" },
+    turn = { id = "submission-1", status = "inProgress" },
   })
-  for _, activity in pairs(seal._state.activities) do
-    equal(activity.turn_id, "actual-turn", "turn/started should replace provisional submission IDs")
-  end
-  truthy(seal._state.owned_turns["submission-1"] == nil, "the first provisional ownership should be removed")
-  truthy(seal._state.owned_turns["submission-2"] == nil, "the second provisional ownership should be removed")
-  truthy(seal._state.owned_turns["actual-turn"] ~= nil, "the actual started turn should remain Seal-owned")
+  equal(seal._state.activities[1].turn_id, "submission-1", "turn/started should bind the active prompt")
+  equal(seal._state.activities[2].turn_id, nil, "the queued prompt should remain unbound")
+  truthy(seal._state.owned_turns["submission-1"] ~= nil, "the active turn should remain Seal-owned")
 
   seal._notification("turn/completed", {
     threadId = "main-thread",
-    turn = { id = "actual-turn", status = "completed" },
+    turn = { id = "submission-1", status = "completed" },
   })
-  equal(vim.tbl_count(seal._state.activities), 0, "the actual completion should clear both startup markers")
-  truthy(seal._state.owned_turns["actual-turn"] == nil, "the actual completion should clear turn ownership")
+  truthy(vim.wait(1000, function()
+    return submission_count == 2
+  end, 5), "the second startup prompt should start after the first")
+  equal(vim.tbl_count(seal._state.activities), 1, "the first completion should preserve the queued marker")
+  equal(seal._state.activities[2].turn_id, "submission-2", "the queued marker should bind to its own turn")
+  truthy(seal._state.owned_turns["submission-1"] == nil, "the completion should clear turn ownership")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "submission-2", status = "completed" },
+  })
+  equal(vim.tbl_count(seal._state.activities), 0, "the second completion should clear its marker")
 end
 
 function tests.session_read_failure_clears_immediate_agent_spinner()
@@ -1888,7 +2090,7 @@ function tests.delayed_old_client_exit_preserves_restarted_activity()
   seal.stop()
 end
 
-function tests.agent_turn_preserves_a_declaration_waiting_for_status()
+function tests.status_batch_preserves_submission_order()
   setup({ "" }, { activity = { interval_ms = 100000 } })
   local original_request = fake.request
   local held_read
@@ -1918,12 +2120,17 @@ function tests.agent_turn_preserves_a_declaration_waiting_for_status()
       status = { type = "idle" },
     },
   })
-  truthy(request(fake, "thread/fork") ~= nil, "the preserved declaration should fork after its status read returns")
+  truthy(request(fake, "thread/fork") == nil, "the preserved declaration should not fork")
+  equal(job.thread_id, "main-thread", "the earlier declaration should start first on the shared thread")
+  equal(fake.main_turn_count, 1, "the later agent prompt should remain queued")
   seal.reject(1)
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
   })
+  truthy(vim.wait(1000, function()
+    return fake.main_turn_count == 2
+  end, 5), "the later agent prompt should start after the declaration")
 end
 
 function tests.spinner_is_anchored_and_animates_in_place()
@@ -1977,7 +2184,7 @@ function tests.mapping_away_from_marker_preserves_global_behavior()
   vim.keymap.del("n", "<Tab>")
 end
 
-function tests.rejecting_one_parallel_job_keeps_its_sibling()
+function tests.rejecting_one_queued_job_keeps_its_sibling()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: first")
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
@@ -1985,14 +2192,15 @@ function tests.rejecting_one_parallel_job_keeps_its_sibling()
 
   truthy(seal.reject(1), "the first job should be rejected")
   local interrupt = request(fake, "turn/interrupt")
-  equal(interrupt.params.threadId, "fork-thread", "only the selected fork should be interrupted")
-  equal(interrupt.params.turnId, "fork-turn", "the selected turn should be interrupted")
-  truthy(seal._state.jobs[2] ~= nil, "the sibling job should keep running")
-  truthy(seal._state.spinner_timer ~= nil, "the shared timer should remain for the sibling")
+  equal(interrupt.params.threadId, "main-thread", "the active shared turn should be interrupted")
+  equal(interrupt.params.turnId, "main-turn", "the selected turn should be interrupted")
+  truthy(seal._state.jobs[2] ~= nil, "the queued sibling job should remain")
+  truthy(seal._state.spinner_timer ~= nil, "the shared timer should remain for the queued sibling")
   seal.reject(2)
+  equal(request(fake, "turn/interrupt"), interrupt, "rejecting the queued sibling should not send another interrupt")
 end
 
-function tests.parallel_jobs_share_and_restore_buffer_mappings()
+function tests.multiple_jobs_share_and_restore_buffer_mappings()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   local previous_tab = function() end
   local previous_escape = function() end
@@ -2058,7 +2266,7 @@ function tests.mapping_restoration_preserves_replace_keycodes()
   equal(restored.replace_keycodes, nil, "Seal should preserve replace_keycodes=false")
 end
 
-function tests.buffer_edit_cancels_only_the_changed_target()
+function tests.buffer_edit_reanchors_all_jobs()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: first")
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
@@ -2073,15 +2281,58 @@ function tests.buffer_edit_cancels_only_the_changed_target()
 
   vim.api.nvim_buf_set_lines(0, 0, 1, false, { "local changed = true" })
   truthy(vim.wait(500, function()
-    return vim.tbl_count(seal._state.jobs) == 2
-  end, 5), "the edit should cancel only the job whose target line changed")
-  truthy(seal._state.jobs[1] == nil, "the changed target's job should be cancelled")
+    return vim.tbl_count(seal._state.jobs) == 3
+      and seal._state.jobs[1].snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "the edit should reanchor every job in the buffer")
+  truthy(seal._state.jobs[1] ~= nil, "the changed target's job should remain active")
+  local first_position = vim.api.nvim_buf_get_extmark_by_id(
+    0,
+    vim.api.nvim_get_namespaces()["seal-activity"],
+    seal._state.jobs[1].extmark,
+    {}
+  )
+  equal(
+    seal._state.jobs[1].snapshot.line,
+    vim.api.nvim_buf_get_lines(0, first_position[1], first_position[1] + 1, false)[1],
+    "the target snapshot should follow its reanchored marker"
+  )
   truthy(seal._state.jobs[2] ~= nil, "an unchanged target in the same buffer should remain active")
   truthy(seal._state.jobs[3] ~= nil, "the other buffer's job should remain active")
 
+  seal.reject(1)
   seal.reject(2)
   seal.reject(3)
   vim.api.nvim_buf_delete(other, { force = true })
+end
+
+function tests.deleting_marked_line_keeps_and_reanchors_job()
+  setup({ "local before = true", "local remove_me = true", "local after = true" }, {
+    activity = { interval_ms = 100000 },
+  })
+  vim.api.nvim_win_set_cursor(0, { 2, 6 })
+  seal.submit("fun: survives deletion of its marked line")
+  local job = seal._state.jobs[1]
+
+  vim.api.nvim_buf_set_lines(0, 1, 2, false, {})
+
+  truthy(vim.wait(500, function()
+    return seal._state.jobs[1] == job
+      and job.snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "deleting the marked line should keep the running job")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, {})
+  equal(position, { 1, 0 }, "the marker should move to the deletion boundary")
+  equal(job.snapshot.line, "local after = true", "the target snapshot should follow the moved marker")
+  truthy(request(fake, "turn/interrupt") == nil, "deleting the marked line should not interrupt Codex")
+
+  complete_declaration("function survives_marked_line_deletion() end")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  truthy(seal.accept(), "the rebased declaration should remain acceptable")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {
+    "local before = true",
+    "function survives_marked_line_deletion() end",
+    "local after = true",
+  }, "accepting should insert at the deletion boundary without replacing nearby code")
 end
 
 function tests.insert_mode_away_from_marker_keeps_and_reanchors_job()
@@ -2136,7 +2387,7 @@ function tests.undo_away_from_marker_keeps_job()
   seal.reject(1)
 end
 
-function tests.editing_selected_context_cancels_job()
+function tests.editing_selected_context_keeps_job()
   setup({ "local selected = true", "local more = true", "" }, { activity = { interval_ms = 100000 } })
   vim.api.nvim_win_set_cursor(0, { 3, 0 })
   seal.submit("fun: uses the selected context", { range = 2, line1 = 1, line2 = 2 })
@@ -2145,12 +2396,11 @@ function tests.editing_selected_context_cancels_job()
   vim.api.nvim_buf_set_lines(0, 0, 1, false, { "local selected = false" })
 
   truthy(vim.wait(500, function()
-    return seal._state.jobs[1] == nil
-  end, 5), "editing context explicitly selected for the prompt should cancel the job")
-  truthy(
-    notifications[#notifications].message:find("context changed", 1, true),
-    "selection invalidation should explain why the spinner disappeared"
-  )
+    return seal._state.jobs[1] ~= nil
+      and seal._state.jobs[1].snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "editing selected context should keep and reanchor the job")
+  truthy(seal._state.jobs[1].snapshot.selection == nil, "edited selection text should not remain as queued context")
+  seal.reject(1)
 end
 
 function tests.new_thread_interrupts_and_detaches_old_thread()
@@ -2170,9 +2420,11 @@ function tests.new_thread_interrupts_and_detaches_old_thread()
   equal(fake.thread_start_count, 2, "new thread should start after cleanup")
 end
 
-complete_declaration = function(code, thread_id, turn_id)
-  thread_id = thread_id or "fork-thread"
-  turn_id = turn_id or "fork-turn"
+complete_declaration = function(code)
+  local session = seal._state.live["/tmp/seal-project"]
+  local entry = session and session.current
+  local thread_id = session and session.thread_id or "main-thread"
+  local turn_id = entry and entry.turn_id or "main-turn"
   seal._notification("item/completed", {
     threadId = thread_id,
     turnId = turn_id,
@@ -2185,7 +2437,7 @@ complete_declaration = function(code, thread_id, turn_id)
   })
   vim.wait(1000, function()
     for _, job in pairs(seal._state.jobs) do
-      if job.fork_id == thread_id then
+      if job.thread_id == thread_id and job.turn_id == turn_id then
         return job.phase == "ready"
       end
     end
@@ -2198,7 +2450,7 @@ function tests.late_turn_start_response_does_not_interrupt_a_ready_result()
   local original_request = fake.request
   local held_turn
   function fake:request(method, params, callback)
-    if method == "turn/start" and params.threadId == "fork-thread" then
+    if method == "turn/start" and params.threadId == "main-thread" then
       table.insert(self.requests, { method = method, params = params })
       held_turn = callback
       return
@@ -2207,14 +2459,23 @@ function tests.late_turn_start_response_does_not_interrupt_a_ready_result()
   end
 
   seal.submit("fun: finish before the response")
+  local client_id = request(fake, "turn/start").params.clientUserMessageId
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = {
+      id = "main-turn",
+      status = "inProgress",
+      items = { { type = "userMessage", clientId = client_id } },
+    },
+  })
   complete_declaration("function finish_before_the_response() end")
   truthy(seal._state.jobs[1] and seal._state.jobs[1].phase == "ready", "the notifications should finish the job")
-  held_turn({ turn = { id = "fork-turn" } })
+  held_turn({ turn = { id = "main-turn" } })
   equal(request(fake, "turn/interrupt"), nil, "a delayed start response must not interrupt a completed turn")
   seal.reject(1)
 end
 
-function tests.parallel_jobs_dispatch_in_their_own_buffers()
+function tests.queued_jobs_dispatch_in_their_own_buffers()
   setup({ "" }, { activity = { interval_ms = 100000 } })
   local first_buf = vim.api.nvim_get_current_buf()
   seal.submit("fun: first buffer declaration")
@@ -2224,8 +2485,8 @@ function tests.parallel_jobs_dispatch_in_their_own_buffers()
   vim.api.nvim_set_option_value("filetype", "lua", { buf = second_buf })
   vim.api.nvim_buf_set_lines(second_buf, 0, -1, false, { "" })
   seal.submit("fun: second buffer declaration", { buf = second_buf, cursor = { 1, 0 } })
-  complete_declaration("function first_buffer_declaration() end", "fork-thread", "fork-turn")
-  complete_declaration("function second_buffer_declaration() end", "fork-thread-2", "fork-turn-2")
+  complete_declaration("function first_buffer_declaration() end")
+  complete_declaration("function second_buffer_declaration() end")
 
   vim.api.nvim_set_current_buf(second_buf)
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
@@ -2280,7 +2541,7 @@ function tests.failed_freeform_preflight_keeps_other_buffer_preview()
       main_turns = main_turns + 1
     end
   end
-  equal(main_turns, 0, "the workspace-writing turn should fail its save preflight")
+  equal(main_turns, 1, "the failed workspace-writing prompt should not start another turn")
   equal(seal._state.jobs[1], job, "a failed freeform preflight should preserve an unrelated ready preview")
 
   seal.reject(1)
@@ -2289,17 +2550,17 @@ function tests.failed_freeform_preflight_keeps_other_buffer_preview()
   vim.fn.delete(path)
 end
 
-function tests.parallel_results_complete_and_accept_out_of_order()
+function tests.sequential_results_can_be_accepted_independently()
   setup({ "", "local between = true", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: first declaration")
   vim.api.nvim_win_set_cursor(0, { 3, 0 })
   seal.submit("fun: second declaration")
 
-  complete_declaration("function second_declaration() end", "fork-thread-2", "fork-turn-2")
+  complete_declaration("function first_declaration()\n  return true\nend")
+  equal(seal._state.jobs[1].phase, "ready", "the first result should become ready first")
+  equal(seal._state.jobs[2].phase, "generating", "the second result should start next")
+  complete_declaration("function second_declaration() end")
   equal(seal._state.jobs[2].phase, "ready", "the second result should become independently ready")
-  equal(seal._state.jobs[1].phase, "generating", "the first result should keep spinning")
-  complete_declaration("function first_declaration()\n  return true\nend", "fork-thread", "fork-turn")
-  equal(seal._state.jobs[1].phase, "ready", "the first result should become ready later")
   equal(seal._state.spinner_timer, nil, "the timer should stop when every job is ready")
 
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
@@ -2364,7 +2625,7 @@ function tests.freeform_preserves_an_existing_preview()
   seal.reject(1)
 end
 
-function tests.targeted_preserves_parallel_declaration_spinners()
+function tests.targeted_preserves_queued_declaration_spinners()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: log the build process")
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
@@ -2396,7 +2657,7 @@ function tests.targeted_patch_reload_preserves_unaffected_previews()
   complete_declaration("function log_build() end")
   vim.api.nvim_win_set_cursor(0, { 4, 0 })
   seal.submit("type: represent build output")
-  complete_declaration("BuildOutput = {}", "fork-thread-2", "fork-turn-2")
+  complete_declaration("BuildOutput = {}")
   local first = seal._state.jobs[1]
   local second = seal._state.jobs[2]
   truthy(first and first.phase == "ready" and second and second.phase == "ready", "both previews should be ready")
@@ -2431,7 +2692,7 @@ function tests.targeted_patch_reload_preserves_unaffected_previews()
   vim.fn.delete(path)
 end
 
-function tests.attached_tui_turn_clears_an_existing_preview()
+function tests.attached_tui_turn_preserves_an_existing_preview()
   setup({ "" })
   seal.submit("fun: focused change")
   complete_declaration("function focused_change() end")
@@ -2439,7 +2700,8 @@ function tests.attached_tui_turn_clears_an_existing_preview()
     threadId = "main-thread",
     turn = { id = "tui-turn", status = "inProgress" },
   })
-  truthy(seal._state.preview == nil, "a TUI-started workspace turn must clear the pending preview")
+  truthy(seal._state.preview ~= nil, "a TUI-started turn should not discard an unchanged pending preview")
+  seal.reject(1)
 end
 
 function tests.external_file_change_blocks_preview_acceptance()
@@ -2498,23 +2760,39 @@ function tests.buffer_rename_blocks_preview_acceptance()
   truthy(seal._state.preview == nil, "the renamed preview should be cleared")
 end
 
-function tests.completion_text_change_cancels_generation()
+function tests.completion_text_change_keeps_generation()
   setup({ "" })
-  seal.submit("fun: cancelled by completion")
+  seal.submit("fun: survives completion")
   vim.api.nvim_buf_set_lines(0, 0, 1, false, { "completed text" })
   truthy(vim.wait(500, function()
-    return seal._state.generation == nil
-  end, 5), "completion-menu edits should cancel declaration generation")
-  equal(request(fake, "turn/interrupt").params.turnId, "fork-turn", "the cancelled fork turn should be interrupted")
+    return seal._state.generation ~= nil
+      and seal._state.generation.snapshot.changedtick == vim.api.nvim_buf_get_changedtick(0)
+  end, 5), "completion-menu edits should reanchor declaration generation")
+  local job = seal._state.generation
+  local position = vim.api.nvim_buf_get_extmark_by_id(
+    0,
+    vim.api.nvim_get_namespaces()["seal-activity"],
+    job.extmark,
+    {}
+  )
+  equal(job.snapshot.row, position[1], "the completion snapshot should follow its marker")
+  truthy(request(fake, "turn/interrupt") == nil, "editing the marked line should not interrupt Codex")
+  complete_declaration("function survives_completion() end")
+  truthy(seal._state.preview ~= nil, "the completed declaration should still reach preview")
+  seal.reject(1)
 end
 
-function tests.stale_result_is_discarded()
+function tests.result_follows_local_edits()
   setup({ "" })
-  seal.submit("fun: stale")
+  seal.submit("fun: follows edits")
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "changed" })
-  complete_declaration("function stale() end")
-  truthy(seal._state.preview == nil, "changed buffer must not receive a preview")
-  truthy(notifications[#notifications].message:find("changed", 1, true), "stale result should explain why it was discarded")
+  complete_declaration("function follows_edits() end")
+  truthy(seal._state.preview ~= nil, "a locally edited buffer should still receive a preview")
+  truthy(seal.accept(), "the rebased preview should remain acceptable from the final real line")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {
+    "changed",
+    "function follows_edits() end",
+  }, "accepting should preserve the local edit")
 end
 
 function tests.python_type_alias_reaches_preview_by_default()
@@ -2531,20 +2809,7 @@ end
 function tests.multiple_declarations_are_rejected()
   setup({ "" }, { validate_declarations = true })
   seal.submit("fun: too many")
-  seal._notification("item/completed", {
-    threadId = "fork-thread",
-    turnId = "fork-turn",
-    item = {
-      type = "agentMessage",
-      phase = "final_answer",
-      text = vim.json.encode({ code = "function one() end\nfunction two() end" }),
-    },
-  })
-  seal._notification("turn/completed", {
-    threadId = "fork-thread",
-    turnId = "fork-turn",
-    turn = { id = "fork-turn", status = "completed" },
-  })
+  complete_declaration("function one() end\nfunction two() end")
   vim.wait(1000, function()
     return seal._state.generation == nil
   end)
@@ -2555,20 +2820,7 @@ end
 function tests.wrong_declaration_kind_is_rejected()
   setup({ "" }, { validate_declarations = true })
   seal.submit("fun: not actually a function")
-  seal._notification("item/completed", {
-    threadId = "fork-thread",
-    turnId = "fork-turn",
-    item = {
-      type = "agentMessage",
-      phase = "final_answer",
-      text = vim.json.encode({ code = "local value = 1" }),
-    },
-  })
-  seal._notification("turn/completed", {
-    threadId = "fork-thread",
-    turnId = "fork-turn",
-    turn = { id = "fork-turn", status = "completed" },
-  })
+  complete_declaration("local value = 1")
   vim.wait(1000, function()
     return seal._state.generation == nil
   end)
@@ -2647,8 +2899,9 @@ local order = {
   "visual_selection_shares_the_context_budget",
   "freeform_uses_main_thread_unchanged",
   "targeted_adds_minimal_change_guidance_to_the_main_thread",
-  "freeform_steers_an_active_turn",
-  "steer_completion_keeps_the_fallback_turn_marker",
+  "refactor_adds_minimal_behavior_preserving_guidance",
+  "freeform_queues_behind_an_active_turn",
+  "late_start_response_does_not_consume_the_next_queued_marker",
   "freeform_uses_the_post_format_buffer_and_selection",
   "freeform_maps_context_through_a_full_buffer_format",
   "freeform_keeps_a_selection_expanded_by_formatting",
@@ -2670,12 +2923,16 @@ local order = {
   "chat_reads_and_renders_the_backing_thread",
   "attach_copies_the_real_tui_command",
   "wiped_chat_ignores_a_delayed_refresh",
-  "declaration_forks_during_active_main_turn",
-  "declaration_uses_safe_ephemeral_fork",
+  "declaration_queues_during_active_main_turn",
+  "declaration_uses_shared_read_only_turn",
   "interface_prefix_requests_api_without_implementation",
-  "first_declaration_handles_empty_main_thread",
-  "thread_setting_changes_flow_into_forks",
-  "null_thread_settings_are_omitted_from_forks",
+  "first_declaration_starts_the_shared_thread",
+  "thread_setting_changes_stay_on_the_shared_thread",
+  "declaration_restores_main_thread_settings",
+  "declaration_turn_declines_file_changes",
+  "declaration_retries_after_a_tui_turn_wins_the_start_race",
+  "stale_status_read_does_not_block_the_queue",
+  "failed_settings_restore_blocks_the_next_turn",
   "server_request_is_resolved_without_an_interactive_client",
   "multi_file_patch_waits_for_review_and_acceptance",
   "prompting_from_patch_review_targets_the_source_buffer",
@@ -2687,53 +2944,54 @@ local order = {
   "command_approval_honors_available_decisions",
   "dismissed_command_uses_the_advertised_cancel",
   "external_resolution_surfaces_the_next_patch_review",
-  "review_mode_does_not_steer_a_tui_owned_turn",
+  "seal_prompt_waits_for_a_tui_owned_turn",
   "seal_owned_child_thread_can_request_patch_review",
   "child_approval_recovers_parent_ancestry_after_a_race",
   "resolved_child_request_does_not_reopen_after_ancestry_lookup",
   "tui_owned_child_thread_is_not_claimed_by_seal",
-  "parallel_pending_forks_both_start",
+  "declarations_run_fifo_on_the_shared_thread",
   "cancel_before_turn_start_response_uses_startup_interrupt",
   "turn_started_notification_supplies_the_declaration_turn_id",
-  "closed_fork_clears_its_job",
+  "closed_shared_thread_clears_its_jobs",
   "duplicate_job_on_the_same_line_is_rejected",
   "spinner_renders_before_app_server_is_ready",
   "insert_leave_noop_formatter_keeps_the_startup_spinner",
   "agent_spinners_render_before_app_server_is_ready",
-  "concurrent_initial_prompts_bind_to_the_started_turn",
+  "concurrent_initial_prompts_run_fifo",
   "session_read_failure_clears_immediate_agent_spinner",
   "app_server_start_failure_clears_immediate_spinners",
   "delayed_old_client_exit_preserves_restarted_activity",
-  "agent_turn_preserves_a_declaration_waiting_for_status",
+  "status_batch_preserves_submission_order",
   "spinner_is_anchored_and_animates_in_place",
   "mapping_away_from_marker_preserves_global_behavior",
-  "rejecting_one_parallel_job_keeps_its_sibling",
-  "parallel_jobs_share_and_restore_buffer_mappings",
+  "rejecting_one_queued_job_keeps_its_sibling",
+  "multiple_jobs_share_and_restore_buffer_mappings",
   "closed_source_buffer_discards_ready_jobs_and_mappings",
   "mapping_installed_during_a_job_is_not_clobbered",
   "mapping_restoration_preserves_replace_keycodes",
-  "buffer_edit_cancels_only_the_changed_target",
+  "buffer_edit_reanchors_all_jobs",
+  "deleting_marked_line_keeps_and_reanchors_job",
   "insert_mode_away_from_marker_keeps_and_reanchors_job",
   "undo_away_from_marker_keeps_job",
-  "editing_selected_context_cancels_job",
+  "editing_selected_context_keeps_job",
   "new_thread_interrupts_and_detaches_old_thread",
   "late_turn_start_response_does_not_interrupt_a_ready_result",
-  "parallel_jobs_dispatch_in_their_own_buffers",
+  "queued_jobs_dispatch_in_their_own_buffers",
   "failed_freeform_preflight_keeps_other_buffer_preview",
-  "parallel_results_complete_and_accept_out_of_order",
+  "sequential_results_can_be_accepted_independently",
   "preview_accepts_as_one_edit",
   "reject_leaves_buffer_untouched",
   "freeform_preserves_an_existing_preview",
-  "targeted_preserves_parallel_declaration_spinners",
+  "targeted_preserves_queued_declaration_spinners",
   "targeted_patch_reload_preserves_unaffected_previews",
-  "attached_tui_turn_clears_an_existing_preview",
+  "attached_tui_turn_preserves_an_existing_preview",
   "external_file_change_blocks_preview_acceptance",
   "external_file_change_blocks_preview_rendering",
   "identical_writes_do_not_invalidate_a_preview",
   "buffer_rename_blocks_preview_rendering",
   "buffer_rename_blocks_preview_acceptance",
-  "completion_text_change_cancels_generation",
-  "stale_result_is_discarded",
+  "completion_text_change_keeps_generation",
+  "result_follows_local_edits",
   "python_type_alias_reaches_preview_by_default",
   "multiple_declarations_are_rejected",
   "wrong_declaration_kind_is_rejected",

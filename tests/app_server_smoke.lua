@@ -124,7 +124,7 @@ local ok, smoke_error = xpcall(function()
   local turn = request("turn/start", {
     threadId = source.id,
     clientUserMessageId = "seal-smoke",
-    sandboxPolicy = { type = "workspaceWrite", writableRoots = {}, networkAccess = false },
+    sandboxPolicy = { type = "readOnly", networkAccess = false },
     approvalPolicy = "never",
     input = {
       { type = "text", text = "Write a Lua function named seal_smoke that returns true. Do not call tools." },
@@ -160,18 +160,35 @@ local ok, smoke_error = xpcall(function()
   end
   assert(saw_user and saw_agent, "thread/read did not return the user and agent messages")
 
-  local fork = request("thread/fork", {
+  completed = nil
+  answer = nil
+  local second_turn = request("turn/start", {
     threadId = source.id,
-    cwd = root,
-    ephemeral = true,
-    sandbox = "read-only",
+    clientUserMessageId = "seal-smoke-follow-up",
+    sandboxPolicy = { type = "readOnly", networkAccess = false },
     approvalPolicy = "never",
-    developerInstructions = "Return exactly one requested declaration. Do not modify files or use Markdown fences.",
-    excludeTurns = true,
-  }).thread
-  assert(fork.ephemeral == true, "fork was not ephemeral")
-  assert(fork.forkedFromId == source.id, "fork did not copy the source thread")
-  request("thread/unsubscribe", { threadId = fork.id })
+    input = {
+      { type = "text", text = "Return a second Lua function named seal_smoke_follow_up that returns true. Do not call tools." },
+    },
+    outputSchema = {
+      type = "object",
+      properties = { code = { type = "string" } },
+      required = { "code" },
+      additionalProperties = false,
+    },
+  }).turn
+  wait_for("second structured Codex turn", function()
+    return completed and completed.id == second_turn.id
+  end, 120000)
+  assert(completed.status == "completed", "second turn status was " .. tostring(completed.status))
+  local second = vim.json.decode(answer)
+  assert(
+    type(second.code) == "string" and second.code:find("seal_smoke_follow_up", 1, true),
+    "invalid second structured code"
+  )
+
+  history = request("thread/read", { threadId = source.id, includeTurns = true }).thread
+  assert(#history.turns >= 2, "the shared thread did not retain both structured turns")
 
   review_root = vim.fn.tempname()
   assert(vim.fn.mkdir(review_root, "p") == 1, "could not create the patch-review smoke directory")
