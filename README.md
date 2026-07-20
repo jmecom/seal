@@ -8,7 +8,7 @@ Press one key, enter a prompt, and Seal routes it in one of three ways:
 - `targeted:` and `refactor:` use that same thread with tighter instructions. `targeted:` asks for the smallest change that satisfies the request; `refactor:` asks for the smallest requested structural change while preserving behavior and public APIs.
 - `fun:`, `type:`, `class:`, and other declaration prefixes use read-only turns in the same conversation. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview.
 
-You can mark several prompts immediately. On each project thread, Seal keeps every spinner visible and runs the model turns in submission order, one at a time, so every request and result becomes context for the next one.
+You can mark several prompts immediately. On each project thread, Seal keeps every request visible and runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Only the request that owns the current turn animates; queued markers are static. Collocated requests share one marker with a count and remain independently addressable, newest first.
 
 Codex owns the agent loop, tools, conversation history, and compaction. Seal keeps only one thread ID per project root in the current Neovim process.
 
@@ -52,8 +52,8 @@ The default mappings are:
 
 - `<leader>ai`: open the Seal prompt
 - `<leader>ac`: inspect the backing Codex conversation
-- `Tab`: accept the ready declaration on the cursor line
-- `Esc`: cancel or reject the Seal job on the cursor line
+- `Tab`: accept the ready declaration at the cursor marker
+- `Esc`: cancel or reject the Seal job at the cursor marker
 
 In a patch review, `Tab` accepts the complete proposed patch, `Esc` rejects it and lets Codex continue, `x` rejects it and stops the turn, and `q` closes the view without deciding.
 
@@ -81,7 +81,7 @@ Recognized inline declaration prefixes are `fun`, `fn`, `function`, `type`, `cla
 
 The project root, file path, file type, cursor line and byte column, nearby buffer excerpt, and visual selection are attached as editor context. A declaration turn is also told to inspect the repository as needed, return exactly one declaration of the requested kind at that cursor, and omit helpers, surrounding declarations, prose, and Markdown. Normal agent prompts save the current modified buffer first so Codex does not edit an older on-disk version. Declaration turns are read-only and can use an unsaved buffer snapshot safely.
 
-Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. It refuses to start a writable turn while another project buffer has unsaved changes. After any main-thread turn, it reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
+Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. A writable turn blocked by another modified project buffer remains queued and retries after the buffers are saved; later prompts cannot overtake it. After any main-thread turn, Seal reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
 
 Normal Seal turns keep Codex's `untrusted` approval policy so file changes still reach Seal's review boundary. Seal auto-approves command-execution requests by default, while every Seal-owned file-change request opens the complete patch in a read-only diff window before Seal answers. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself is not atomic and can partially fail. Seal queues concurrent file-change requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Opening a new Seal prompt from the review defers it and targets the underlying editable source buffer. When you accept, Seal saves modified target buffers before approving the patch; Codex will apply clean hunks or report that its patch no longer applies. External disk changes and save/format conflicts still block acceptance.
 
@@ -89,7 +89,9 @@ This is an app-server approval UI, not a universal filesystem barrier. An auto-a
 
 Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
 
-Declaration jobs are anchored with Neovim extmarks. You can queue them before or during a normal, `targeted:`, or `refactor:` turn, prompt several locations in one or more buffers, continue editing, and accept each completed result from its marker. Local inserts, deletes, undo, formatting, and accepted Codex patches re-anchor each job. If an edit changes text explicitly selected for a queued request, Seal omits that stale selection when the turn starts but keeps the job. A closed buffer, renamed file, or conflicting on-disk change still blocks the result. Accepted declarations format normally on the next save.
+One shared buffer model owns every logical declaration and prompt anchor; Neovim extmarks are display-only. Ordinary edits send only the changed line slice through that model, while reloads and whole-buffer formatters use one shared diff for every mark. You can queue locations in one or more buffers, continue editing, and accept each completed result from its marker. If a deletion or replacement makes a location ambiguous, Seal keeps the result and asks the first `Tab` to re-anchor it at the cursor; a second `Tab` accepts. If selected context changes, Seal omits that stale selection when the turn starts but keeps the job.
+
+Ready previews retain the raw model output and recompute indentation when their anchor moves. Acceptance is transactional: a non-modifiable buffer, textlock, validation failure, or disk conflict leaves the same preview available for retry. A closed or renamed buffer still removes work that can no longer be displayed. Seal admits at most `max_pending_items` requests per project so snapshots and markers remain bounded.
 
 Seal never opens a terminal or Zellij pane. Permission expansion and structured user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
 
@@ -110,6 +112,7 @@ require("seal").setup({
   auto_approve_commands = true,
   save_before_agent = true,
   validate_declarations = false,
+  max_pending_items = 100,
   activity = {
     interval_ms = 80,
     max_summary_cells = 56,

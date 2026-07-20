@@ -1,6 +1,9 @@
 local Client = require("seal.client")
 local Chat = require("seal.chat")
 local Review = require("seal.review")
+local BufferModel = require("seal.buffer_model")
+local Scheduler = require("seal.scheduler")
+local WorkItems = require("seal.work_items")
 
 local M = {}
 local activity_namespace = vim.api.nvim_create_namespace("seal-activity")
@@ -10,6 +13,8 @@ local defaults = {
   codex_command = "codex",
   bridge = nil,
   max_context_chars = 120000,
+  max_pending_items = 100,
+  direct_reconcile_lines = 16,
   main_sandbox = "workspace-write",
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
@@ -60,18 +65,25 @@ local defaults = {
 }
 
 local config = vim.deepcopy(defaults)
+local work_store = WorkItems.new()
 local state = {
   client = nil,
   sessions = {},
   live = {},
   loading = {},
-  jobs = {},
+  work_items = work_store,
+  items = work_store.items,
+  jobs = work_store.jobs,
   jobs_by_thread = {},
-  activities = {},
+  activities = work_store.activities,
+  buffer_models = {},
+  buffer_errors = {},
+  buffer_items = {},
   job_mappings = {},
   job_buffers = {},
   spinner_timer = nil,
   spinner_frame = 1,
+  animated_items = {},
   job_sequence = 0,
   activity_sequence = 0,
   submission_sequence = 0,
@@ -82,11 +94,14 @@ local state = {
   chat_request = 0,
   owned_turns = {},
   owned_threads = {},
+  ownership_generation = 0,
   approval_items = {},
   accepted_file_items = {},
   reviews = {},
   command_requests = {},
   resolved_requests = {},
+  pending_unowned_requests = {},
+  pending_unowned_request_sequence = 0,
   review_sequence = 0,
   file_baselines = {},
   file_conflicts = {},
@@ -97,6 +112,13 @@ local state = {
 local refresh_chat
 local pump_session
 local requeue_session_entry
+local sync_item_snapshot
+local handle_notification
+local handle_scheduler_action
+local handle_server_request
+local refresh_item_animation
+local replay_pending_owned_requests
+local revoke_root_ownership
 
 local function notify(message, level)
   if config.notify then
@@ -125,6 +147,81 @@ local function active_turn_error(err)
   return message:find("active turn", 1, true) ~= nil
     or message:find("turn in progress", 1, true) ~= nil
     or message:find("already active", 1, true) ~= nil
+end
+
+local function set_owned_turn(turn_id, owner)
+  if turn_id and state.owned_turns[turn_id] ~= owner then
+    state.owned_turns[turn_id] = owner
+    state.ownership_generation = state.ownership_generation + 1
+  end
+end
+
+local function set_owned_thread(thread_id, owner)
+  if thread_id and not vim.deep_equal(state.owned_threads[thread_id], owner) then
+    state.owned_threads[thread_id] = owner
+    state.ownership_generation = state.ownership_generation + 1
+    if owner and replay_pending_owned_requests then
+      replay_pending_owned_requests(thread_id)
+    end
+  end
+end
+
+local function reset_ownership()
+  state.owned_turns = {}
+  state.owned_threads = {}
+  state.ownership_generation = state.ownership_generation + 1
+end
+
+local function work_item_registered(item)
+  return item and work_store:get(item.id) == item
+end
+
+local function job_registered(job)
+  return job and work_store:get_legacy("declaration", job.legacy_id) == job
+end
+
+local function activity_registered(activity)
+  return activity and work_store:get_legacy("agent", activity.legacy_id) == activity
+end
+
+local function transition_work_item(item, target, fields)
+  local transitioned, err = work_store:transition(item, target, fields)
+  if not transitioned then
+    notify("Seal work-item transition failed: " .. error_message(err, target), vim.log.levels.ERROR)
+    return nil, err
+  end
+  return transitioned
+end
+
+local function purge_retired_work(root)
+  local retired = {}
+  for _, item in pairs(work_store.items) do
+    if item.retired and item.terminal and (not root or item.root == root) then
+      table.insert(retired, item)
+    end
+  end
+  for _, item in ipairs(retired) do
+    work_store:remove(item)
+  end
+end
+
+local function scheduler_transition(item, target, context)
+  local transitioned, err = work_store:transition(item, target, context and context.fields or nil)
+  if not transitioned then
+    return false, err
+  end
+  if target == "queued" or target == "blocked" or target == "starting" or target == "running" then
+    item.phase = "generating"
+  end
+  return transitioned
+end
+
+local function new_project_scheduler(root)
+  return Scheduler.new({
+    registry = work_store.items,
+    token_prefix = "seal-" .. vim.fn.sha256(root):sub(1, 8),
+    transition = scheduler_transition,
+  })
 end
 
 local function root_for_buffer(buf)
@@ -404,26 +501,90 @@ local function turn_sandbox_policy(mode)
   return nil
 end
 
-local function release_session_entry(session, entry, pump_next)
-  if not session or session.current ~= entry then
-    return false
+local function restore_snapshot(settings)
+  settings = settings or {}
+  return {
+    approvalPolicy = settings.approvalPolicy and vim.deepcopy(settings.approvalPolicy) or nil,
+    approvalsReviewer = settings.approvalsReviewer,
+    sandboxPolicy = settings.sandboxPolicy and vim.deepcopy(settings.sandboxPolicy) or nil,
+    permissions = settings.activePermissionProfile and settings.activePermissionProfile.id or nil,
+  }
+end
+
+local function settings_match_restore(settings, restore)
+  settings = settings or {}
+  restore = restore or {}
+  local profile = settings.activePermissionProfile
+  local permissions_match = restore.permissions
+      and profile
+      and profile.id == restore.permissions
+    or not restore.permissions
+      and profile == nil
+      and vim.deep_equal(settings.sandboxPolicy, restore.sandboxPolicy)
+  return vim.deep_equal(settings.approvalPolicy, restore.approvalPolicy)
+    and settings.approvalsReviewer == restore.approvalsReviewer
+    and permissions_match
+end
+
+local function same_restore(left, right)
+  left = left or {}
+  right = right or {}
+  return vim.deep_equal(left.approvalPolicy, right.approvalPolicy)
+    and left.approvalsReviewer == right.approvalsReviewer
+    and left.permissions == right.permissions
+    and vim.deep_equal(left.sandboxPolicy, right.sandboxPolicy)
+end
+
+local function merge_external_restore(base, update)
+  local desired = vim.deepcopy(base or {})
+  local changed = false
+  if update.approvalPolicy ~= nil then
+    desired.approvalPolicy = vim.deepcopy(not_null(update.approvalPolicy))
+    changed = true
   end
-  session.current = nil
-  local external_turn_id = session.external_turn_id
-  session.busy = external_turn_id ~= nil
-  session.active_turn_id = external_turn_id
-  session.status = external_turn_id
-      and { type = "active", activeFlags = {} }
-    or { type = "idle" }
-  entry.finished = true
-  if not session.busy and pump_next ~= false and not session.settings_blocked and pump_session then
-    vim.schedule(function()
-      if state.live[session.root] == session then
-        pump_session(session)
-      end
-    end)
+  if update.approvalsReviewer ~= nil then
+    desired.approvalsReviewer = not_null(update.approvalsReviewer)
+    changed = true
   end
-  return true
+  if update.sandboxPolicy ~= nil then
+    desired.sandboxPolicy = vim.deepcopy(not_null(update.sandboxPolicy))
+    desired.permissions = nil
+    changed = true
+  end
+  if update.activePermissionProfile ~= nil then
+    local profile = not_null(update.activePermissionProfile)
+    if profile and profile.id then
+      desired.permissions = profile.id
+    else
+      desired.permissions = nil
+    end
+    changed = true
+  end
+  return desired, changed
+end
+
+local function update_is_declaration_override(update)
+  return update.approvalPolicy ~= nil
+    and not_null(update.approvalPolicy) == "never"
+    and update.approvalsReviewer ~= nil
+    and not_null(update.approvalsReviewer) == config.main_approvals_reviewer
+    and update.sandboxPolicy ~= nil
+    and vim.deep_equal(not_null(update.sandboxPolicy), turn_sandbox_policy("read-only"))
+    and (update.activePermissionProfile == nil or not_null(update.activePermissionProfile) == nil)
+end
+
+local function reset_restore_attempt(entry)
+  entry.settings_restore_started = nil
+  entry.settings_restored = nil
+  entry.settings_restore_failed = nil
+  entry.restore_settings = nil
+  entry.policy_overridden = nil
+  entry.retry_after_restore = nil
+  entry.restore_request = nil
+  entry.restore_advance = nil
+  entry.restore_superseded = nil
+  entry.restore_settings_epoch = nil
+  entry.declaration_override_pending = nil
 end
 
 local function restore_main_thread_settings(session, entry)
@@ -434,84 +595,130 @@ local function restore_main_thread_settings(session, entry)
   -- them while the read-only declaration is running so the next Seal or TUI
   -- prompt does not inherit its restricted policy.
   entry.settings_restore_started = true
+  local lease_token = session.current_lease_token
+  local scheduler = session.scheduler
   if not state.client then
     entry.settings_restored = true
-    if entry.turn_completed then
-      release_session_entry(session, entry)
+    local action = scheduler and scheduler:restore_finished(lease_token, true)
+    if action then
+      if action.requeued then
+        reset_restore_attempt(entry)
+      end
+      handle_scheduler_action(session, action)
     end
     return
   end
   local active_client = state.client
   local restore = entry.restore_settings or {}
-  local params = {
-    threadId = session.thread_id,
-    approvalPolicy = restore.approvalPolicy or config.main_approval_policy,
-    approvalsReviewer = restore.approvalsReviewer or config.main_approvals_reviewer,
-  }
-  if restore.permissions then
-    params.permissions = restore.permissions
-  else
-    params.sandboxPolicy = restore.sandboxPolicy or turn_sandbox_policy(config.main_sandbox)
-  end
-  active_client:request("thread/settings/update", params, function(_, err)
-    if state.client ~= active_client then
-      return
-    end
-    if err then
+
+  local function finish_restore(ok, message, failed_restore)
+    if not ok then
       session.settings_blocked = true
-      session.blocked_restore = vim.deepcopy(restore)
+      session.blocked_restore = vim.deepcopy(failed_restore)
       entry.settings_restore_failed = true
       notify(
-        error_message(err, "could not restore the main Codex thread settings")
-          .. "; start a new Seal thread before sending another prompt",
+        message .. "; restore the thread settings or start a new Seal thread before sending another prompt",
         vim.log.levels.ERROR
       )
-      if entry.retry_after_restore and requeue_session_entry then
-        requeue_session_entry(session, entry)
+    else
+      entry.settings_restored = true
+    end
+    entry.restore_request = nil
+    entry.restore_advance = nil
+    entry.restore_superseded = nil
+    entry.declaration_override_pending = nil
+    local action, scheduler_error = scheduler:restore_finished(lease_token, ok, message)
+    if action then
+      if action.requeued then
+        reset_restore_attempt(entry)
+      end
+      handle_scheduler_action(session, action)
+    elseif scheduler_error then
+      notify(error_message(scheduler_error, "could not finalize settings restoration"), vim.log.levels.ERROR)
+    end
+  end
+
+  local send_restore
+  local function advance_restore(request)
+    if entry.restore_request ~= request or not request.acknowledged or not request.observed then
+      return
+    end
+    entry.restore_request = nil
+    local latest = entry.restore_superseded or entry.restore_settings or request.desired
+    entry.restore_superseded = nil
+    entry.restore_settings = vim.deepcopy(latest)
+    entry.restore_settings_epoch = session.settings_epoch
+    if same_restore(latest, request.desired) or settings_match_restore(session.settings, latest) then
+      finish_restore(true)
+      return
+    end
+    send_restore(latest, false)
+  end
+
+  send_restore = function(desired, force)
+    local effective = vim.deepcopy(desired)
+    effective.approvalPolicy = effective.approvalPolicy or config.main_approval_policy
+    effective.approvalsReviewer = effective.approvalsReviewer or config.main_approvals_reviewer
+    if not effective.permissions then
+      effective.sandboxPolicy = effective.sandboxPolicy or turn_sandbox_policy(config.main_sandbox)
+    end
+    if not force and settings_match_restore(session.settings, effective) then
+      entry.restore_settings = vim.deepcopy(effective)
+      entry.restore_settings_epoch = session.settings_epoch
+      finish_restore(true)
+      return
+    end
+    local request = {
+      desired = vim.deepcopy(effective),
+      acknowledged = false,
+      observed = false,
+    }
+    entry.restore_request = request
+    local params = {
+      threadId = session.thread_id,
+      approvalPolicy = effective.approvalPolicy,
+      approvalsReviewer = effective.approvalsReviewer,
+    }
+    if effective.permissions then
+      params.permissions = effective.permissions
+    else
+      params.sandboxPolicy = effective.sandboxPolicy
+    end
+    active_client:request("thread/settings/update", params, function(_, err)
+      if state.client ~= active_client
+        or state.live[session.root] ~= session
+        or session.scheduler ~= scheduler
+        or entry.restore_request ~= request
+      then
         return
       end
-      if entry.turn_completed then
-        release_session_entry(session, entry, false)
+      if err then
+        local superseded = entry.restore_superseded
+        local latest = superseded or entry.restore_settings or effective
+        if request.observed or (superseded and settings_match_restore(session.settings, superseded)) then
+          entry.restore_settings = vim.deepcopy(latest)
+          entry.restore_settings_epoch = session.settings_epoch
+          finish_restore(true)
+        else
+          finish_restore(false, error_message(err, "could not restore the main Codex thread settings"), latest)
+        end
+        return
       end
-      return
-    end
-    session.settings = session.settings or {}
-    session.settings.approvalPolicy = params.approvalPolicy
-    session.settings.approvalsReviewer = params.approvalsReviewer
-    if params.permissions then
-      session.settings.activePermissionProfile = { id = params.permissions }
-      session.settings.sandboxPolicy = restore.sandboxPolicy
-    else
-      session.settings.activePermissionProfile = nil
-      session.settings.sandboxPolicy = params.sandboxPolicy
-    end
-    entry.settings_restored = true
-    if entry.retry_after_restore and requeue_session_entry then
-      requeue_session_entry(session, entry)
-      return
-    end
-    if entry.turn_completed then
-      release_session_entry(session, entry)
-    end
-  end)
-end
-
-local function complete_session_entry(session, entry)
-  if not entry or session.current ~= entry then
-    return
+      request.acknowledged = true
+      advance_restore(request)
+    end)
   end
-  entry.turn_completed = true
-  if entry.mode == "declaration" and entry.policy_overridden then
-    restore_main_thread_settings(session, entry)
-    if entry.settings_restore_failed then
-      release_session_entry(session, entry, false)
+  entry.restore_advance = function()
+    local request = entry.restore_request
+    if not request then
       return
     end
-    if not entry.settings_restored then
-      return
+    if settings_match_restore(session.settings, request.desired) then
+      request.observed = true
     end
+    advance_restore(request)
   end
-  release_session_entry(session, entry)
+  send_restore(restore, entry.declaration_override_pending == true)
 end
 
 local function previous_buffer_map(buf, lhs)
@@ -551,44 +758,196 @@ local function has_generating_jobs()
   return false
 end
 
-local function has_generating_activities()
-  for _, activity in pairs(state.activities) do
-    if activity.phase == "generating" then
-      return true
-    end
-  end
-  return false
-end
-
 local function has_spinner_work()
-  return has_generating_jobs() or has_generating_activities()
+  return next(state.animated_items) ~= nil
 end
 
 local function has_buffer_jobs(buf)
-  for _, job in pairs(state.jobs) do
-    if job.snapshot.buf == buf then
+  for _, item in pairs(state.buffer_items[buf] or {}) do
+    if item.kind == "declaration" and job_registered(item) then
       return true
     end
   end
   return false
+end
+
+local function buffer_model(buf, create)
+  local model = state.buffer_models[buf]
+  if model or not create or not vim.api.nvim_buf_is_valid(buf) then
+    return model
+  end
+  model = BufferModel.new(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+  state.buffer_models[buf] = model
+  state.buffer_errors[buf] = nil
+  return model
+end
+
+local function snapshot_anchor(snapshot)
+  local line_count = vim.api.nvim_buf_line_count(snapshot.buf)
+  local selection
+  if snapshot.selection_range then
+    local first = math.max(1, math.min(snapshot.selection_range.line1, line_count))
+    local last = math.max(first, math.min(snapshot.selection_range.line2, line_count))
+    local last_line = vim.api.nvim_buf_get_lines(snapshot.buf, last - 1, last, false)[1] or ""
+    selection = {
+      start = { row = first - 1, column = 0, affinity = "left" },
+      finish = { row = last - 1, column = #last_line, affinity = "right" },
+    }
+  end
+  return {
+    row = math.max(0, math.min(snapshot.row, line_count)),
+    column = snapshot.column,
+    affinity = "right",
+    selection = selection,
+  }
+end
+
+local function register_item_anchor(item)
+  local model = buffer_model(item.snapshot.buf, true)
+  if not model then
+    return false
+  end
+  item.anchor_id = item.anchor_id or item.id
+  model:add(item.anchor_id, snapshot_anchor(item.snapshot))
+  state.buffer_items[item.snapshot.buf] = state.buffer_items[item.snapshot.buf] or {}
+  state.buffer_items[item.snapshot.buf][item.id] = item
+  return true
+end
+
+local function remove_item_anchor(item)
+  local model = state.buffer_models[item.snapshot.buf]
+  if model and item.anchor_id then
+    model:remove(item.anchor_id)
+  end
+  local items = state.buffer_items[item.snapshot.buf]
+  if items then
+    items[item.id] = nil
+    if not next(items) then
+      state.buffer_items[item.snapshot.buf] = nil
+    end
+  end
 end
 
 local function job_position(job)
   local buf = job.snapshot.buf
-  if not job.extmark or not vim.api.nvim_buf_is_valid(buf) then
+  local model = state.buffer_models[buf]
+  if not model or not job.anchor_id or not vim.api.nvim_buf_is_valid(buf) then
     return nil
   end
-  local ok, position = pcall(
-    vim.api.nvim_buf_get_extmark_by_id,
-    buf,
-    activity_namespace,
-    job.extmark,
-    { details = true }
-  )
-  if not ok or #position ~= 3 or position[3].invalid then
+  local position = model:position(job.anchor_id)
+  if not position then
     return nil
   end
-  return { position[1], position[2] }
+  return { position.row, position.column }
+end
+
+local function item_registered(item)
+  return item.kind == "declaration" and job_registered(item) or activity_registered(item)
+end
+
+local function clear_item_extmark(item)
+  if item.extmark and vim.api.nvim_buf_is_valid(item.snapshot.buf) then
+    pcall(vim.api.nvim_buf_del_extmark, item.snapshot.buf, activity_namespace, item.extmark)
+  end
+  item.extmark = nil
+end
+
+local function declaration_action_priority(item)
+  if item.phase == "ready" then
+    return 3
+  end
+  if item.state == "blocked" then
+    return 2
+  end
+  return 1
+end
+
+local function declaration_before(left, right)
+  local left_priority = declaration_action_priority(left)
+  local right_priority = declaration_action_priority(right)
+  if left_priority ~= right_priority then
+    return left_priority > right_priority
+  end
+  return left.id > right.id
+end
+
+local function build_buffer_layout(buf)
+  local groups = {}
+  local layout = {}
+  for _, item in pairs(state.buffer_items[buf] or {}) do
+    if item_registered(item) and item.snapshot.buf == buf then
+      local position = job_position(item)
+      if position then
+        local key = tostring(position[1]) .. ":" .. tostring(position[2])
+        local group = groups[key]
+        if not group then
+          group = { position = position, items = {} }
+          groups[key] = group
+        end
+        table.insert(group.items, item)
+      end
+    end
+  end
+  for _, group in pairs(groups) do
+    table.sort(group.items, function(left, right)
+      return left.id > right.id
+    end)
+    -- A declaration is interactive, whereas an agent marker is only status.
+    -- Keep the interactive proposal visible when both share one anchor.
+    local visible = group.items[1]
+    local animated = false
+    for _, candidate in ipairs(group.items) do
+      if candidate.kind == "declaration"
+        and (visible.kind ~= "declaration" or declaration_before(candidate, visible))
+      then
+        visible = candidate
+      end
+    end
+    for _, candidate in ipairs(group.items) do
+      if candidate.phase == "generating"
+        and (candidate.awaiting_session or candidate.state == "starting" or candidate.state == "running")
+      then
+        animated = true
+        break
+      end
+    end
+    for _, candidate in ipairs(group.items) do
+      layout[candidate.id] = {
+        visible = candidate == visible,
+        visible_item = visible,
+        animated = animated,
+        count = #group.items,
+        position = group.position,
+      }
+    end
+  end
+  return layout
+end
+
+local function visible_collocated_item(item, layout)
+  local entry = (layout or build_buffer_layout(item.snapshot.buf))[item.id]
+  if not entry then
+    return false, 0, nil
+  end
+  return entry.visible, entry.count, entry.position
+end
+
+local function collision_suffix(count)
+  return count > 1 and string.format(" · %d requests here", count) or ""
+end
+
+local function item_should_animate(item)
+  return item_registered(item)
+    and item.phase == "generating"
+    and (item.awaiting_session or item.state == "starting" or item.state == "running")
+end
+
+refresh_item_animation = function(item)
+  if item_should_animate(item) then
+    state.animated_items[item.id] = item
+  else
+    state.animated_items[item.id] = nil
+  end
 end
 
 local function summary_text(kind, prompt)
@@ -621,12 +980,20 @@ local function stop_spinner_if_idle()
   state.spinner_frame = 1
 end
 
-local function render_spinner(job)
+local function render_spinner(job, layout)
   local buf = job.snapshot.buf
   if job.phase ~= "generating" or job.invalidated or not vim.api.nvim_buf_is_valid(buf) then
     return false
   end
-  local position = job_position(job)
+  local visible, collocated, position = visible_collocated_item(job, layout)
+  if not visible then
+    clear_item_extmark(job)
+    local entry = layout and layout[job.id]
+    if entry and entry.animated and entry.visible_item.phase == "generating" then
+      render_spinner(entry.visible_item, layout)
+    end
+    return true
+  end
   if not position then
     if job.extmark then
       return false
@@ -634,14 +1001,24 @@ local function render_spinner(job)
     position = { job.snapshot.row, job.snapshot.column }
   end
   local frames = config.activity.frames or {}
-  local frame = frames[state.spinner_frame] or "⠋"
+  local layout_entry = layout and layout[job.id]
+  local animated = item_should_animate(job) or layout_entry and layout_entry.animated
+  local frame = animated and (frames[state.spinner_frame] or "⠋")
+    or job.state == "blocked" and "!"
+    or "○"
+  local detail = job.summary .. collision_suffix(collocated)
+  if job.state == "blocked" and job.blocked_reason then
+    detail = detail .. " · waiting to retry"
+  elseif job.snapshot.anchor_ambiguous then
+    detail = detail .. " · anchor needs confirmation"
+  end
   local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, buf, activity_namespace, position[1], position[2], {
     id = job.extmark,
     right_gravity = true,
     strict = false,
     virt_text = {
       { " " .. frame .. " ", "SealSpinner" },
-      { job.summary, "SealSpinnerSummary" },
+      { detail, "SealSpinnerSummary" },
     },
     virt_text_pos = "inline",
     hl_mode = "combine",
@@ -659,20 +1036,30 @@ local cancel_job
 local reconcile_buffer_lines
 local reconcile_buffer_tick
 local remove_activity
+local ensure_job_buffer
+local render_preview
+local refresh_buffer_decorations
 
 function M._tick_activity()
   local frames = config.activity.frames or {}
   state.spinner_frame = state.spinner_frame % math.max(1, #frames) + 1
   local stale = {}
-  for _, job in pairs(state.jobs) do
-    if job.phase == "generating" and not render_spinner(job) then
-      table.insert(stale, job)
+  local layouts = {}
+  for _, item in pairs(state.animated_items) do
+    local buf = item.snapshot.buf
+    layouts[buf] = layouts[buf] or build_buffer_layout(buf)
+  end
+  for id, item in pairs(state.animated_items) do
+    if not item_should_animate(item) then
+      state.animated_items[id] = nil
+    elseif item.kind == "declaration" and not render_spinner(item, layouts[item.snapshot.buf]) then
+      table.insert(stale, item)
     end
   end
   local stale_activities = {}
-  for _, activity in pairs(state.activities) do
-    if activity.phase == "generating" and not render_spinner(activity) then
-      table.insert(stale_activities, activity)
+  for _, item in pairs(state.animated_items) do
+    if item.kind == "agent" and not render_spinner(item, layouts[item.snapshot.buf]) then
+      table.insert(stale_activities, item)
     end
   end
   for _, job in ipairs(stale) do
@@ -699,37 +1086,122 @@ local function ensure_spinner()
   state.spinner_timer = timer
 end
 
-local function add_activity(snapshot, kind, prompt)
-  state.activity_sequence = state.activity_sequence + 1
-  local activity = {
-    id = state.activity_sequence,
-    phase = "generating",
-    snapshot = snapshot,
-    root = snapshot.root,
-    summary = summary_text(kind, prompt),
-  }
-  state.activities[activity.id] = activity
-  if not render_spinner(activity) then
-    state.activities[activity.id] = nil
+refresh_buffer_decorations = function(buf, quiet)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local items = {}
+  for _, item in pairs(state.buffer_items[buf] or {}) do
+    if item_registered(item) and item.snapshot.buf == buf then
+      table.insert(items, item)
+    end
+  end
+  table.sort(items, function(left, right)
+    return left.id < right.id
+  end)
+  local layout = build_buffer_layout(buf)
+  for _, item in ipairs(items) do
+    if item.kind == "declaration" and item.phase == "ready" then
+      render_preview(item, nil, quiet ~= false, layout)
+    elseif item.phase == "generating" then
+      render_spinner(item, layout)
+    end
+  end
+end
+
+local function has_buffer_items(buf)
+  return next(state.buffer_items[buf] or {}) ~= nil
+end
+
+local function release_buffer_tracking_if_idle(buf)
+  if has_buffer_items(buf) then
+    return
+  end
+  local attached = state.job_buffers[buf]
+  if attached then
+    attached.idle = true
+  end
+  state.buffer_models[buf] = nil
+  state.buffer_errors[buf] = nil
+  state.buffer_items[buf] = nil
+end
+
+local function add_activity(activity)
+  local snapshot = activity.snapshot
+  if not activity_registered(activity) then
+    return nil
+  end
+  if not register_item_anchor(activity) or not ensure_job_buffer(snapshot.buf) then
+    remove_item_anchor(activity)
+    transition_work_item(activity, "cancelled", { cancel_reason = "could not attach activity" })
+    work_store:remove(activity)
+    release_buffer_tracking_if_idle(snapshot.buf)
+    return nil
+  end
+  refresh_item_animation(activity)
+  local rendered = render_spinner(activity)
+  refresh_buffer_decorations(snapshot.buf)
+  if not rendered then
+    remove_item_anchor(activity)
+    transition_work_item(activity, "cancelled", { cancel_reason = "could not render activity" })
+    work_store:remove(activity)
+    state.animated_items[activity.id] = nil
+    release_buffer_tracking_if_idle(snapshot.buf)
     return nil
   end
   ensure_spinner()
   return activity
 end
 
-remove_activity = function(activity)
-  if not activity or state.activities[activity.id] ~= activity then
+remove_activity = function(activity, interrupt)
+  if not activity_registered(activity) then
     return false
   end
-  state.activities[activity.id] = nil
-  if activity.extmark and vim.api.nvim_buf_is_valid(activity.snapshot.buf) then
-    pcall(vim.api.nvim_buf_del_extmark, activity.snapshot.buf, activity_namespace, activity.extmark)
+  local session = state.live[activity.root or activity.snapshot.root]
+  if session and session.preflight_blocked == activity.id then
+    session.preflight_blocked = nil
   end
+  local scheduler_action
+  if session and session.scheduler and session.scheduler:canonical_item(activity.id) == activity and not activity.terminal then
+    local action = session.scheduler:cancel(activity.id, "agent activity removed")
+    scheduler_action = action
+    if activity.turn_id and session.current == activity then
+      revoke_root_ownership(session.root, "cancel")
+    end
+    if interrupt ~= false and action and action.interrupt_turn_id and state.client then
+      state.client:request("turn/interrupt", {
+        threadId = session.thread_id,
+        turnId = action.interrupt_turn_id,
+      }, function() end)
+    end
+  end
+  local buf = activity.snapshot.buf
+  remove_item_anchor(activity)
+  clear_item_extmark(activity)
+  state.animated_items[activity.id] = nil
+  if not activity.terminal then
+    transition_work_item(activity, "cancelled", { cancel_reason = "activity removed" })
+  end
+  local held_lease = session and session.scheduler and session.scheduler:current_lease()
+  if held_lease and held_lease.item_id == activity.id then
+    work_store:retire(activity)
+  else
+    work_store:remove(activity)
+  end
+  if scheduler_action then
+    handle_scheduler_action(session, scheduler_action)
+    local lease = session.scheduler:current_lease()
+    if not lease or lease.item_id ~= activity.id then
+      session.scheduler:forget(activity.id)
+    end
+  end
+  refresh_buffer_decorations(buf)
+  release_buffer_tracking_if_idle(buf)
   stop_spinner_if_idle()
   return true
 end
 
-local function clear_activities(predicate)
+local function clear_activities(predicate, interrupt)
   local activities = {}
   for _, activity in pairs(state.activities) do
     if not predicate or predicate(activity) then
@@ -737,7 +1209,7 @@ local function clear_activities(predicate)
     end
   end
   for _, activity in ipairs(activities) do
-    remove_activity(activity)
+    remove_activity(activity, interrupt)
   end
 end
 
@@ -771,15 +1243,20 @@ local function restore_job_mappings(buf)
 end
 
 local function job_at_cursor(buf)
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row = cursor[1] - 1
+  local column = cursor[2]
   local exact = {}
+  local same_row = {}
   local end_of_buffer = {}
   local line_count = vim.api.nvim_buf_line_count(buf)
   for _, job in pairs(state.jobs) do
     if job.snapshot.buf == buf then
       local position = job_position(job)
-      if position and position[1] == row then
+      if position and position[1] == row and position[2] == column then
         table.insert(exact, job)
+      elseif position and position[1] == row then
+        table.insert(same_row, job)
       elseif position and position[1] == line_count and row == math.max(0, line_count - 1) then
         -- A whole-line edit can move a right-gravity extmark to the EOF
         -- boundary. The cursor cannot enter that boundary row, so let the
@@ -788,9 +1265,25 @@ local function job_at_cursor(buf)
       end
     end
   end
-  local candidates = #exact > 0 and exact or end_of_buffer
+  local candidates = exact
+  if #candidates == 0 and #same_row > 0 then
+    local only_column = job_position(same_row[1])[2]
+    local one_anchor = true
+    for index = 2, #same_row do
+      if job_position(same_row[index])[2] ~= only_column then
+        one_anchor = false
+        break
+      end
+    end
+    if one_anchor then
+      candidates = same_row
+    end
+  end
+  if #candidates == 0 then
+    candidates = end_of_buffer
+  end
   table.sort(candidates, function(left, right)
-    return left.id > right.id
+    return declaration_before(left, right)
   end)
   if #candidates > 0 then
     return candidates[1]
@@ -841,17 +1334,19 @@ local function ensure_job_mappings(buf)
     local mapping = {
       lhs = key,
       previous = previous,
-      fallback = previous or global_map(key),
     }
     local callback = function()
       local count = vim.v.count
       local job = job_at_cursor(buf)
       if not job then
-        replay_mapping(mapping.fallback, key, count)
+        -- A global mapping may change while Seal owns the temporary
+        -- buffer-local dispatcher. Resolve it at dispatch time unless Seal
+        -- shadowed a pre-existing buffer-local map.
+        replay_mapping(mapping.previous or global_map(key), key, count)
       elseif key == "<Tab>" then
-        M.accept(job.id)
+        M.accept(job)
       else
-        M.reject(job.id)
+        M.reject(job)
       end
     end
     mapping.callback = callback
@@ -866,45 +1361,87 @@ local function ensure_job_mappings(buf)
   state.job_mappings[buf] = mappings
 end
 
-local function detach_job(job)
-  if state.jobs[job.id] ~= job then
+local function job_mappings_active(buf)
+  local mappings = state.job_mappings[buf]
+  if not mappings then
     return false
   end
-  state.jobs[job.id] = nil
+  for _, mapping in ipairs(mappings) do
+    local current = previous_buffer_map(buf, mapping.lhs)
+    if not current or current.callback ~= mapping.callback then
+      return false
+    end
+  end
+  return true
+end
+
+local function detach_job(job)
+  if not job_registered(job) then
+    return false
+  end
+  local buf = job.snapshot.buf
+  local session = state.live[job.root or job.snapshot.root]
+  if session and session.preflight_blocked == job.id then
+    session.preflight_blocked = nil
+  end
+  remove_item_anchor(job)
   if job.thread_id and state.jobs_by_thread[job.thread_id] == job then
     state.jobs_by_thread[job.thread_id] = nil
   end
-  if job.extmark and vim.api.nvim_buf_is_valid(job.snapshot.buf) then
-    pcall(vim.api.nvim_buf_del_extmark, job.snapshot.buf, activity_namespace, job.extmark)
+  clear_item_extmark(job)
+  state.animated_items[job.id] = nil
+  if not job.terminal then
+    transition_work_item(job, "cancelled", { cancel_reason = "declaration removed" })
+  end
+  local held_lease = session and session.scheduler and session.scheduler:current_lease()
+  if held_lease and held_lease.item_id == job.id then
+    work_store:retire(job)
+  else
+    work_store:remove(job)
   end
   sync_job_aliases()
-  if not has_buffer_jobs(job.snapshot.buf) then
-    restore_job_mappings(job.snapshot.buf)
-    local buffer_state = state.job_buffers[job.snapshot.buf]
-    if buffer_state then
-      buffer_state.idle = true
-    end
+  refresh_buffer_decorations(buf)
+  if not has_buffer_jobs(buf) then
+    restore_job_mappings(buf)
   end
+  release_buffer_tracking_if_idle(buf)
   stop_spinner_if_idle()
   return true
 end
 
 cancel_job = function(job, interrupt)
   local was_generating = job.phase == "generating"
-  local thread_id = job.thread_id
-  local turn_id = job.turn_id
+  local session = state.live[job.root or job.snapshot.root]
+  local scheduler_action
+  if session and session.scheduler and session.scheduler:canonical_item(job.id) == job and not job.terminal then
+    local action, scheduler_error = session.scheduler:cancel(job.id, "declaration cancelled")
+    if action then
+      scheduler_action = action
+    elseif scheduler_error then
+      notify(error_message(scheduler_error, "could not cancel declaration work"), vim.log.levels.ERROR)
+    end
+  end
   if not detach_job(job) then
     return false
   end
   job.cancelled = true
-  if interrupt and was_generating and thread_id and state.client then
+  local interrupt_turn_id = interrupt and was_generating and scheduler_action and scheduler_action.interrupt_turn_id
+  if session and job.turn_id and session.current == job then
+    revoke_root_ownership(session.root, "cancel")
+  end
+  if interrupt_turn_id and state.client then
     job.interrupt_requested = true
-    -- Codex treats an empty turn ID as a startup interrupt. This closes the
-    -- race where the turn is running but turn/start has not replied yet.
     state.client:request("turn/interrupt", {
-      threadId = thread_id,
-      turnId = turn_id or "",
+      threadId = session.thread_id,
+      turnId = interrupt_turn_id,
     }, function() end)
+  end
+  if scheduler_action then
+    handle_scheduler_action(session, scheduler_action)
+    local lease = session.scheduler:current_lease()
+    if not lease or lease.item_id ~= job.id then
+      session.scheduler:forget(job.id)
+    end
   end
   return true
 end
@@ -915,7 +1452,7 @@ local function schedule_job_cancellation(stale)
   end
   vim.schedule(function()
     for _, job in ipairs(stale) do
-      if state.jobs[job.id] == job then
+      if job_registered(job) then
         local changed = cancel_job(job, true)
         if changed then
           notify_job_invalidation(job)
@@ -936,7 +1473,7 @@ local function schedule_buffer_job_cancellation(buf)
   schedule_job_cancellation(stale)
 end
 
-local function ensure_job_buffer(buf)
+ensure_job_buffer = function(buf)
   if state.job_buffers[buf] then
     state.job_buffers[buf].idle = false
     return true
@@ -998,14 +1535,19 @@ local function clear_jobs(predicate, interrupt)
 end
 
 local function add_job(job)
-  state.jobs[job.id] = job
+  if not job_registered(job) then
+    return false
+  end
   sync_job_aliases()
-  if not ensure_job_buffer(job.snapshot.buf) then
+  if not register_item_anchor(job) or not ensure_job_buffer(job.snapshot.buf) then
     detach_job(job)
     return false
   end
   ensure_job_mappings(job.snapshot.buf)
-  if not render_spinner(job) then
+  refresh_item_animation(job)
+  local rendered = render_spinner(job)
+  refresh_buffer_decorations(job.snapshot.buf)
+  if not rendered then
     detach_job(job)
     return false
   end
@@ -1027,74 +1569,18 @@ local function owned_turn_context(thread_id, turn_id)
     return session and { root = session.root, thread_id = thread_id } or nil
   end
   local inherited = state.owned_threads[thread_id]
-  if inherited and turn_id then
+  if inherited then
     local context = {
       root = inherited.root,
       thread_id = thread_id,
       parent_turn_id = inherited.parent_turn_id,
       mode = inherited.mode,
     }
-    state.owned_turns[turn_id] = context
+    if turn_id then
+      set_owned_turn(turn_id, context)
+    end
     return context
   end
-end
-
-local function direct_thread_owner(thread_id)
-  local inherited = state.owned_threads[thread_id]
-  if inherited then
-    return inherited
-  end
-  local session = find_session_by_thread(thread_id)
-  if session and session.active_turn_id then
-    local owner = owned_turn_context(thread_id, session.active_turn_id)
-    if owner then
-      return { root = owner.root, parent_turn_id = session.active_turn_id, mode = owner.mode }
-    end
-  end
-  for turn_id, owner in pairs(state.owned_turns) do
-    if type(owner) == "table" and owner.thread_id == thread_id then
-      return { root = owner.root, parent_turn_id = turn_id, mode = owner.mode }
-    end
-  end
-end
-
-local function resolve_thread_owner(thread_id, callback, seen)
-  local owner = direct_thread_owner(thread_id)
-  if owner then
-    callback(owner)
-    return
-  end
-  seen = seen or {}
-  if seen[thread_id] or not state.client then
-    callback(nil)
-    return
-  end
-  seen[thread_id] = true
-  local active_client = state.client
-  active_client:request("thread/read", { threadId = thread_id, includeTurns = false }, function(result, err)
-    if state.client ~= active_client or err or not result or not result.thread then
-      callback(nil)
-      return
-    end
-    local parent_thread_id = not_null(result.thread.parentThreadId)
-    if not parent_thread_id then
-      callback(nil)
-      return
-    end
-    resolve_thread_owner(parent_thread_id, function(parent_owner)
-      if not parent_owner then
-        callback(nil)
-        return
-      end
-      local resolved = {
-        root = parent_owner.root,
-        parent_turn_id = parent_owner.parent_turn_id,
-        mode = parent_owner.mode,
-      }
-      state.owned_threads[thread_id] = resolved
-      callback(resolved)
-    end, seen)
-  end)
 end
 
 local function remember_collab_threads(params)
@@ -1107,11 +1593,11 @@ local function remember_collab_threads(params)
     return
   end
   for _, thread_id in ipairs(item.receiverThreadIds or {}) do
-    state.owned_threads[thread_id] = {
+    set_owned_thread(thread_id, {
       root = owner.root,
       parent_turn_id = params.turnId,
       mode = owner.mode,
-    }
+    })
   end
 end
 
@@ -1121,25 +1607,85 @@ local function remember_started_thread(thread)
     return
   end
   local parent_owner = state.owned_threads[parent_thread_id]
-  if not parent_owner then
-    local parent_session = find_session_by_thread(parent_thread_id)
-    local parent_turn_id = parent_session and parent_session.active_turn_id
-    local turn_owner = parent_turn_id and owned_turn_context(parent_thread_id, parent_turn_id)
-    if turn_owner then
-      parent_owner = { root = turn_owner.root, parent_turn_id = parent_turn_id, mode = turn_owner.mode }
-    end
-  end
   if parent_owner then
-    state.owned_threads[thread.id] = {
+    set_owned_thread(thread.id, {
       root = parent_owner.root,
       parent_turn_id = parent_owner.parent_turn_id,
       mode = parent_owner.mode,
-    }
+    })
   end
 end
 
 local function review_key(request_id)
   return tostring(request_id)
+end
+
+local max_pending_unowned_requests = 256
+
+local function forget_pending_unowned_request(request_id)
+  state.pending_unowned_requests[review_key(request_id)] = nil
+end
+
+local function clear_pending_unowned_requests(thread_id, turn_id)
+  for key, pending in pairs(state.pending_unowned_requests) do
+    if (not thread_id or pending.thread_id == thread_id)
+      and (not turn_id or pending.turn_id == turn_id)
+    then
+      state.pending_unowned_requests[key] = nil
+    end
+  end
+end
+
+local function remember_pending_unowned_request(request)
+  local params = request.params or {}
+  if request.id == nil or not params.threadId then
+    return false
+  end
+  local key = review_key(request.id)
+  local existing = state.pending_unowned_requests[key]
+  if existing then
+    existing.request = vim.deepcopy(request)
+    return true
+  end
+
+  state.pending_unowned_request_sequence = state.pending_unowned_request_sequence + 1
+  state.pending_unowned_requests[key] = {
+    request = vim.deepcopy(request),
+    thread_id = params.threadId,
+    turn_id = params.turnId,
+    sequence = state.pending_unowned_request_sequence,
+  }
+
+  if vim.tbl_count(state.pending_unowned_requests) > max_pending_unowned_requests then
+    local oldest_key
+    local oldest_sequence
+    for candidate_key, candidate in pairs(state.pending_unowned_requests) do
+      if not oldest_sequence or candidate.sequence < oldest_sequence then
+        oldest_key = candidate_key
+        oldest_sequence = candidate.sequence
+      end
+    end
+    state.pending_unowned_requests[oldest_key] = nil
+  end
+  return true
+end
+
+replay_pending_owned_requests = function(thread_id)
+  local pending = {}
+  for key, candidate in pairs(state.pending_unowned_requests) do
+    if candidate.thread_id == thread_id then
+      state.pending_unowned_requests[key] = nil
+      table.insert(pending, candidate)
+    end
+  end
+  table.sort(pending, function(left, right)
+    return left.sequence < right.sequence
+  end)
+  for _, candidate in ipairs(pending) do
+    if not state.resolved_requests[review_key(candidate.request.id)] then
+      handle_server_request(candidate.request)
+    end
+  end
 end
 
 local function canonical_path(path)
@@ -1462,6 +2008,47 @@ local function clear_command_requests(thread_id, turn_id, decision)
   end
 end
 
+revoke_root_ownership = function(root, decision)
+  if not root then
+    return
+  end
+  local turn_ids = {}
+  local thread_ids = {}
+  for turn_id, owner in pairs(state.owned_turns) do
+    if type(owner) == "table" and owner.root == root then
+      table.insert(turn_ids, turn_id)
+      if owner.thread_id then
+        thread_ids[owner.thread_id] = true
+      end
+    end
+  end
+  for thread_id, owner in pairs(state.owned_threads) do
+    if type(owner) == "table" and owner.root == root then
+      thread_ids[thread_id] = true
+    end
+  end
+  local session = state.live[root]
+  if session then
+    thread_ids[session.thread_id] = true
+    session.pending_server_requests = nil
+  end
+
+  for _, turn_id in ipairs(turn_ids) do
+    set_owned_turn(turn_id, nil)
+  end
+  for thread_id in pairs(thread_ids) do
+    set_owned_thread(thread_id, nil)
+    clear_pending_unowned_requests(thread_id)
+  end
+  clear_reviews(function(review)
+    return review.root == root
+  end, decision)
+  for thread_id in pairs(thread_ids) do
+    clear_command_requests(thread_id, nil, decision)
+    clear_approval_items(thread_id)
+  end
+end
+
 local function command_details(params, item)
   local parts = {}
   local command = not_null(params.command) or (item and not_null(item.command))
@@ -1584,32 +2171,13 @@ local function request_command_decision(request, item)
   end
 end
 
-local function started_turn_client_id(turn)
-  for _, item in ipairs(turn and turn.items or {}) do
-    if item.type == "userMessage" and item.clientId then
-      return item.clientId
-    end
-  end
-end
-
-local function entry_matches_started_turn(entry, turn)
-  if not entry or not turn then
-    return false
-  end
-  if entry.turn_id then
-    return entry.turn_id == turn.id
-  end
-  local client_id = started_turn_client_id(turn)
-  return client_id ~= nil and client_id == entry.client_id
-end
-
 local function bind_session_entry_turn(session, entry, turn_id)
   if not session or session.current ~= entry or not turn_id then
     return false
   end
   local newly_confirmed = not entry.confirmed_turn
   if entry.turn_id and entry.turn_id ~= turn_id then
-    state.owned_turns[entry.turn_id] = nil
+    set_owned_turn(entry.turn_id, nil)
   end
   entry.turn_id = turn_id
   entry.confirmed_turn = true
@@ -1620,32 +2188,126 @@ local function bind_session_entry_turn(session, entry, turn_id)
   session.status = { type = "active", activeFlags = {} }
   session.active_turn_id = turn_id
   session.external_turn_id = nil
-  if entry.mode == "declaration" then
-    local job = entry.job
-    job.thread_id = session.thread_id
-    job.turn_id = turn_id
-    state.jobs_by_thread[session.thread_id] = job
+  if entry.kind == "declaration" then
+    entry.thread_id = session.thread_id
+    entry.turn_id = turn_id
+    state.jobs_by_thread[session.thread_id] = entry
     restore_main_thread_settings(session, entry)
   else
-    local activity = entry.activity
-    if activity.provisional_turn_id and activity.provisional_turn_id ~= turn_id then
-      state.owned_turns[activity.provisional_turn_id] = nil
+    if entry.provisional_turn_id and entry.provisional_turn_id ~= turn_id then
+      set_owned_turn(entry.provisional_turn_id, nil)
     end
-    activity.thread_id = session.thread_id
-    activity.turn_id = turn_id
-    activity.start_pending = false
-    activity.provisional_turn_id = nil
+    entry.thread_id = session.thread_id
+    entry.turn_id = turn_id
+    entry.start_pending = false
+    entry.provisional_turn_id = nil
   end
-  state.owned_turns[turn_id] = {
+  set_owned_turn(turn_id, {
     root = session.root,
     thread_id = session.thread_id,
     mode = entry.mode,
-  }
+  })
   return true
 end
 
-local function handle_notification(method, params)
+local function replay_pending_server_requests(session, turn_id)
+  local pending_by_turn = session.pending_server_requests
+  local pending = pending_by_turn and pending_by_turn[turn_id]
+  if not pending then
+    return
+  end
+  pending_by_turn[turn_id] = nil
+  for _, request in pairs(pending) do
+    handle_server_request(request)
+  end
+end
+
+local function accept_start_response(session, entry, turn_id)
+  local scheduler = session and session.scheduler
+  local token = session and session.current_lease_token
+  if not scheduler or not token then
+    return nil
+  end
+  local action, err = scheduler:start_succeeded(token, turn_id)
+  if not action then
+    notify(error_message(err, "could not bind the Codex turn"), vim.log.levels.ERROR)
+    return nil
+  end
+  if session.unbound_turns then
+    session.unbound_turns[turn_id] = nil
+  end
+
+  entry.turn_id = turn_id
+  entry.confirmed_turn = true
+  session.status_generation = (session.status_generation or 0) + 1
+  session.busy = true
+  session.status = { type = "active", activeFlags = {} }
+  session.active_turn_id = turn_id
+  session.external_turn_id = nil
+
+  local entry_running = work_item_registered(entry) and entry.state == "running"
+  local owns_requests = entry_running and not action.already_completed
+  if entry_running then
+    bind_session_entry_turn(session, entry, turn_id)
+  else
+    if entry.kind == "declaration" then
+      restore_main_thread_settings(session, entry)
+    end
+  end
+  if not owns_requests then
+    if session.pending_server_requests then
+      session.pending_server_requests[turn_id] = nil
+    end
+    if action.already_completed then
+      revoke_root_ownership(session.root)
+      for _, event in ipairs(action.events or {}) do
+        local item = event.payload and event.payload.item
+        if item and item.type == "collabAgentToolCall" then
+          for _, child_thread_id in ipairs(item.receiverThreadIds or {}) do
+            clear_pending_unowned_requests(child_thread_id)
+          end
+        end
+      end
+      if entry.restore_advance then
+        entry.restore_advance()
+      end
+    end
+  else
+    -- Collab ownership can be observed before the turn/start response. Replay
+    -- those exact receiver mappings first so a child approval that raced the
+    -- response is attributed before any buffered request is handled.
+    for _, event in ipairs(action.events or {}) do
+      if (event.type == "item/started" or event.type == "item/completed") and event.payload then
+        remember_collab_threads(event.payload)
+      end
+    end
+    replay_pending_server_requests(session, turn_id)
+  end
+
+  if action.interrupt_turn_id and state.client then
+    state.client:request("turn/interrupt", {
+      threadId = session.thread_id,
+      turnId = action.interrupt_turn_id,
+    }, function() end)
+  end
+
+  for _, event in ipairs(action.events or {}) do
+    if event.type ~= "started" and event.payload then
+      vim.schedule(function()
+        handle_notification(event.type == "completed" and "turn/completed" or event.type, event.payload)
+      end)
+    end
+  end
+  return action
+end
+
+handle_notification = function(method, params)
   local notification_turn_id = params.turnId or (params.turn and params.turn.id)
+  if method == "turn/completed" then
+    clear_pending_unowned_requests(params.threadId, notification_turn_id)
+  elseif method == "thread/closed" then
+    clear_pending_unowned_requests(params.threadId)
+  end
   if method == "item/started" or method == "item/completed" then
     remember_collab_threads(params)
   end
@@ -1655,6 +2317,7 @@ local function handle_notification(method, params)
     update_file_change_item(params)
   elseif method == "serverRequest/resolved" then
     state.resolved_requests[review_key(params.requestId)] = true
+    forget_pending_unowned_request(params.requestId)
     local review = state.reviews[review_key(params.requestId)]
     if review then
       local was_visible = review.view and vim.api.nvim_win_is_valid(review.view.win)
@@ -1692,22 +2355,28 @@ local function handle_notification(method, params)
       notify("Codex stopped the shared project thread", vim.log.levels.ERROR)
     end
     if status == "notLoaded" or status == "systemError" then
+      clear_pending_unowned_requests(params.threadId)
       if session then
-        session.queue = {}
-        session.current = nil
-        session.busy = false
+        revoke_root_ownership(session.root)
         clear_jobs(function(candidate)
           return candidate.snapshot.root == session.root
         end, false)
         clear_activities(function(activity)
           return activity.root == session.root
         end)
+        purge_retired_work(session.root)
+        session.scheduler = new_project_scheduler(session.root)
+        session.queue = session.scheduler.queue
+        session.current = nil
+        session.current_lease_token = nil
+        session.busy = false
+        session.preflight_blocked = nil
       end
       clear_reviews(function(review)
         return review.thread_id == params.threadId
       end)
       clear_command_requests(params.threadId)
-      state.owned_threads[params.threadId] = nil
+      set_owned_thread(params.threadId, nil)
       clear_activities(function(activity)
         return activity.thread_id == params.threadId
       end)
@@ -1735,6 +2404,42 @@ local function handle_notification(method, params)
           previous.activePermissionProfile
         ),
       }
+      session.settings_epoch = (session.settings_epoch or 0) + 1
+      local settings_entry = session.current
+      local restore_request = settings_entry and settings_entry.restore_request
+      local self_issued_restore = restore_request
+        and settings_match_restore(session.settings, restore_request.desired)
+        or false
+      if self_issued_restore then
+        restore_request.observed = true
+      end
+      local own_declaration_override = settings_entry
+        and settings_entry.declaration_override_pending
+        and update_is_declaration_override(settings)
+        or false
+      if own_declaration_override then
+        settings_entry.declaration_override_pending = nil
+      end
+      if settings_entry
+        and settings_entry.kind == "declaration"
+        and settings_entry.policy_overridden
+        and not settings_entry.settings_restored
+        and not self_issued_restore
+        and not own_declaration_override
+      then
+        local restore_base = settings_entry.restore_superseded or settings_entry.restore_settings
+        local observed, changed = merge_external_restore(restore_base, settings)
+        if changed and settings_entry.settings_restore_started then
+          settings_entry.restore_superseded = observed
+          settings_entry.restore_settings = vim.deepcopy(observed)
+        elseif changed then
+          settings_entry.restore_settings = observed
+          settings_entry.restore_settings_epoch = session.settings_epoch
+        end
+      end
+      if settings_entry and settings_entry.restore_advance then
+        settings_entry.restore_advance()
+      end
       if session.settings_blocked
         and session.blocked_restore
       then
@@ -1744,13 +2449,20 @@ local function handle_notification(method, params)
             and profile
             and profile.id == desired.permissions
           or not desired.permissions
+            and profile == nil
             and vim.deep_equal(session.settings.sandboxPolicy, desired.sandboxPolicy)
-        if session.settings.approvalPolicy == desired.approvalPolicy
+        if vim.deep_equal(session.settings.approvalPolicy, desired.approvalPolicy)
           and session.settings.approvalsReviewer == desired.approvalsReviewer
           and permissions_match
         then
           session.settings_blocked = false
           session.blocked_restore = nil
+          if session.scheduler and session.scheduler:blocked_reason() then
+            local action = session.scheduler:clear_block({ requeue_items = true })
+            if action then
+              handle_scheduler_action(session, action)
+            end
+          end
           if pump_session then
             vim.schedule(function()
               if state.live[session.root] == session then
@@ -1772,21 +2484,26 @@ local function handle_notification(method, params)
       notify("Codex closed the shared project thread", vim.log.levels.ERROR)
     end
     if session then
-      session.queue = {}
-      session.current = nil
-      session.busy = false
+      revoke_root_ownership(session.root)
       clear_jobs(function(candidate)
         return candidate.snapshot.root == session.root
       end, false)
       clear_activities(function(activity)
         return activity.root == session.root
       end)
+      purge_retired_work(session.root)
+      session.scheduler = new_project_scheduler(session.root)
+      session.queue = session.scheduler.queue
+      session.current = nil
+      session.current_lease_token = nil
+      session.busy = false
+      session.preflight_blocked = nil
     end
     clear_reviews(function(review)
       return review.thread_id == params.threadId
     end)
     clear_command_requests(params.threadId)
-    state.owned_threads[params.threadId] = nil
+    set_owned_thread(params.threadId, nil)
     clear_activities(function(activity)
       return activity.thread_id == params.threadId
     end)
@@ -1799,11 +2516,13 @@ local function handle_notification(method, params)
       session.busy = true
       session.status = { type = "active", activeFlags = {} }
       session.active_turn_id = params.turn.id
-      local entry = session.current
-      if not entry_matches_started_turn(entry, params.turn) then
+      local lease = session.scheduler and session.scheduler:current_lease()
+      if lease and not lease.turn_id then
+        session.scheduler:record_turn_started(params.turn.id, params)
+        session.unbound_turns = session.unbound_turns or {}
+        session.unbound_turns[params.turn.id] = { completed = false }
+      elseif not lease or lease.turn_id ~= params.turn.id then
         session.external_turn_id = params.turn.id
-      else
-        bind_session_entry_turn(session, entry, params.turn.id)
       end
       if refresh_chat then
         vim.schedule(function()
@@ -1815,12 +2534,38 @@ local function handle_notification(method, params)
     local session = find_session_by_thread(params.threadId)
     local completed_turn_id = params.turn and params.turn.id or params.turnId
     local completed_owner = completed_turn_id and state.owned_turns[completed_turn_id]
+    local lease = session and session.scheduler and session.scheduler:current_lease()
+    if session
+      and lease
+      and not lease.turn_id
+      and completed_turn_id
+      and session.external_turn_id == completed_turn_id
+    then
+      session.scheduler:discard_turn_events(completed_turn_id)
+      if session.unbound_turns then
+        session.unbound_turns[completed_turn_id] = nil
+      end
+      session.external_turn_id = nil
+      session.active_turn_id = nil
+      session.status_generation = (session.status_generation or 0) + 1
+      session.busy = session.current ~= nil
+      session.status = { type = "idle" }
+      return
+    end
+    if session and lease and not lease.turn_id and completed_turn_id then
+      session.scheduler:record_turn_completed(completed_turn_id, params)
+      session.unbound_turns = session.unbound_turns or {}
+      session.unbound_turns[completed_turn_id] = { completed = true }
+      session.status_generation = (session.status_generation or 0) + 1
+      session.active_turn_id = nil
+      session.status = { type = "idle" }
+      return
+    end
     if params.turn then
-      state.owned_turns[params.turn.id] = nil
+      set_owned_turn(params.turn.id, nil)
     end
     local entry = session and session.current
-    local completes_entry = entry
-      and (not completed_turn_id or entry.turn_id == completed_turn_id)
+    local completes_entry = entry and lease and lease.turn_id == completed_turn_id
     local completes_external = session
       and completed_turn_id
       and session.external_turn_id == completed_turn_id
@@ -1831,6 +2576,12 @@ local function handle_notification(method, params)
           and (not session.active_turn_id
             or not completed_turn_id
             or session.active_turn_id == completed_turn_id)))
+    if completes_entry and entry.restore_advance then
+      -- A terminal turn cannot apply a still-pending declaration override.
+      -- This also releases a restore update that was an authoritative no-op
+      -- and therefore produced no settings-changed notification.
+      entry.restore_advance()
+    end
     if completes_session_turn then
       session.status_generation = (session.status_generation or 0) + 1
       if completes_external then
@@ -1846,7 +2597,7 @@ local function handle_notification(method, params)
         end)
       end
     end
-    if session then
+    if session and (not completes_entry or entry.kind ~= "declaration") then
       vim.schedule(function()
         local failures = check_unmodified_project_buffers(session.root)
         if #failures > 0 then
@@ -1861,19 +2612,37 @@ local function handle_notification(method, params)
     clear_approval_items(params.threadId, completed_turn_id)
     clear_command_requests(params.threadId, completed_turn_id)
     if completes_entry then
-      if entry.mode == "declaration" then
-        local job = entry.job
-        if state.jobs_by_thread[params.threadId] == job then
+      local turn_status = params.turn and params.turn.status or "failed"
+      local outcome
+      local fields
+      if entry.state == "cancelled" then
+        outcome = "cancelled"
+      elseif turn_status == "completed" and entry.kind == "declaration" then
+        outcome = "preview"
+        fields = { preview = { raw = entry.answer } }
+      elseif turn_status == "completed" then
+        outcome = "done"
+      else
+        outcome = "failed"
+        fields = { error = entry.notification_error or "Codex turn failed" }
+      end
+      local action, scheduler_error = session.scheduler:finish_turn(completed_turn_id, outcome, fields)
+      if entry.kind == "declaration" then
+        if state.jobs_by_thread[params.threadId] == entry then
           state.jobs_by_thread[params.threadId] = nil
         end
-        job.turn_status = params.turn and params.turn.status or "failed"
+        entry.turn_status = turn_status
         vim.schedule(function()
-          M._finish_generation(job)
+          M._finish_generation(entry)
         end)
       else
-        remove_activity(entry.activity)
+        remove_activity(entry)
       end
-      complete_session_entry(session, entry)
+      if action then
+        handle_scheduler_action(session, action)
+      elseif scheduler_error then
+        notify(error_message(scheduler_error, "could not finish Codex work"), vim.log.levels.ERROR)
+      end
     elseif session and not session.current then
       session.busy = false
       session.status = { type = "idle" }
@@ -1888,16 +2657,21 @@ local function handle_notification(method, params)
     local completed_root = session and session.root
       or (type(completed_owner) == "table" and not completed_owner.parent_turn_id and completed_owner.root)
     if completed_root then
-      for thread_id, owner in pairs(state.owned_threads) do
-        if owner.root == completed_root then
-          state.owned_threads[thread_id] = nil
-        end
-      end
+      revoke_root_ownership(completed_root)
     end
+  end
+
+  if method == "turn/started" or method == "turn/completed" then
+    return
   end
 
   local job = state.jobs_by_thread[params.threadId]
   if not job or job.phase ~= "generating" then
+    local session = find_session_by_thread(params.threadId)
+    local lease = session and session.scheduler and session.scheduler:current_lease()
+    if notification_turn_id and lease and not lease.turn_id then
+      session.scheduler:record_event(method, notification_turn_id, params)
+    end
     return
   end
 
@@ -1919,8 +2693,6 @@ local function handle_notification(method, params)
   end
 end
 
-local handle_server_request
-
 handle_server_request = function(request)
   if state.resolved_requests[review_key(request.id)] then
     return
@@ -1937,13 +2709,19 @@ handle_server_request = function(request)
   local owner = owned_turn_context(params.threadId, turn_id)
   is_generation = is_generation or (owner and owner.mode == "declaration") or false
   if not is_generation and not owner then
-    resolve_thread_owner(params.threadId, function(resolved)
-      if resolved then
-        handle_server_request(request)
-      end
-    end)
+    local lease = session and session.scheduler and session.scheduler:current_lease()
+    if current and lease and not lease.turn_id and turn_id then
+      session.pending_server_requests = session.pending_server_requests or {}
+      local pending = session.pending_server_requests[turn_id] or {}
+      session.pending_server_requests[turn_id] = pending
+      pending[review_key(request.id)] = request
+      return
+    end
+    remember_pending_unowned_request(request)
     return
   end
+
+  forget_pending_unowned_request(request.id)
 
   if request.method == "item/fileChange/requestApproval" and not is_generation then
     local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
@@ -2026,11 +2804,12 @@ local function client()
       end
       state.live = {}
       state.loading = {}
-      state.owned_turns = {}
-      state.owned_threads = {}
+      reset_ownership()
       state.approval_items = {}
       state.accepted_file_items = {}
       state.resolved_requests = {}
+      state.pending_unowned_requests = {}
+      state.pending_unowned_request_sequence = 0
       clear_activities()
       clear_reviews()
       clear_command_requests()
@@ -2052,14 +2831,17 @@ end
 local function remember_thread(root, result)
   local thread = result.thread
   local status = thread.status or { type = "idle" }
+  local scheduler = new_project_scheduler(root)
   local session = {
     root = root,
     thread_id = thread.id,
     status = status,
     busy = status.type == "active",
     status_generation = 0,
-    queue = {},
+    scheduler = scheduler,
+    queue = scheduler.queue,
     current = nil,
+    settings_epoch = 0,
     settings = {
       model = result.model,
       modelProvider = result.modelProvider,
@@ -2365,7 +3147,6 @@ local function capture_snapshot(opts)
     excerpt_last = last,
     selection = selection,
     selection_range = selection_range,
-    source_lines = lines,
   }
 end
 
@@ -2397,7 +3178,6 @@ local function refresh_snapshot(snapshot)
   snapshot.excerpt = text
   snapshot.excerpt_first = first
   snapshot.excerpt_last = last
-  snapshot.source_lines = lines
   return snapshot
 end
 
@@ -2841,21 +3621,73 @@ local function validate_declaration(snapshot, lines, kind)
   return valid, reason
 end
 
-local function render_preview(job, lines, quiet)
+local function preview_safety_reason(snapshot)
+  if not vim.api.nvim_buf_is_valid(snapshot.buf) then
+    return "The source buffer is no longer available"
+  end
+  if vim.api.nvim_buf_get_name(snapshot.buf) ~= snapshot.file then
+    return "The source buffer was renamed"
+  end
+  if state.buffer_errors[snapshot.buf] then
+    return "Seal could not reconcile this buffer: " .. state.buffer_errors[snapshot.buf]
+  end
+  if vim.api.nvim_buf_get_changedtick(snapshot.buf) ~= snapshot.changedtick then
+    return "The source buffer has an unreconciled edit"
+  end
+  if not file_unchanged(snapshot.file, snapshot.file_stamp, snapshot.file_digest) then
+    return "The source file changed on disk; reload or save it before accepting"
+  end
+  return nil
+end
+
+render_preview = function(job, lines, quiet, layout)
   local snapshot = job.snapshot
-  if state.jobs[job.id] ~= job or job.invalidated or not snapshot_valid(snapshot) then
-    notify("The buffer or file changed while Codex was working; result discarded", vim.log.levels.WARN)
+  if not job_registered(job) then
+    return false
+  end
+  if job.invalidated or not vim.api.nvim_buf_is_valid(snapshot.buf) then
+    notify("The marked buffer is no longer available; result discarded", vim.log.levels.WARN)
     cancel_job(job, false)
     return false
   end
 
-  local position = job_position(job)
+  sync_item_snapshot(job, nil, false)
+  local visible, collocated, position = visible_collocated_item(job, layout)
   if not position then
     cancel_job(job, false)
     return false
   end
   snapshot.row = position[1]
   snapshot.column = position[2]
+  if job.raw_code then
+    lines = normalize_code(job.raw_code, snapshot.base_indent)
+  end
+  lines = lines or job.lines
+  if not lines or #lines == 0 then
+    cancel_job(job, false)
+    return false
+  end
+  job.phase = "ready"
+  job.lines = lines
+  job.preview_blocked_reason = job.apply_blocked_reason or preview_safety_reason(snapshot)
+  refresh_item_animation(job)
+  if not visible then
+    clear_item_extmark(job)
+    sync_job_aliases()
+    stop_spinner_if_idle()
+    return true
+  end
+
+  local marker = " ✓ "
+  local mappings_active = job_mappings_active(snapshot.buf)
+  local action = mappings_active and "Tab accept · Esc reject" or ":SealAccept · :SealReject"
+  if snapshot.anchor_ambiguous then
+    marker = " ? "
+    action = mappings_active and "Tab re-anchor · Esc reject" or ":SealAccept re-anchor · :SealReject"
+  elseif job.preview_blocked_reason then
+    marker = " ! "
+    action = mappings_active and "accept blocked · Esc reject" or "accept blocked · :SealReject"
+  end
   local virtual_lines = {}
   for _, line in ipairs(lines) do
     table.insert(virtual_lines, { { line, "SealPreview" } })
@@ -2867,8 +3699,8 @@ local function render_preview(job, lines, quiet)
     virt_lines = virtual_lines,
     virt_lines_above = true,
     virt_text = {
-      { " ✓ ", "SealReady" },
-      { job.summary .. " · Tab accept · Esc reject", "SealPreviewHint" },
+      { marker, "SealReady" },
+      { job.summary .. collision_suffix(collocated) .. " · " .. action, "SealPreviewHint" },
     },
     virt_text_pos = "eol",
     priority = 200,
@@ -2879,18 +3711,22 @@ local function render_preview(job, lines, quiet)
     return false
   end
   job.extmark = extmark
-  job.phase = "ready"
-  job.lines = lines
   sync_job_aliases()
   stop_spinner_if_idle()
   if not quiet then
-    notify("Declaration ready: Tab accepts, Esc rejects")
+    if snapshot.anchor_ambiguous then
+      notify("Declaration ready, but its insertion point moved ambiguously; Tab re-anchors it first", vim.log.levels.WARN)
+    elseif job.preview_blocked_reason then
+      notify("Declaration ready, but acceptance is blocked: " .. job.preview_blocked_reason, vim.log.levels.WARN)
+    else
+      notify("Declaration ready: Tab accepts, Esc rejects")
+    end
   end
   return true
 end
 
 function M._finish_generation(job)
-  if state.jobs[job.id] ~= job or job.phase ~= "generating" then
+  if not job_registered(job) or job.phase ~= "generating" then
     return
   end
   if job.thread_id and state.jobs_by_thread[job.thread_id] == job then
@@ -2930,13 +3766,14 @@ function M._finish_generation(job)
   end
   job.snapshot.row = position[1]
   job.snapshot.column = position[2]
-  local lines = normalize_code(decoded.code, job.snapshot.base_indent)
+  job.raw_code = decoded.code
+  local lines = normalize_code(job.raw_code, job.snapshot.base_indent)
   if #lines == 0 then
     notify("Codex returned an empty declaration", vim.log.levels.ERROR)
     cancel_job(job, false)
     return
   end
-  local valid, reason = validate_declaration(job.snapshot, lines, job.kind)
+  local valid, reason = validate_declaration(job.snapshot, lines, job.declaration_kind)
   if not valid then
     notify("Declaration rejected: " .. reason, vim.log.levels.ERROR)
     cancel_job(job, false)
@@ -2945,14 +3782,41 @@ function M._finish_generation(job)
   render_preview(job, lines)
 end
 
-local function start_declaration(session, snapshot, route, job)
-  if state.jobs[job.id] ~= job or job.phase ~= "generating" then
+local function defer_preflight_item(session, item, message)
+  local action, scheduler_error = session.scheduler:defer_current(session.current_lease_token, message, {
+    preflight_blocked = true,
+  })
+  if not action then
+    notify(error_message(scheduler_error, "could not defer Seal work"), vim.log.levels.ERROR)
     return false
   end
-  if not snapshot_valid(snapshot) then
+  item.blocked_reason = message
+  session.preflight_blocked = item.id
+  refresh_item_animation(item)
+  refresh_buffer_decorations(item.snapshot.buf)
+  handle_scheduler_action(session, action)
+  stop_spinner_if_idle()
+  notify(message, vim.log.levels.WARN)
+  return true
+end
+
+local function start_declaration(session, snapshot, route, job)
+  if not job_registered(job) or job.phase ~= "generating" then
+    return false
+  end
+  if state.buffer_errors[snapshot.buf] then
+    return defer_preflight_item(session, job, "Seal could not reconcile the marked buffer; reload it before retrying")
+  end
+  if not sync_item_snapshot(job, nil, true) then
     notify("The source buffer changed while Codex was starting", vim.log.levels.WARN)
     cancel_job(job, false)
     return false
+  end
+  if snapshot.anchor_ambiguous then
+    return defer_preflight_item(session, job, "The declaration anchor moved ambiguously; place the cursor and press Tab to re-anchor it")
+  end
+  if not snapshot_valid(snapshot) then
+    return defer_preflight_item(session, job, "The source buffer or file changed while Codex was starting")
   end
   if route.prompt == "" then
     notify(route.kind .. " prompt cannot be empty", vim.log.levels.WARN)
@@ -2967,15 +3831,6 @@ local function start_declaration(session, snapshot, route, job)
       return false
     end
   end
-  for _, existing in pairs(state.jobs) do
-    local position = job_position(existing)
-    if existing ~= job and existing.snapshot.buf == snapshot.buf and position and position[1] == snapshot.row then
-      notify("A Seal job already exists on this line", vim.log.levels.WARN)
-      cancel_job(job, false)
-      return false
-    end
-  end
-
   local declaration_prompt_parts = {
     "Generate one focused code declaration for Seal.",
     "Inspect the repository as needed, but do not modify files.",
@@ -3003,27 +3858,48 @@ local function start_declaration(session, snapshot, route, job)
   end
   snapshot.row = position[1]
   snapshot.column = position[2]
-  snapshot = refresh_snapshot(snapshot)
-  if not snapshot or not snapshot_valid(snapshot) then
-    notify("The source buffer changed while this request was queued", vim.log.levels.WARN)
+  if not sync_item_snapshot(job, nil, true)
+    or snapshot.anchor_ambiguous
+    or not snapshot_valid(snapshot)
+  then
+    return defer_preflight_item(session, job, "The marked context changed while this request was queued; re-anchor or reload it before retrying")
+  end
+
+  local entry = session.current
+  local lease_token = session.current_lease_token
+  local settings = session.settings or {}
+  entry.restore_settings = restore_snapshot(settings)
+  entry.restore_settings_epoch = session.settings_epoch or 0
+  entry.policy_overridden = true
+  entry.declaration_override_pending = not same_restore(entry.restore_settings, {
+    approvalPolicy = "never",
+    approvalsReviewer = config.main_approvals_reviewer,
+    sandboxPolicy = turn_sandbox_policy("read-only"),
+  })
+  local restore_lease, restore_error = session.scheduler:require_restore(lease_token)
+  if not restore_lease then
+    notify(error_message(restore_error, "could not protect the shared thread settings"), vim.log.levels.ERROR)
     cancel_job(job, false)
     return false
   end
-
-  job.thread_id = session.thread_id
-  local entry = session.current
-  local settings = session.settings or {}
-  entry.restore_settings = {
-    approvalPolicy = settings.approvalPolicy,
-    approvalsReviewer = settings.approvalsReviewer,
-    sandboxPolicy = settings.sandboxPolicy and vim.deepcopy(settings.sandboxPolicy) or nil,
-    permissions = settings.activePermissionProfile and settings.activePermissionProfile.id or nil,
-  }
-  entry.policy_overridden = true
   entry.client_id = next_client_id()
   local request_client = client()
+  local dispatched, dispatch_error = session.scheduler:mark_start_dispatched(lease_token)
+  if not dispatched then
+    entry.declaration_override_pending = nil
+    notify(error_message(dispatch_error, "could not dispatch declaration work"), vim.log.levels.ERROR)
+    local action = session.scheduler:start_failed(lease_token, {
+      error = error_message(dispatch_error, "could not dispatch declaration work"),
+    })
+    if action and action.waiting_for_restore then
+      restore_main_thread_settings(session, entry)
+    else
+      handle_scheduler_action(session, action)
+    end
+    return true
+  end
   request_client:request("turn/start", {
-    threadId = job.thread_id,
+    threadId = session.thread_id,
     clientUserMessageId = entry.client_id,
     input = { { type = "text", text = declaration_prompt } },
     additionalContext = additional_context(snapshot),
@@ -3041,17 +3917,28 @@ local function start_declaration(session, snapshot, route, job)
       return
     end
     if turn_err or not turn_result or not turn_result.turn then
+      entry.declaration_override_pending = nil
       if active_turn_error(turn_err) then
-        entry.retry_after_restore = true
-        restore_main_thread_settings(session, entry)
+        requeue_session_entry(session, entry)
         return
       end
-      cancel_job(job, false)
+      local action, scheduler_error = session.scheduler:start_failed(lease_token, {
+        error = error_message(turn_err, "could not start declaration turn"),
+      })
       notify(error_message(turn_err, "could not start declaration turn"), vim.log.levels.ERROR)
-      complete_session_entry(session, entry)
+      cancel_job(job, false)
+      if action then
+        if action.waiting_for_restore then
+          restore_main_thread_settings(session, entry)
+        else
+          handle_scheduler_action(session, action)
+        end
+      elseif scheduler_error then
+        notify(error_message(scheduler_error, "could not release failed declaration"), vim.log.levels.ERROR)
+      end
       return
     end
-    bind_session_entry_turn(session, entry, turn_result.turn.id)
+    accept_start_response(session, entry, turn_result.turn.id)
   end)
   return true
 end
@@ -3188,20 +4075,54 @@ local function other_modified_project_buffers(root, source_buf)
 end
 
 local function start_agent(session, snapshot, prompt, activity)
-  local function fail(message, level)
-    remove_activity(activity)
+  local entry = session.current
+  local lease_token = session.current_lease_token
+  local function reject(message, level)
+    local action, scheduler_error = session.scheduler:start_failed(lease_token, { error = message })
     notify(message, level or vim.log.levels.WARN)
+    if action then
+      handle_scheduler_action(session, action)
+    elseif scheduler_error then
+      notify(error_message(scheduler_error, "could not release rejected prompt"), vim.log.levels.ERROR)
+    end
+    remove_activity(activity)
+    return true
+  end
+  local function defer(message, level)
+    local action, scheduler_error = session.scheduler:defer_current(lease_token, message, {
+      preflight_blocked = true,
+    })
+    if not action then
+      return reject(error_message(scheduler_error, message), vim.log.levels.ERROR)
+    end
+    activity.start_pending = false
+    activity.blocked_reason = message
+    session.preflight_blocked = activity.id
+    refresh_item_animation(activity)
+    refresh_buffer_decorations(snapshot.buf)
+    handle_scheduler_action(session, action)
+    stop_spinner_if_idle()
+    notify(message .. "; Seal will retry after the project buffers are saved", level or vim.log.levels.WARN)
+    return true
+  end
+  if not activity_registered(activity) then
     return false
   end
-  if not activity or state.activities[activity.id] ~= activity then
-    return false
+  if state.buffer_errors[snapshot.buf] then
+    return defer("Seal could not reconcile the marked buffer; reload it before retrying")
+  end
+  if not sync_item_snapshot(activity, nil, true) then
+    return reject("The source buffer closed while Codex was starting")
+  end
+  if snapshot.anchor_ambiguous then
+    return reject("The marked context moved ambiguously; place the cursor and submit the prompt again")
   end
   if not snapshot_valid(snapshot) then
-    return fail("The source buffer changed while Codex was starting")
+    return defer("The source buffer or file changed while Codex was starting")
   end
   local modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
   if #modified > 0 then
-    return fail(
+    return defer(
       "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
       vim.log.levels.WARN
     )
@@ -3209,25 +4130,38 @@ local function start_agent(session, snapshot, prompt, activity)
   if config.save_before_agent and snapshot.modified and vim.api.nvim_buf_is_valid(snapshot.buf) then
     local source_file = snapshot.file
     local anchors = anchor_snapshot(snapshot)
+    activity.preserve_selection_edits = true
     local ok, err = pcall(vim.api.nvim_buf_call, snapshot.buf, function()
       vim.cmd("silent update")
     end)
     restore_snapshot_anchors(snapshot, anchors)
     if not ok then
-      return fail("Could not save the current buffer: " .. tostring(err), vim.log.levels.ERROR)
+      activity.preserve_selection_edits = nil
+      return defer("Could not save the current buffer: " .. tostring(err), vim.log.levels.ERROR)
     end
     if not vim.api.nvim_buf_is_valid(snapshot.buf) then
-      return fail("The source buffer closed while it was being saved", vim.log.levels.ERROR)
+      return reject("The source buffer closed while it was being saved", vim.log.levels.ERROR)
     end
     if vim.api.nvim_buf_get_name(snapshot.buf) ~= source_file then
-      return fail("The source buffer was renamed while it was being saved; run the prompt again")
+      return defer("The source buffer was renamed while it was being saved")
     end
-    snapshot = refresh_snapshot(snapshot)
-    if not snapshot then
-      return fail("The source buffer closed while it was being saved", vim.log.levels.ERROR)
+    local model = state.buffer_models[snapshot.buf]
+    if model then
+      -- The temporary context extmarks above survived the controlled save.
+      -- Use their restored position to resolve BufferModel ambiguity instead
+      -- of accepting the model's guessed replacement boundary.
+      model:resolve(activity.anchor_id, snapshot_anchor(snapshot))
     end
+    if not sync_item_snapshot(activity, nil, true) then
+      activity.preserve_selection_edits = nil
+      return reject("The source buffer closed while it was being saved", vim.log.levels.ERROR)
+    end
+    activity.preserve_selection_edits = nil
+    local saved_disk = disk_state(snapshot.file)
+    snapshot.file_stamp = saved_disk.stamp
+    snapshot.file_digest = saved_disk.digest
     if snapshot.modified or not buffer_matches_disk(snapshot.buf, snapshot.file) then
-      return fail(
+      return defer(
         "Save or format hooks left the buffer different from disk; save again before starting Codex",
         vim.log.levels.WARN
       )
@@ -3235,14 +4169,12 @@ local function start_agent(session, snapshot, prompt, activity)
     remember_file_baseline(snapshot.buf)
     modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
     if #modified > 0 then
-      return fail(
+      return defer(
         "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
         vim.log.levels.WARN
       )
     end
   end
-  local entry = session.current
-  activity.thread_id = session.thread_id
   activity.turn_id = nil
   activity.start_pending = true
   activity.provisional_turn_id = nil
@@ -3257,6 +4189,10 @@ local function start_agent(session, snapshot, prompt, activity)
     approvalsReviewer = config.main_approvals_reviewer,
   }
   local request_client = client()
+  local dispatched, dispatch_error = session.scheduler:mark_start_dispatched(lease_token)
+  if not dispatched then
+    return reject(error_message(dispatch_error, "could not dispatch Codex prompt"), vim.log.levels.ERROR)
+  end
   request_client:request("turn/start", params, function(result, err)
     if state.client ~= request_client or session.current ~= entry then
       return
@@ -3267,65 +4203,163 @@ local function start_agent(session, snapshot, prompt, activity)
         requeue_session_entry(session, entry)
         return
       end
-      remove_activity(activity)
+      local action, scheduler_error = session.scheduler:start_failed(lease_token, {
+        error = error_message(err, "could not start Codex turn"),
+      })
       notify(error_message(err, "could not start Codex turn"), vim.log.levels.ERROR)
-      complete_session_entry(session, entry)
+      remove_activity(activity)
+      if action then
+        handle_scheduler_action(session, action)
+      elseif scheduler_error then
+        notify(error_message(scheduler_error, "could not release failed Codex work"), vim.log.levels.ERROR)
+      end
       return
     end
-    activity.provisional_turn_id = result.turn.id
-    bind_session_entry_turn(session, entry, result.turn.id)
+    accept_start_response(session, entry, result.turn.id)
     notify("Prompt sent to Codex; use :SealChat to inspect it")
   end)
   return true
 end
 
 local function queue_entry_alive(entry)
-  if entry.mode == "declaration" then
-    return entry.job and state.jobs[entry.job.id] == entry.job and entry.job.phase == "generating"
+  return work_item_registered(entry)
+    and entry.state ~= "done"
+    and entry.state ~= "failed"
+    and entry.state ~= "cancelled"
+end
+
+handle_scheduler_action = function(session, action)
+  if not action then
+    return false
   end
-  return entry.activity and state.activities[entry.activity.id] == entry.activity
+  session.queue = session.scheduler.queue
+  if action.released then
+    local released_entry = session.current
+    session.current = nil
+    session.current_lease_token = nil
+    local external_turn_id = session.external_turn_id
+    session.busy = external_turn_id ~= nil
+    session.active_turn_id = external_turn_id
+    session.status = external_turn_id
+        and { type = "active", activeFlags = {} }
+      or { type = "idle" }
+    if released_entry
+      and (not work_item_registered(released_entry) or released_entry.terminal)
+    then
+      session.scheduler:forget(released_entry.id)
+      if released_entry.retired and work_item_registered(released_entry) then
+        work_store:remove(released_entry)
+      end
+    end
+  end
+  if session.scheduler:blocked_reason() then
+    session.settings_blocked = true
+  end
+  if action.next_item_id
+    and not session.current
+    and not session.busy
+    and not session.settings_blocked
+    and not session.preflight_blocked
+    and pump_session
+  then
+    vim.schedule(function()
+      if state.live[session.root] == session then
+        pump_session(session)
+      end
+    end)
+  end
+  return true
+end
+
+local function retry_preflight_blocked(session)
+  local item_id = session and session.preflight_blocked
+  if not item_id or not session.scheduler then
+    return false
+  end
+  local item = work_store:get(item_id)
+  if not item or item.terminal then
+    session.preflight_blocked = nil
+    pump_session(session)
+    return false
+  end
+  if item.state ~= "blocked" or not vim.api.nvim_buf_is_valid(item.snapshot.buf) then
+    return false
+  end
+  if state.buffer_errors[item.snapshot.buf]
+    or item.snapshot.anchor_ambiguous
+    or not snapshot_valid(item.snapshot)
+  then
+    return false
+  end
+  if #other_modified_project_buffers(item.snapshot.root, item.snapshot.buf) > 0 then
+    return false
+  end
+  local unblocked, unblock_error = session.scheduler:unblock_item(item.id)
+  if not unblocked then
+    notify(error_message(unblock_error, "could not retry blocked Seal prompt"), vim.log.levels.ERROR)
+    return false
+  end
+  session.preflight_blocked = nil
+  item.blocked_reason = nil
+  refresh_item_animation(item)
+  refresh_buffer_decorations(item.snapshot.buf)
+  return pump_session(session)
 end
 
 requeue_session_entry = function(session, entry)
-  if not session or session.current ~= entry or not queue_entry_alive(entry) then
+  if not session or session.current ~= entry or not session.scheduler then
+    return false
+  end
+  local lease = session.scheduler:current_lease()
+  if not lease or lease.item_id ~= entry.id then
+    return false
+  end
+  if entry.kind == "declaration" then
+    -- A rejected turn/start never applied its per-turn settings. If an
+    -- override event did arrive despite the error, session.settings differs
+    -- from the restore target and the normal restore path still runs.
+    entry.declaration_override_pending = nil
+  end
+  local action, err = session.scheduler:start_failed(lease.token, {
+    retry = true,
+    error = "another Codex turn won the start race",
+  })
+  if not action then
+    notify(error_message(err, "could not requeue Seal work"), vim.log.levels.ERROR)
     return false
   end
   if entry.turn_id then
-    state.owned_turns[entry.turn_id] = nil
+    set_owned_turn(entry.turn_id, nil)
   end
-  if entry.mode == "declaration" then
-    local job = entry.job
-    if job.thread_id and state.jobs_by_thread[job.thread_id] == job then
-      state.jobs_by_thread[job.thread_id] = nil
-    end
-    job.thread_id = nil
-    job.turn_id = nil
-  else
-    entry.activity.thread_id = nil
-    entry.activity.turn_id = nil
-    entry.activity.start_pending = false
-    entry.activity.provisional_turn_id = nil
+  if entry.kind == "declaration" and entry.thread_id and state.jobs_by_thread[entry.thread_id] == entry then
+    state.jobs_by_thread[entry.thread_id] = nil
   end
+  entry.thread_id = nil
+  entry.turn_id = nil
+  entry.start_pending = false
+  entry.provisional_turn_id = nil
   entry.turn_id = nil
   entry.confirmed_turn = nil
   entry.client_id = nil
-  entry.policy_overridden = nil
-  entry.restore_settings = nil
-  entry.settings_restore_started = nil
-  entry.settings_restored = nil
-  entry.settings_restore_failed = nil
-  entry.retry_after_restore = nil
-  entry.turn_completed = nil
-  session.current = nil
-  session.active_turn_id = session.external_turn_id
-  session.busy = session.external_turn_id ~= nil
-    or (session.status and session.status.type == "active" or false)
-  table.insert(session.queue, entry)
-  table.sort(session.queue, function(left, right)
-    return left.id < right.id
-  end)
-  if not session.busy then
-    pump_session(session)
+  entry.retry_after_restore = action.waiting_for_restore or nil
+  local unbound = session.unbound_turns or {}
+  session.unbound_turns = {}
+  for turn_id, observed in pairs(unbound) do
+    if session.pending_server_requests then
+      session.pending_server_requests[turn_id] = nil
+    end
+    if observed.completed then
+      session.scheduler:discard_turn_events(turn_id)
+    else
+      session.scheduler:discard_turn_events(turn_id)
+      session.external_turn_id = turn_id
+      session.active_turn_id = turn_id
+    end
+  end
+  if action.waiting_for_restore then
+    restore_main_thread_settings(session, entry)
+  else
+    handle_scheduler_action(session, action)
   end
   return true
 end
@@ -3334,44 +4368,67 @@ local function enqueue_session_entry(session, entry)
   if state.live[session.root] ~= session or not queue_entry_alive(entry) then
     return false
   end
-  local inserted = false
-  for index, queued in ipairs(session.queue) do
-    if entry.id < queued.id then
-      table.insert(session.queue, index, entry)
-      inserted = true
-      break
-    end
+  local queued, err = session.scheduler:enqueue_item(entry)
+  if not queued then
+    notify(error_message(err, "could not queue Seal work"), vim.log.levels.ERROR)
+    return false
   end
-  if not inserted then
-    table.insert(session.queue, entry)
-  end
+  entry.awaiting_session = nil
+  session.queue = session.scheduler.queue
   pump_session(session)
+  refresh_item_animation(entry)
+  refresh_buffer_decorations(entry.snapshot.buf)
+  ensure_spinner()
+  stop_spinner_if_idle()
   return true
 end
 
 pump_session = function(session)
-  if state.live[session.root] ~= session or session.current or session.busy or session.settings_blocked then
+  if state.live[session.root] ~= session
+    or session.current
+    or session.busy
+    or session.settings_blocked
+    or session.preflight_blocked
+  then
     return false
   end
-  while #session.queue > 0 do
-    local entry = table.remove(session.queue, 1)
-    if queue_entry_alive(entry) then
-      session.current = entry
-      session.busy = true
-      session.status = { type = "active", activeFlags = {} }
-      local started
-      if entry.mode == "declaration" then
-        started = start_declaration(session, entry.snapshot, entry.route, entry.job)
-      else
-        started = start_agent(session, entry.snapshot, entry.prompt, entry.activity)
-      end
-      if not started and session.current == entry then
-        complete_session_entry(session, entry)
-      end
-      return started
+  local lease, lease_error = session.scheduler:start_next()
+  if not lease then
+    if lease_error and lease_error.code ~= "scheduler_blocked" then
+      notify(error_message(lease_error, "could not schedule Seal work"), vim.log.levels.ERROR)
+    end
+    return false
+  end
+  local entry = work_store:get(lease.item_id)
+  if not entry then
+    local action = session.scheduler:start_failed(lease.token, { error = "work item disappeared" })
+    handle_scheduler_action(session, action)
+    return false
+  end
+  session.current = entry
+  session.current_lease_token = lease.token
+  session.busy = true
+  session.status = { type = "active", activeFlags = {} }
+  refresh_item_animation(entry)
+  refresh_buffer_decorations(entry.snapshot.buf)
+  ensure_spinner()
+  local started
+  if entry.kind == "declaration" then
+    started = start_declaration(session, entry.snapshot, entry.route, entry)
+  else
+    started = start_agent(session, entry.snapshot, entry.prompt, entry)
+  end
+  if not started and session.current == entry then
+    local action, err = session.scheduler:start_failed(lease.token, {
+      error = "Seal preflight rejected the work item",
+    })
+    if not action then
+      notify(error_message(err, "could not finish rejected Seal work"), vim.log.levels.ERROR)
+    else
+      handle_scheduler_action(session, action)
     end
   end
-  return false
+  return started
 end
 
 function M.submit(text, opts)
@@ -3389,6 +4446,14 @@ function M.submit(text, opts)
     notify("The source buffer or file changed while the prompt was open", vim.log.levels.WARN)
     return false
   end
+  local pending_limit = math.max(1, math.floor(tonumber(config.max_pending_items) or defaults.max_pending_items))
+  if work_store:count({ root = snapshot.root, terminal = false }) >= pending_limit then
+    notify(
+      string.format("Seal already has %d pending requests in this project; finish or reject one first", pending_limit),
+      vim.log.levels.WARN
+    )
+    return false
+  end
   if submitting_review and submitting_review.view then
     submitting_review.view:close()
     submitting_review.view = nil
@@ -3396,46 +4461,65 @@ function M.submit(text, opts)
   end
   local declaration_job
   local agent_activity
-  state.submission_sequence = state.submission_sequence + 1
-  local submission_id = state.submission_sequence
   if route.mode == "declaration" then
-    for _, existing in pairs(state.jobs) do
-      local position = job_position(existing)
-      if existing.snapshot.buf == snapshot.buf and position and position[1] == snapshot.row then
-        notify("A Seal job already exists on this line", vim.log.levels.WARN)
-        return false
-      end
+    local item, create_error = work_store:create({
+      kind = "declaration",
+      root = snapshot.root,
+      buffer = snapshot.buf,
+      request = { route = route, prompt = route.prompt },
+      fields = {
+        mode = route.mode,
+        phase = "generating",
+        awaiting_session = true,
+        snapshot = snapshot,
+        declaration_kind = route.kind,
+        route = route,
+        summary = summary_text(route.kind, route.prompt),
+      },
+    })
+    if not item then
+      notify(error_message(create_error, "could not create declaration work"), vim.log.levels.ERROR)
+      return false
     end
-    state.job_sequence = state.job_sequence + 1
-    declaration_job = {
-      id = state.job_sequence,
-      phase = "generating",
-      snapshot = snapshot,
-      kind = route.kind,
-      summary = summary_text(route.kind, route.prompt),
-    }
+    declaration_job = item
+    state.job_sequence = item.legacy_id
     if not add_job(declaration_job) then
       notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
       return false
     end
     notify("Codex is generating one " .. route.kind .. "…")
   else
-    agent_activity = add_activity(snapshot, route.label or "Codex", route.prompt)
+    local item, create_error = work_store:create({
+      kind = "agent",
+      root = snapshot.root,
+      buffer = snapshot.buf,
+      request = { route = route, prompt = route.prompt },
+      fields = {
+        mode = route.mode,
+        phase = "generating",
+        awaiting_session = true,
+        snapshot = snapshot,
+        route = route,
+        prompt = routed_agent_prompt(route),
+        summary = summary_text(route.label or "Codex", route.prompt),
+      },
+    })
+    if not item then
+      notify(error_message(create_error, "could not create agent work"), vim.log.levels.ERROR)
+      return false
+    end
+    agent_activity = add_activity(item)
     if not agent_activity then
       notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
       return false
     end
+    state.activity_sequence = item.legacy_id
   end
+  local work_item = declaration_job or agent_activity
+  local submission_id = work_item.id
+  state.submission_sequence = submission_id
   with_session_status(snapshot.root, function(session)
-    enqueue_session_entry(session, {
-      id = submission_id,
-      mode = route.mode,
-      snapshot = snapshot,
-      route = route,
-      job = declaration_job,
-      activity = agent_activity,
-      prompt = route.mode == "agent" and routed_agent_prompt(route) or nil,
-    })
+    enqueue_session_entry(session, work_item)
   end, function()
     if declaration_job then
       cancel_job(declaration_job, false)
@@ -3460,144 +4544,147 @@ function M.prompt(opts)
 end
 
 local function selected_job(job_id)
+  if type(job_id) == "table" then
+    return job_registered(job_id) and job_id or nil
+  end
   if type(job_id) == "number" then
     return state.jobs[job_id]
   end
   return job_at_cursor(vim.api.nvim_get_current_buf())
 end
 
-local function rebase_job(job, changedtick)
-  if job.invalidated then
+sync_item_snapshot = function(item, changedtick, include_context)
+  if item.invalidated or not vim.api.nvim_buf_is_valid(item.snapshot.buf) then
     return false
   end
-  local position = job_position(job)
-  if not position or not vim.api.nvim_buf_is_valid(job.snapshot.buf) then
+  if state.buffer_errors[item.snapshot.buf] then
     return false
   end
-  local line = vim.api.nvim_buf_get_lines(job.snapshot.buf, position[1], position[1] + 1, false)[1] or ""
-  job.snapshot.row = position[1]
-  job.snapshot.column = math.min(position[2], #line)
-  job.snapshot.line = line
-  job.snapshot.replace_blank = line:match("^%s*$") ~= nil
-  job.snapshot.base_indent = line:match("^%s*") or ""
-  job.snapshot.changedtick = changedtick
-  job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = job.snapshot.buf })
-  job.snapshot.source_lines = vim.api.nvim_buf_get_lines(job.snapshot.buf, 0, -1, false)
-  return true
-end
-
-local function rebase_reloaded_job(job, changedtick, current_disk)
-  local snapshot = job.snapshot
-  if job.invalidated or not snapshot.source_lines or not vim.api.nvim_buf_is_valid(snapshot.buf) then
-    return false
-  end
-  if vim.api.nvim_buf_get_name(snapshot.buf) ~= snapshot.file then
+  local model = state.buffer_models[item.snapshot.buf]
+  local context = model and item.anchor_id and model:context(item.anchor_id, {
+    include_selection_text = include_context,
+  }) or nil
+  if not context then
     return false
   end
 
-  local new_lines = vim.api.nvim_buf_get_lines(snapshot.buf, 0, -1, false)
-  local mapped_row = map_formatted_row(snapshot.source_lines, new_lines, snapshot.row)
-  if mapped_row == nil or (new_lines[mapped_row + 1] or "") ~= snapshot.line then
-    return false
-  end
-
-  if snapshot.selection_range then
-    local old_first = snapshot.selection_range.line1
-    local old_last = snapshot.selection_range.line2
-    local mapped_first = map_formatted_row(snapshot.source_lines, new_lines, old_first - 1)
-    local mapped_last = map_formatted_row(snapshot.source_lines, new_lines, old_last - 1)
-    if mapped_first == nil
-      or mapped_last == nil
-      or not vim.deep_equal(
-        vim.list_slice(snapshot.source_lines, old_first, old_last),
-        vim.list_slice(new_lines, mapped_first + 1, mapped_last + 1)
-      )
-    then
+  local position = model:position(item.anchor_id)
+  local function selection_point_lost(point)
+    local ambiguity = point and point.ambiguity
+    if not ambiguity then
       return false
     end
-    snapshot.selection_range = { line1 = mapped_first + 1, line2 = mapped_last + 1 }
-    snapshot.selection = capture_selection(snapshot.buf, mapped_first + 1, mapped_last + 1)
+    if not item.preserve_selection_edits then
+      return true
+    end
+    return ambiguity.reason == "line-deleted" or ambiguity.reason == "duplicate-line"
+  end
+  if position.selection
+    and (selection_point_lost(position.selection.start) or selection_point_lost(position.selection.finish))
+  then
+    model:set_selection(item.anchor_id, nil)
+    context = model:context(item.anchor_id, { include_selection_text = include_context })
+    position = model:position(item.anchor_id)
   end
 
-  snapshot.row = mapped_row
-  snapshot.column = math.min(snapshot.column, #snapshot.line)
-  snapshot.changedtick = changedtick
+  local snapshot = item.snapshot
+  snapshot.row = context.row
+  snapshot.column = context.column
+  snapshot.line = context.line
+  snapshot.replace_blank = context.line:match("^%s*$") ~= nil
+  snapshot.base_indent = context.line:match("^%s*") or ""
+  snapshot.changedtick = changedtick or vim.api.nvim_buf_get_changedtick(snapshot.buf)
   snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = snapshot.buf })
-  snapshot.file_stamp = current_disk.stamp
-  snapshot.file_digest = current_disk.digest
-  snapshot.source_lines = new_lines
-  local excerpt_text, excerpt_first, excerpt_last = bounded_excerpt(new_lines, mapped_row + 1, snapshot.selection)
-  snapshot.excerpt = excerpt_text
-  snapshot.excerpt_first = excerpt_first
-  snapshot.excerpt_last = excerpt_last
+  snapshot.filetype = vim.api.nvim_get_option_value("filetype", { buf = snapshot.buf })
+  snapshot.buffer_revision = context.revision
+  snapshot.anchor_ambiguous = position.ambiguity ~= nil
+  snapshot.anchor_ambiguity = position.ambiguity
 
-  if job.extmark then
-    pcall(vim.api.nvim_buf_del_extmark, snapshot.buf, activity_namespace, job.extmark)
-  end
-  job.extmark = nil
-  local ok, extmark = pcall(vim.api.nvim_buf_set_extmark, snapshot.buf, activity_namespace, mapped_row, snapshot.column, {
-    right_gravity = true,
-    strict = false,
-    undo_restore = true,
-  })
-  if not ok then
-    return false
-  end
-  job.extmark = extmark
-  if job.phase == "ready" then
-    return render_preview(job, job.lines, true)
-  end
-  return render_spinner(job)
-end
-
-local function rebase_selection(snapshot, first, last, new_last)
-  local selection = snapshot.selection_range
-  if not selection then
-    return true
-  end
-  local selection_first = selection.line1 - 1
-  local selection_last = selection.line2
-  local insertion = first == last
-  local intersects
-  if insertion then
-    intersects = first > selection_first and first < selection_last
+  if context.selection then
+    snapshot.selection_range = {
+      line1 = context.selection.start.row + 1,
+      line2 = context.selection.finish.row + 1,
+    }
+    if include_context then
+      local selection_budget = math.floor(math.max(0, config.max_context_chars) / 2)
+      snapshot.selection = truncate_text(context.selection.text or "", selection_budget)
+    end
   else
-    intersects = first < selection_last and last > selection_first
-  end
-  if intersects then
     snapshot.selection = nil
     snapshot.selection_range = nil
-    return true
   end
-  if last <= selection_first then
-    local delta = new_last - last
-    selection.line1 = selection.line1 + delta
-    selection.line2 = selection.line2 + delta
+
+  if include_context then
+    local lines = model:lines()
+    local excerpt_text, excerpt_first, excerpt_last = bounded_excerpt(
+      lines,
+      math.min(context.row + 1, #lines),
+      snapshot.selection
+    )
+    snapshot.excerpt = excerpt_text
+    snapshot.excerpt_first = excerpt_first
+    snapshot.excerpt_last = excerpt_last
   end
   return true
+end
+
+local function rebase_job(job, changedtick)
+  return sync_item_snapshot(job, changedtick, false)
 end
 
 reconcile_buffer_lines = function(buf, changedtick, first, last, new_last)
-  local stale = {}
-  for _, job in pairs(state.jobs) do
-    if job.snapshot.buf == buf and not job.invalidated then
-      rebase_selection(job.snapshot, first, last, new_last)
-      local target_rebased = rebase_job(job, changedtick)
-      if not target_rebased then
-        job.invalidated = true
-        job.invalidation_reason = "The marked insertion point disappeared; Seal job cancelled"
-        table.insert(stale, job)
+  local model = state.buffer_models[buf]
+  if not model then
+    return
+  end
+  -- Incremental ranges are relative to the immediately previous buffer
+  -- revision. Once one is missed, only a full-snapshot reconciliation can
+  -- safely recover the model.
+  if state.buffer_errors[buf] then
+    return
+  end
+  local direct_limit = math.max(0, math.floor(tonumber(config.direct_reconcile_lines) or 0))
+  local direct = (last - first) <= direct_limit and (new_last - first) <= direct_limit
+  local ok, reconcile_error
+  if direct then
+    local replacement = vim.api.nvim_buf_get_lines(buf, first, new_last, false)
+    ok, reconcile_error = pcall(model.reconcile_edit, model, first, last, replacement)
+  else
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    ok, reconcile_error = pcall(model.reconcile, model, first, last, new_last, lines)
+  end
+  if not ok then
+    state.buffer_errors[buf] = tostring(reconcile_error)
+    notify("Could not reconcile Seal anchors; affected requests are blocked: " .. tostring(reconcile_error), vim.log.levels.ERROR)
+    refresh_buffer_decorations(buf)
+    return
+  end
+  state.buffer_errors[buf] = nil
+  local stale_activities = {}
+  for _, item in pairs(state.buffer_items[buf] or {}) do
+    if item.kind == "declaration" and not item.invalidated then
+      if not sync_item_snapshot(item, changedtick, false) then
+        item.invalidated = true
+        item.invalidation_reason = "The marked insertion point disappeared; Seal job needs to be discarded"
       end
+    elseif item.kind == "agent" and not sync_item_snapshot(item, changedtick, false) then
+      table.insert(stale_activities, item)
     end
   end
-  schedule_job_cancellation(stale)
+  for _, activity in ipairs(stale_activities) do
+    remove_activity(activity)
+  end
+  refresh_buffer_decorations(buf)
 end
 
 reconcile_buffer_tick = function(buf, changedtick)
-  for _, job in pairs(state.jobs) do
-    if job.snapshot.buf == buf and not job.invalidated then
-      job.snapshot.changedtick = changedtick
-      job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = buf })
+  if state.buffer_errors[buf] then
+    return
+  end
+  for _, item in pairs(state.buffer_items[buf] or {}) do
+    if not item.invalidated then
+      item.snapshot.changedtick = changedtick
+      item.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = buf })
     end
   end
 end
@@ -3612,13 +4699,16 @@ function M.accept(job_id)
     notify_job_invalidation(job)
     return false
   end
-  if job.phase ~= "ready" then
-    notify("That Seal job is still generating", vim.log.levels.INFO)
-    return false
-  end
   local snapshot = job.snapshot
   if vim.api.nvim_get_current_buf() ~= snapshot.buf then
     notify("Return to the source buffer before accepting", vim.log.levels.WARN)
+    return false
+  end
+  if state.buffer_errors[snapshot.buf] then
+    if job.phase == "ready" then
+      render_preview(job, nil, true)
+    end
+    notify("Could not accept the declaration until the buffer is reloaded", vim.log.levels.ERROR)
     return false
   end
   local position = job_position(job)
@@ -3626,27 +4716,152 @@ function M.accept(job_id)
     snapshot.row = position[1]
     snapshot.column = position[2]
   end
-  if not snapshot_valid(snapshot) then
-    cancel_job(job, false)
-    notify("The buffer or file changed; result discarded", vim.log.levels.WARN)
+
+  if snapshot.anchor_ambiguous then
+    local model = state.buffer_models[snapshot.buf]
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local resolved_row = cursor[1] - 1
+    local resolved_column = cursor[2]
+    if position
+      and position[1] == vim.api.nvim_buf_line_count(snapshot.buf)
+      and cursor[1] == vim.api.nvim_buf_line_count(snapshot.buf)
+    then
+      resolved_row = position[1]
+      resolved_column = 0
+    end
+    if not model or not model:resolve(job.anchor_id, {
+      row = resolved_row,
+      column = resolved_column,
+      affinity = "right",
+      selection = false,
+    }) or not sync_item_snapshot(job, nil, false) then
+      notify("Could not re-anchor this Seal result", vim.log.levels.ERROR)
+      return false
+    end
+    job.apply_blocked_reason = nil
+    refresh_buffer_decorations(snapshot.buf, true)
+    local session = state.live[job.root or snapshot.root]
+    local resumed = false
+    if session and session.preflight_blocked == job.id then
+      resumed = retry_preflight_blocked(session)
+    end
+    notify(resumed and "Insertion point re-anchored; Codex request resumed"
+      or "Insertion point re-anchored; press Tab again to accept")
     return false
   end
-  local valid, reason = validate_declaration(snapshot, job.lines, job.kind)
+
+  if job.phase ~= "ready" then
+    notify("That Seal job is still generating", vim.log.levels.INFO)
+    return false
+  end
+
+  sync_item_snapshot(job, nil, false)
+  job.apply_blocked_reason = nil
+  local safety_reason = preview_safety_reason(snapshot)
+  if safety_reason then
+    job.apply_blocked_reason = safety_reason
+    render_preview(job, nil, true)
+    notify("Could not accept the declaration: " .. safety_reason, vim.log.levels.WARN)
+    return false
+  end
+  if not vim.api.nvim_get_option_value("modifiable", { buf = snapshot.buf }) then
+    job.apply_blocked_reason = "The source buffer is not modifiable"
+    render_preview(job, nil, true)
+    notify("Could not accept the declaration: the source buffer is not modifiable", vim.log.levels.ERROR)
+    return false
+  end
+  local valid, reason = validate_declaration(snapshot, job.lines, job.declaration_kind)
   if not valid then
-    cancel_job(job, false)
-    notify("Declaration rejected after another edit: " .. reason, vim.log.levels.ERROR)
+    job.apply_blocked_reason = "Declaration no longer validates: " .. reason
+    render_preview(job, nil, true)
+    notify(job.apply_blocked_reason, vim.log.levels.ERROR)
     return false
   end
 
   local buf = snapshot.buf
   local row = snapshot.row
   local last = snapshot.replace_blank and row + 1 or row
-  cancel_job(job, false)
+  local collocated = {}
+  if snapshot.replace_blank then
+    for _, sibling in pairs(state.buffer_items[buf] or {}) do
+      if sibling ~= job and item_registered(sibling) then
+        local sibling_position = job_position(sibling)
+        if sibling_position and sibling_position[1] == row and sibling_position[2] == snapshot.column then
+          table.insert(collocated, {
+            item = sibling,
+            ambiguous = sibling.snapshot.anchor_ambiguous == true,
+          })
+        end
+      end
+    end
+  end
+  local session = state.live[job.root or snapshot.root]
+  local scheduler = session and session.scheduler
+  local applying, apply_state_error
+  if scheduler and scheduler:canonical_item(job.id) == job then
+    applying, apply_state_error = scheduler:begin_apply(job.id)
+  else
+    applying, apply_state_error = transition_work_item(job, "applying")
+  end
+  if not applying then
+    notify(error_message(apply_state_error, "Could not begin applying the declaration"), vim.log.levels.ERROR)
+    return false
+  end
+  job.phase = "applying"
   local ok, insert_error = pcall(vim.api.nvim_buf_set_lines, buf, row, last, false, job.lines)
   if not ok then
+    if scheduler and scheduler:canonical_item(job.id) == job then
+      scheduler:apply_failed(job.id, tostring(insert_error))
+    else
+      transition_work_item(job, "preview", { apply_error = tostring(insert_error), preview = job.preview })
+    end
+    job.phase = "ready"
+    job.apply_blocked_reason = "Editor rejected the insertion: " .. tostring(insert_error)
+    render_preview(job, nil, true)
     notify("Could not insert the declaration: " .. tostring(insert_error), vim.log.levels.ERROR)
     return false
   end
+  if #collocated > 0 and not state.buffer_errors[buf] then
+    local model = state.buffer_models[buf]
+    local boundary = math.min(row + #job.lines, vim.api.nvim_buf_line_count(buf))
+    for _, candidate in ipairs(collocated) do
+      local sibling = candidate.item
+      if item_registered(sibling) and model then
+        local method = candidate.ambiguous and model.relocate or model.resolve
+        local moved_ok, moved = pcall(method, model, sibling.anchor_id, {
+          row = boundary,
+          column = 0,
+          affinity = "right",
+          selection = false,
+        })
+        if not moved_ok then
+          state.buffer_errors[buf] = tostring(moved)
+          notify(
+            "Declaration inserted, but sibling anchors need a reload: " .. tostring(moved),
+            vim.log.levels.ERROR
+          )
+          break
+        elseif moved then
+          sync_item_snapshot(sibling, nil, false)
+        end
+      end
+    end
+    refresh_buffer_decorations(buf, true)
+  end
+  local completed, completion_error
+  if scheduler and scheduler:canonical_item(job.id) == job then
+    completed, completion_error = scheduler:apply_succeeded(job.id)
+  else
+    completed, completion_error = transition_work_item(job, "done")
+  end
+  if not completed then
+    notify(error_message(completion_error, "Declaration inserted, but Seal could not finalize the work item"), vim.log.levels.ERROR)
+    return false
+  end
+  if scheduler then
+    scheduler:forget(job.id)
+  end
+  detach_job(job)
   notify("Declaration inserted")
   return true
 end
@@ -3754,19 +4969,24 @@ function M.new_thread()
       notify("Wait for the active Codex turn before starting a new thread", vim.log.levels.WARN)
       return
     end
+    if previous then
+      revoke_root_ownership(root, "cancel")
+    end
 
     local function start_new()
       clear_activities(function(activity)
         return activity.root == root
-      end)
+      end, false)
       clear_jobs(function(job)
         return job.snapshot.root == root
       end, false)
+      purge_retired_work(root)
       if previous then
         clear_reviews(function(review)
           return review.thread_id == previous.thread_id
         end)
         clear_command_requests(previous.thread_id)
+        clear_pending_unowned_requests(previous.thread_id)
       end
       state.live[root] = nil
       state.sessions[root] = nil
@@ -3801,6 +5021,7 @@ function M.stop()
   clear_activities()
   clear_reviews(nil, "cancel")
   clear_command_requests(nil, nil, "cancel")
+  purge_retired_work()
   stop_spinner_if_idle()
   close_chat()
   local stopped_client = state.client
@@ -3810,11 +5031,12 @@ function M.stop()
     stopped_client:stop()
   end
   state.live = {}
-  state.owned_turns = {}
-  state.owned_threads = {}
+  reset_ownership()
   state.approval_items = {}
   state.accepted_file_items = {}
   state.resolved_requests = {}
+  state.pending_unowned_requests = {}
+  state.pending_unowned_request_sequence = 0
   state.stopping = false
 end
 
@@ -3823,17 +5045,33 @@ function M.status()
   local session = state.live[root]
   local generating = 0
   local ready = 0
+  local queued = 0
+  local blocked = 0
+  local running = 0
+  local applying = 0
   for _, job in pairs(state.jobs) do
-    if job.phase == "generating" then
+    if job.root == root and job.phase == "generating" then
       generating = generating + 1
-    elseif job.phase == "ready" then
+    elseif job.root == root and job.phase == "ready" then
       ready = ready + 1
     end
   end
   for _, activity in pairs(state.activities) do
-    if activity.phase == "generating" then
+    if activity.root == root and activity.phase == "generating" then
       generating = generating + 1
     end
+  end
+  for _, item in pairs(state.items) do
+    if item.root == root then
+      queued = queued + (item.state == "queued" and 1 or 0)
+      blocked = blocked + (item.state == "blocked" and 1 or 0)
+      running = running + ((item.state == "starting" or item.state == "running") and 1 or 0)
+      applying = applying + (item.state == "applying" and 1 or 0)
+    end
+  end
+  local pending_reviews = 0
+  for _, review in pairs(state.reviews) do
+    pending_reviews = pending_reviews + (review.root == root and 1 or 0)
   end
   return {
     root = root,
@@ -3843,7 +5081,11 @@ function M.status()
     preview = ready > 0,
     generating_count = generating,
     preview_count = ready,
-    pending_reviews = vim.tbl_count(state.reviews),
+    queued_count = queued,
+    blocked_count = blocked,
+    running_count = running,
+    applying_count = applying,
+    pending_reviews = pending_reviews,
     remote = state.client and state.client:url() or nil,
   }
 end
@@ -3861,14 +5103,16 @@ function M.setup(opts)
     if previous_client then
       clear_jobs(nil, true)
       clear_activities()
+      purge_retired_work()
       clear_reviews(nil, "cancel")
       clear_command_requests(nil, nil, "cancel")
       state.live = {}
-      state.owned_turns = {}
-      state.owned_threads = {}
+      reset_ownership()
       state.approval_items = {}
       state.accepted_file_items = {}
       state.resolved_requests = {}
+      state.pending_unowned_requests = {}
+      state.pending_unowned_request_sequence = 0
     end
     state.client = opts.client
     state.loading = {}
@@ -3919,25 +5163,54 @@ function M.setup(opts)
         if matches_disk then
           remember_file_baseline(args.buf)
         end
-        local stale = {}
-        for _, job in pairs(state.jobs) do
-          if job.snapshot.buf == args.buf
-            and (not matches_disk or not rebase_reloaded_job(job, changedtick, current_disk))
-          then
-            table.insert(stale, job)
+        local model = state.buffer_models[args.buf]
+        local reconciled = true
+        if model then
+          local old_lines = model:lines()
+          local new_lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
+          local ok, reconcile_error = pcall(
+            model.reconcile,
+            model,
+            0,
+            #old_lines,
+            #new_lines,
+            new_lines
+          )
+          if not ok then
+            reconciled = false
+            state.buffer_errors[args.buf] = tostring(reconcile_error)
+            notify(
+              "Could not reconcile Seal anchors after reload; affected requests are blocked: "
+                .. tostring(reconcile_error),
+              vim.log.levels.ERROR
+            )
+          else
+            state.buffer_errors[args.buf] = nil
           end
         end
-        if has_buffer_jobs(args.buf) then
+        for _, job in pairs(state.jobs) do
+          if reconciled and job.snapshot.buf == args.buf and sync_item_snapshot(job, changedtick, false) then
+            if matches_disk then
+              job.snapshot.file_stamp = current_disk.stamp
+              job.snapshot.file_digest = current_disk.digest
+            end
+          end
+        end
+        for _, activity in pairs(state.activities) do
+          if reconciled and activity.snapshot.buf == args.buf and sync_item_snapshot(activity, changedtick, false) then
+            if matches_disk then
+              activity.snapshot.file_stamp = current_disk.stamp
+              activity.snapshot.file_digest = current_disk.digest
+            end
+          end
+        end
+        refresh_buffer_decorations(args.buf)
+        if has_buffer_items(args.buf) then
           ensure_job_buffer(args.buf)
         end
-        for _, job in ipairs(stale) do
-          if cancel_job(job, true) then
-            notify_job_invalidation(job)
-          end
+        if reconciled then
+          retry_preflight_blocked(state.live[root_for_buffer(args.buf)])
         end
-        clear_activities(function(activity)
-          return activity.snapshot.buf == args.buf
-        end)
         return
       end
       local path = vim.api.nvim_buf_get_name(args.buf)
@@ -3950,13 +5223,24 @@ function M.setup(opts)
       local stale = {}
       for _, job in pairs(state.jobs) do
         if job.snapshot.buf == args.buf then
-          if not matches_disk or not rebase_job(job, changedtick) then
+          if not rebase_job(job, changedtick) then
             table.insert(stale, job)
           else
-            job.snapshot.file_stamp = current_disk.stamp
-            job.snapshot.file_digest = current_disk.digest
+            if matches_disk then
+              job.snapshot.file_stamp = current_disk.stamp
+              job.snapshot.file_digest = current_disk.digest
+            end
             job.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = args.buf })
           end
+        end
+      end
+      for _, activity in pairs(state.activities) do
+        if activity.snapshot.buf == args.buf and sync_item_snapshot(activity, changedtick, false) then
+          if matches_disk then
+            activity.snapshot.file_stamp = current_disk.stamp
+            activity.snapshot.file_digest = current_disk.digest
+          end
+          activity.snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = args.buf })
         end
       end
       for _, job in ipairs(stale) do
@@ -3964,6 +5248,8 @@ function M.setup(opts)
           notify_job_invalidation(job)
         end
       end
+      refresh_buffer_decorations(args.buf)
+      retry_preflight_blocked(state.live[root_for_buffer(args.buf)])
     end,
   })
   vim.api.nvim_create_autocmd({
@@ -4027,16 +5313,24 @@ M._excerpt = excerpt
 M._state = state
 M._reset = function()
   M.stop()
+  work_store = WorkItems.new()
   state.client = nil
   state.sessions = {}
   state.live = {}
   state.loading = {}
-  state.jobs = {}
+  state.work_items = work_store
+  state.items = work_store.items
+  state.jobs = work_store.jobs
   state.jobs_by_thread = {}
-  state.activities = {}
+  state.activities = work_store.activities
+  state.buffer_models = {}
+  state.buffer_errors = {}
+  state.buffer_items = {}
   state.job_mappings = {}
+  state.job_buffers = {}
   state.spinner_timer = nil
   state.spinner_frame = 1
+  state.animated_items = {}
   state.job_sequence = 0
   state.activity_sequence = 0
   state.submission_sequence = 0
@@ -4044,11 +5338,12 @@ M._reset = function()
   state.preview = nil
   state.chat = nil
   state.chat_request = 0
-  state.owned_turns = {}
-  state.owned_threads = {}
+  reset_ownership()
   state.approval_items = {}
   state.accepted_file_items = {}
   state.resolved_requests = {}
+  state.pending_unowned_requests = {}
+  state.pending_unowned_request_sequence = 0
   state.reviews = {}
   state.command_requests = {}
   state.review_sequence = 0

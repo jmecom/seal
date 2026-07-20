@@ -6,6 +6,9 @@ build:
 test:
 	go test ./...
 	nvim --headless -u NONE -l tests/client_spec.lua
+	nvim --headless -u NONE -l tests/buffer_model_spec.lua
+	nvim --headless -u NONE -l tests/work_items_spec.lua
+	nvim --headless -u NONE -l tests/seal_scheduler_spec.lua
 	nvim --headless -u NONE -l tests/seal_spec.lua
 
 smoke: build
