@@ -8,6 +8,10 @@ local WorkItems = require("seal.work_items")
 local M = {}
 local activity_namespace = vim.api.nvim_create_namespace("seal-activity")
 local context_namespace = vim.api.nvim_create_namespace("seal-context")
+local bounded_agent_prefixes = {
+  targeted = true,
+  refactor = true,
+}
 
 local defaults = {
   codex_command = "codex",
@@ -44,16 +48,30 @@ local defaults = {
     impl = "implementation",
   },
   agent_prefixes = {
-    targeted = table.concat({
-      "Make a targeted change that does the minimum necessary to fulfill the request.",
-      "Avoid unrelated refactors, cleanup, renames, formatting changes, or behavior changes.",
-      "Preserve the existing design and conventions unless the request requires changing them.",
-    }, " "),
-    refactor = table.concat({
-      "Perform only the requested refactor using the smallest structural change necessary.",
-      "Preserve existing behavior and public APIs unless the request explicitly requires changing them.",
-      "Do not add features, fix unrelated bugs, rename unrelated symbols, reformat unrelated code, or perform adjacent cleanup.",
-    }, " "),
+    targeted = {
+      bounded_patch = true,
+      instruction = table.concat({
+        "Make a targeted change that does the minimum necessary to fulfill the request.",
+        "Avoid unrelated refactors, cleanup, renames, formatting changes, or behavior changes.",
+        "Preserve the existing design and conventions unless the request requires changing them.",
+        "Read and search the repository as needed, but do not run tests, builds, linters, formatters, or other verification commands.",
+        "Do not delegate this request to subagents.",
+        "Propose exactly one file-change patch, which may include multiple files.",
+        "After that patch is applied, stop immediately without testing, inspecting the result, or proposing another patch.",
+      }, " "),
+    },
+    refactor = {
+      bounded_patch = true,
+      instruction = table.concat({
+        "Perform only the requested refactor using the smallest structural change necessary.",
+        "Preserve existing behavior and public APIs unless the request explicitly requires changing them.",
+        "Do not add features, fix unrelated bugs, rename unrelated symbols, reformat unrelated code, or perform adjacent cleanup.",
+        "Read and search the repository as needed, but do not run tests, builds, linters, formatters, or other verification commands.",
+        "Do not delegate this request to subagents.",
+        "Propose exactly one file-change patch, which may include multiple files.",
+        "After that patch is applied, stop immediately without testing, inspecting the result, or proposing another patch.",
+      }, " "),
+    },
   },
   declaration_instructions = {
     interface = table.concat({
@@ -501,6 +519,33 @@ local function turn_sandbox_policy(mode)
   return nil
 end
 
+local function normalized_sandbox_policy(policy)
+  policy = not_null(policy)
+  if type(policy) ~= "table" then
+    return policy
+  end
+  local normalized = vim.deepcopy(policy)
+  if normalized.type == "workspaceWrite" then
+    normalized.writableRoots = normalized.writableRoots or {}
+    if normalized.networkAccess == nil then
+      normalized.networkAccess = false
+    end
+    if normalized.excludeTmpdirEnvVar == nil then
+      normalized.excludeTmpdirEnvVar = false
+    end
+    if normalized.excludeSlashTmp == nil then
+      normalized.excludeSlashTmp = false
+    end
+  elseif normalized.type == "readOnly" and normalized.networkAccess == nil then
+    normalized.networkAccess = false
+  end
+  return normalized
+end
+
+local function sandbox_policies_equal(left, right)
+  return vim.deep_equal(normalized_sandbox_policy(left), normalized_sandbox_policy(right))
+end
+
 local function restore_snapshot(settings)
   settings = settings or {}
   return {
@@ -520,7 +565,7 @@ local function settings_match_restore(settings, restore)
       and profile.id == restore.permissions
     or not restore.permissions
       and profile == nil
-      and vim.deep_equal(settings.sandboxPolicy, restore.sandboxPolicy)
+      and sandbox_policies_equal(settings.sandboxPolicy, restore.sandboxPolicy)
   return vim.deep_equal(settings.approvalPolicy, restore.approvalPolicy)
     and settings.approvalsReviewer == restore.approvalsReviewer
     and permissions_match
@@ -532,7 +577,7 @@ local function same_restore(left, right)
   return vim.deep_equal(left.approvalPolicy, right.approvalPolicy)
     and left.approvalsReviewer == right.approvalsReviewer
     and left.permissions == right.permissions
-    and vim.deep_equal(left.sandboxPolicy, right.sandboxPolicy)
+    and sandbox_policies_equal(left.sandboxPolicy, right.sandboxPolicy)
 end
 
 local function merge_external_restore(base, update)
@@ -563,13 +608,22 @@ local function merge_external_restore(base, update)
   return desired, changed
 end
 
-local function update_is_declaration_override(update)
-  return update.approvalPolicy ~= nil
-    and not_null(update.approvalPolicy) == "never"
-    and update.approvalsReviewer ~= nil
-    and not_null(update.approvalsReviewer) == config.main_approvals_reviewer
-    and update.sandboxPolicy ~= nil
-    and vim.deep_equal(not_null(update.sandboxPolicy), turn_sandbox_policy("read-only"))
+local function update_is_policy_override(entry, update)
+  local desired = entry and entry.policy_override
+  if not desired
+    or update.approvalPolicy == nil
+    or not_null(update.approvalPolicy) ~= desired.approvalPolicy
+    or update.approvalsReviewer == nil
+    or not_null(update.approvalsReviewer) ~= desired.approvalsReviewer
+  then
+    return false
+  end
+  if desired.permissions then
+    local profile = update.activePermissionProfile ~= nil and not_null(update.activePermissionProfile) or nil
+    return profile and profile.id == desired.permissions or false
+  end
+  return update.sandboxPolicy ~= nil
+    and sandbox_policies_equal(not_null(update.sandboxPolicy), desired.sandboxPolicy)
     and (update.activePermissionProfile == nil or not_null(update.activePermissionProfile) == nil)
 end
 
@@ -584,7 +638,8 @@ local function reset_restore_attempt(entry)
   entry.restore_advance = nil
   entry.restore_superseded = nil
   entry.restore_settings_epoch = nil
-  entry.declaration_override_pending = nil
+  entry.policy_override = nil
+  entry.policy_override_pending = nil
 end
 
 local function restore_main_thread_settings(session, entry)
@@ -592,8 +647,8 @@ local function restore_main_thread_settings(session, entry)
     return
   end
   -- App-server turn overrides also become the defaults for later turns. Reset
-  -- them while the read-only declaration is running so the next Seal or TUI
-  -- prompt does not inherit its restricted policy.
+  -- temporary declaration and bounded-patch policies while their turn is
+  -- running so the next Seal or TUI prompt inherits the prior settings.
   entry.settings_restore_started = true
   local lease_token = session.current_lease_token
   local scheduler = session.scheduler
@@ -626,7 +681,8 @@ local function restore_main_thread_settings(session, entry)
     entry.restore_request = nil
     entry.restore_advance = nil
     entry.restore_superseded = nil
-    entry.declaration_override_pending = nil
+    entry.policy_override = nil
+    entry.policy_override_pending = nil
     local action, scheduler_error = scheduler:restore_finished(lease_token, ok, message)
     if action then
       if action.requeued then
@@ -718,7 +774,7 @@ local function restore_main_thread_settings(session, entry)
     end
     advance_restore(request)
   end
-  send_restore(restore, entry.declaration_override_pending == true)
+  send_restore(restore, entry.policy_override_pending == true)
 end
 
 local function previous_buffer_map(buf, lhs)
@@ -1575,6 +1631,7 @@ local function owned_turn_context(thread_id, turn_id)
       thread_id = thread_id,
       parent_turn_id = inherited.parent_turn_id,
       mode = inherited.mode,
+      bounded_patch = inherited.bounded_patch,
     }
     if turn_id then
       set_owned_turn(turn_id, context)
@@ -1585,18 +1642,27 @@ end
 
 local function remember_collab_threads(params)
   local item = params.item
-  if not item or item.type ~= "collabAgentToolCall" then
+  if not item then
+    return
+  end
+  local receiver_thread_ids
+  if item.type == "collabAgentToolCall" then
+    receiver_thread_ids = item.receiverThreadIds or {}
+  elseif item.type == "subAgentActivity" and item.agentThreadId then
+    receiver_thread_ids = { item.agentThreadId }
+  else
     return
   end
   local owner = owned_turn_context(params.threadId, params.turnId)
   if not owner then
     return
   end
-  for _, thread_id in ipairs(item.receiverThreadIds or {}) do
+  for _, thread_id in ipairs(receiver_thread_ids) do
     set_owned_thread(thread_id, {
       root = owner.root,
       parent_turn_id = params.turnId,
       mode = owner.mode,
+      bounded_patch = owner.bounded_patch,
     })
   end
 end
@@ -1612,8 +1678,48 @@ local function remember_started_thread(thread)
       root = parent_owner.root,
       parent_turn_id = parent_owner.parent_turn_id,
       mode = parent_owner.mode,
+      bounded_patch = parent_owner.bounded_patch,
     })
   end
+end
+
+local function bounded_turn(owner)
+  if type(owner) ~= "table" or not owner.bounded_patch then
+    return nil, nil
+  end
+  local session = state.live[owner.root]
+  local entry = session and session.current
+  if not entry or entry.terminal or not entry.bounded_patch then
+    return nil, nil
+  end
+  return session, entry
+end
+
+local function stop_bounded_turn(session, entry, reason)
+  if not session
+    or not entry
+    or session.current ~= entry
+    or not entry.bounded_patch
+    or entry.terminal
+  then
+    return false
+  end
+  if entry.bounded_stop_requested then
+    return true
+  end
+  entry.bounded_stop_requested = reason or true
+  if not state.client or not entry.confirmed_turn or not entry.turn_id then
+    return false
+  end
+  state.client:request("turn/interrupt", {
+    threadId = session.thread_id,
+    turnId = entry.turn_id,
+  }, function(_, err)
+    if err and session.current == entry and not entry.terminal then
+      notify("Could not stop the bounded Codex turn: " .. error_message(err, "interrupt failed"), vim.log.levels.ERROR)
+    end
+  end)
+  return true
 end
 
 local function review_key(request_id)
@@ -1837,6 +1943,18 @@ end
 
 local resolve_file_review
 
+local function bounded_review_is_current(review)
+  local session = state.live[review.root]
+  local entry = session and session.current
+  local item_key = approval_item_key(review.thread_id, review.turn_id, review.item_id)
+  return entry
+    and entry.id == review.work_item_id
+    and not entry.terminal
+    and not entry.bounded_stop_requested
+    and not entry.bounded_patch_failed
+    and entry.bounded_patch_item_key == item_key
+end
+
 local function open_file_review(review)
   if review.view and vim.api.nvim_win_is_valid(review.view.win) then
     vim.api.nvim_set_current_win(review.view.win)
@@ -1892,6 +2010,10 @@ resolve_file_review = function(review, decision)
   if state.reviews[review_key(review.request_id)] ~= review then
     return false
   end
+  if decision == "accept" and review.bounded_patch and not bounded_review_is_current(review) then
+    decision = "decline"
+    notify("The bounded turn is already stopping; Seal rejected its stale patch", vim.log.levels.WARN)
+  end
   if decision == "accept" then
     local save_error, saved = save_modified_review_targets(review)
     if save_error then
@@ -1911,6 +2033,10 @@ resolve_file_review = function(review, decision)
       notify(string.format("Saved local changes in %d reviewed file(s) before approval", saved))
     end
   end
+  if decision == "accept" and review.bounded_patch and not bounded_review_is_current(review) then
+    decision = "decline"
+    notify("The bounded turn stopped while its patch was being checked; Seal rejected it", vim.log.levels.WARN)
+  end
   if not state.client or not state.client:respond(review.request_id, { decision = decision }) then
     notify("Could not send the patch decision to Codex", vim.log.levels.ERROR)
     if state.stopping then
@@ -1922,12 +2048,32 @@ resolve_file_review = function(review, decision)
   end
   drop_review(review)
   if decision == "accept" then
-    state.accepted_file_items[approval_item_key(review.thread_id, review.turn_id, review.item_id)] = true
-    notify("Codex patch accepted; the turn is continuing")
+    state.accepted_file_items[approval_item_key(review.thread_id, review.turn_id, review.item_id)] = {
+      root = review.root,
+      work_item_id = review.work_item_id,
+      bounded_patch = review.bounded_patch == true,
+    }
+    if review.bounded_patch then
+      notify("Codex patch accepted; applying it before the bounded turn stops")
+    else
+      notify("Codex patch accepted; the turn is continuing")
+    end
   elseif decision == "decline" then
-    notify("Codex patch rejected; the turn is continuing")
+    if review.bounded_patch then
+      notify("Codex patch rejected; stopping the bounded turn")
+    else
+      notify("Codex patch rejected; the turn is continuing")
+    end
   else
     notify("Codex patch rejected and the turn was cancelled")
+  end
+  if review.bounded_patch and decision ~= "accept" then
+    local session = state.live[review.root]
+    local entry = session and session.current
+    if entry and entry.id == review.work_item_id then
+      entry.bounded_patch_rejected = true
+      stop_bounded_turn(session, entry, "patch_rejected")
+    end
   end
   if not state.stopping then
     schedule_next_review()
@@ -2132,6 +2278,25 @@ local function automatic_command_decision(params)
   end
 end
 
+local function bounded_rejection_decision(params)
+  local advertised = not_null(params.availableDecisions)
+  if type(advertised) == "table" then
+    local allowed = {}
+    for _, decision in ipairs(advertised) do
+      if type(decision) == "string" then
+        allowed[decision] = true
+      end
+    end
+    if allowed.decline then
+      return "decline"
+    end
+    if allowed.cancel then
+      return "cancel"
+    end
+  end
+  return "decline"
+end
+
 local function request_command_decision(request, item)
   local key = review_key(request.id)
   state.command_requests[key] = request
@@ -2192,7 +2357,6 @@ local function bind_session_entry_turn(session, entry, turn_id)
     entry.thread_id = session.thread_id
     entry.turn_id = turn_id
     state.jobs_by_thread[session.thread_id] = entry
-    restore_main_thread_settings(session, entry)
   else
     if entry.provisional_turn_id and entry.provisional_turn_id ~= turn_id then
       set_owned_turn(entry.provisional_turn_id, nil)
@@ -2202,10 +2366,14 @@ local function bind_session_entry_turn(session, entry, turn_id)
     entry.start_pending = false
     entry.provisional_turn_id = nil
   end
+  if entry.policy_overridden then
+    restore_main_thread_settings(session, entry)
+  end
   set_owned_turn(turn_id, {
     root = session.root,
     thread_id = session.thread_id,
     mode = entry.mode,
+    bounded_patch = entry.bounded_patch,
   })
   return true
 end
@@ -2250,7 +2418,7 @@ local function accept_start_response(session, entry, turn_id)
   if entry_running then
     bind_session_entry_turn(session, entry, turn_id)
   else
-    if entry.kind == "declaration" then
+    if entry.policy_overridden then
       restore_main_thread_settings(session, entry)
     end
   end
@@ -2330,11 +2498,26 @@ handle_notification = function(method, params)
     return
   elseif method == "item/completed" and params.item then
     local completed_item_key = approval_item_key(params.threadId, params.turnId, params.item.id)
+    local accepted = state.accepted_file_items[completed_item_key]
     if params.item.type == "fileChange"
       and params.item.status == "failed"
-      and state.accepted_file_items[completed_item_key]
+      and accepted
     then
       notify("Codex could not apply the complete reviewed patch; inspect the workspace", vim.log.levels.ERROR)
+    end
+    if params.item.type == "fileChange" and type(accepted) == "table" and accepted.bounded_patch then
+      local session = state.live[accepted.root]
+      local entry = session and session.current
+      if entry and entry.id == accepted.work_item_id then
+        if params.item.status == "completed" then
+          entry.bounded_patch_applied = true
+          notify("Codex patch applied; stopping the bounded turn")
+          stop_bounded_turn(session, entry, "patch_applied")
+        else
+          entry.bounded_patch_failed = "Codex did not apply the accepted patch"
+          stop_bounded_turn(session, entry, "patch_failed")
+        end
+      end
     end
     state.accepted_file_items[completed_item_key] = nil
     clear_approval_items(params.threadId, params.turnId, params.item.id)
@@ -2413,19 +2596,18 @@ handle_notification = function(method, params)
       if self_issued_restore then
         restore_request.observed = true
       end
-      local own_declaration_override = settings_entry
-        and settings_entry.declaration_override_pending
-        and update_is_declaration_override(settings)
+      local own_policy_override = settings_entry
+        and settings_entry.policy_override_pending
+        and update_is_policy_override(settings_entry, settings)
         or false
-      if own_declaration_override then
-        settings_entry.declaration_override_pending = nil
+      if own_policy_override then
+        settings_entry.policy_override_pending = nil
       end
       if settings_entry
-        and settings_entry.kind == "declaration"
         and settings_entry.policy_overridden
         and not settings_entry.settings_restored
         and not self_issued_restore
-        and not own_declaration_override
+        and not own_policy_override
       then
         local restore_base = settings_entry.restore_superseded or settings_entry.restore_settings
         local observed, changed = merge_external_restore(restore_base, settings)
@@ -2450,7 +2632,7 @@ handle_notification = function(method, params)
             and profile.id == desired.permissions
           or not desired.permissions
             and profile == nil
-            and vim.deep_equal(session.settings.sandboxPolicy, desired.sandboxPolicy)
+            and sandbox_policies_equal(session.settings.sandboxPolicy, desired.sandboxPolicy)
         if vim.deep_equal(session.settings.approvalPolicy, desired.approvalPolicy)
           and session.settings.approvalsReviewer == desired.approvalsReviewer
           and permissions_match
@@ -2577,7 +2759,7 @@ handle_notification = function(method, params)
             or not completed_turn_id
             or session.active_turn_id == completed_turn_id)))
     if completes_entry and entry.restore_advance then
-      -- A terminal turn cannot apply a still-pending declaration override.
+      -- A terminal turn cannot apply a still-pending temporary policy override.
       -- This also releases a restore update that was an authoritative no-op
       -- and therefore produced no settings-changed notification.
       entry.restore_advance()
@@ -2617,10 +2799,23 @@ handle_notification = function(method, params)
       local fields
       if entry.state == "cancelled" then
         outcome = "cancelled"
+      elseif entry.bounded_patch_failed then
+        outcome = "failed"
+        fields = { error = entry.bounded_patch_failed }
+      elseif entry.bounded_patch_rejected then
+        outcome = "cancelled"
       elseif turn_status == "completed" and entry.kind == "declaration" then
         outcome = "preview"
         fields = { preview = { raw = entry.answer } }
+      elseif turn_status == "completed" and entry.bounded_patch and not entry.bounded_patch_applied then
+        outcome = "failed"
+        fields = { error = "Codex completed the bounded turn without applying one patch" }
       elseif turn_status == "completed" then
+        outcome = "done"
+      elseif turn_status == "interrupted"
+        and entry.bounded_patch_applied
+        and entry.bounded_stop_requested == "patch_applied"
+      then
         outcome = "done"
       else
         outcome = "failed"
@@ -2722,8 +2917,36 @@ handle_server_request = function(request)
   end
 
   forget_pending_unowned_request(request.id)
+  local bounded_session, bounded_entry = bounded_turn(owner)
 
   if request.method == "item/fileChange/requestApproval" and not is_generation then
+    local item_key = approval_item_key(params.threadId, turn_id, params.itemId)
+    if bounded_entry and (bounded_entry.bounded_stop_requested or bounded_entry.bounded_patch_item_key) then
+      if bounded_entry.bounded_patch_request_id == request.id then
+        return
+      end
+      local already_stopping = bounded_entry.bounded_stop_requested ~= nil
+      local decision = bounded_rejection_decision(params)
+      if not state.client:respond(request.id, { decision = decision }) then
+        notify("Could not reject an extra bounded-turn patch", vim.log.levels.ERROR)
+      end
+      bounded_entry.bounded_patch_failed = bounded_entry.bounded_patch_failed
+        or "Codex proposed more than one patch for a bounded turn"
+      stop_bounded_turn(bounded_session, bounded_entry, "extra_patch")
+      clear_reviews(function(review)
+        return review.bounded_patch and review.work_item_id == bounded_entry.id
+      end, "decline")
+      if already_stopping then
+        notify("Codex proposed a patch after the bounded turn began stopping; Seal rejected it", vim.log.levels.ERROR)
+      else
+        notify("Codex proposed a second patch; Seal rejected it and stopped the bounded turn", vim.log.levels.ERROR)
+      end
+      return
+    end
+    if bounded_entry then
+      bounded_entry.bounded_patch_item_key = item_key
+      bounded_entry.bounded_patch_request_id = request.id
+    end
     local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
     state.review_sequence = state.review_sequence + 1
     local review = {
@@ -2735,6 +2958,8 @@ handle_server_request = function(request)
       root = session and session.root or owner.root,
       changes = vim.deepcopy(item and item.changes or {}),
       grant_root = not_null(params.grantRoot),
+      bounded_patch = bounded_entry ~= nil,
+      work_item_id = bounded_entry and bounded_entry.id or nil,
     }
     review.warning = review_safety(review)
     state.reviews[review_key(request.id)] = review
@@ -2746,6 +2971,16 @@ handle_server_request = function(request)
     open_file_review(review)
     return
   elseif request.method == "item/commandExecution/requestApproval" and not is_generation then
+    if bounded_entry then
+      local decision = bounded_rejection_decision(params)
+      if not state.client:respond(request.id, { decision = decision }) then
+        notify("Could not decline the bounded-turn command", vim.log.levels.ERROR)
+      elseif not bounded_entry.bounded_command_notice then
+        bounded_entry.bounded_command_notice = true
+        notify("Seal declined a command requiring approval; targeted and refactor turns only inspect and patch")
+      end
+      return
+    end
     local decision = config.auto_approve_commands and automatic_command_decision(params)
     if decision then
       if not state.client:respond(request.id, { decision = decision }) then
@@ -3346,14 +3581,18 @@ local function route_prompt(text)
       route.instruction = config.declaration_instructions[kind]
       return route
     end
-    local instruction = config.agent_prefixes[normalized_prefix]
-    if instruction then
+    local policy = config.agent_prefixes[normalized_prefix]
+    if policy then
+      local instruction = type(policy) == "table" and policy.instruction or policy
       return {
         mode = "agent",
         label = normalized_prefix,
         prompt = vim.trim(body),
         original = trimmed,
         instruction = instruction,
+        bounded_patch = bounded_agent_prefixes[normalized_prefix] == true
+          or type(policy) == "table" and policy.bounded_patch == true
+          or false,
       }
     end
   end
@@ -3871,11 +4110,12 @@ local function start_declaration(session, snapshot, route, job)
   entry.restore_settings = restore_snapshot(settings)
   entry.restore_settings_epoch = session.settings_epoch or 0
   entry.policy_overridden = true
-  entry.declaration_override_pending = not same_restore(entry.restore_settings, {
+  entry.policy_override = {
     approvalPolicy = "never",
     approvalsReviewer = config.main_approvals_reviewer,
     sandboxPolicy = turn_sandbox_policy("read-only"),
-  })
+  }
+  entry.policy_override_pending = not same_restore(entry.restore_settings, entry.policy_override)
   local restore_lease, restore_error = session.scheduler:require_restore(lease_token)
   if not restore_lease then
     notify(error_message(restore_error, "could not protect the shared thread settings"), vim.log.levels.ERROR)
@@ -3886,7 +4126,7 @@ local function start_declaration(session, snapshot, route, job)
   local request_client = client()
   local dispatched, dispatch_error = session.scheduler:mark_start_dispatched(lease_token)
   if not dispatched then
-    entry.declaration_override_pending = nil
+    entry.policy_override_pending = nil
     notify(error_message(dispatch_error, "could not dispatch declaration work"), vim.log.levels.ERROR)
     local action = session.scheduler:start_failed(lease_token, {
       error = error_message(dispatch_error, "could not dispatch declaration work"),
@@ -3917,7 +4157,7 @@ local function start_declaration(session, snapshot, route, job)
       return
     end
     if turn_err or not turn_result or not turn_result.turn then
-      entry.declaration_override_pending = nil
+      entry.policy_override_pending = nil
       if active_turn_error(turn_err) then
         requeue_session_entry(session, entry)
         return
@@ -4081,7 +4321,11 @@ local function start_agent(session, snapshot, prompt, activity)
     local action, scheduler_error = session.scheduler:start_failed(lease_token, { error = message })
     notify(message, level or vim.log.levels.WARN)
     if action then
-      handle_scheduler_action(session, action)
+      if action.waiting_for_restore then
+        restore_main_thread_settings(session, entry)
+      else
+        handle_scheduler_action(session, action)
+      end
     elseif scheduler_error then
       notify(error_message(scheduler_error, "could not release rejected prompt"), vim.log.levels.ERROR)
     end
@@ -4175,6 +4419,21 @@ local function start_agent(session, snapshot, prompt, activity)
       )
     end
   end
+  if activity.bounded_patch then
+    entry.restore_settings = restore_snapshot(session.settings or {})
+    entry.restore_settings_epoch = session.settings_epoch or 0
+    entry.policy_overridden = true
+    entry.policy_override = {
+      approvalPolicy = "untrusted",
+      approvalsReviewer = "user",
+      sandboxPolicy = turn_sandbox_policy(config.main_sandbox),
+    }
+    entry.policy_override_pending = not same_restore(entry.restore_settings, entry.policy_override)
+    local restore_lease, restore_error = session.scheduler:require_restore(lease_token)
+    if not restore_lease then
+      return reject(error_message(restore_error, "could not protect the shared thread settings"), vim.log.levels.ERROR)
+    end
+  end
   activity.turn_id = nil
   activity.start_pending = true
   activity.provisional_turn_id = nil
@@ -4185,12 +4444,13 @@ local function start_agent(session, snapshot, prompt, activity)
     input = { { type = "text", text = prompt } },
     additionalContext = additional_context(snapshot),
     sandboxPolicy = turn_sandbox_policy(config.main_sandbox),
-    approvalPolicy = config.main_approval_policy,
-    approvalsReviewer = config.main_approvals_reviewer,
+    approvalPolicy = activity.bounded_patch and "untrusted" or config.main_approval_policy,
+    approvalsReviewer = activity.bounded_patch and "user" or config.main_approvals_reviewer,
   }
   local request_client = client()
   local dispatched, dispatch_error = session.scheduler:mark_start_dispatched(lease_token)
   if not dispatched then
+    entry.policy_override_pending = nil
     return reject(error_message(dispatch_error, "could not dispatch Codex prompt"), vim.log.levels.ERROR)
   end
   request_client:request("turn/start", params, function(result, err)
@@ -4199,6 +4459,7 @@ local function start_agent(session, snapshot, prompt, activity)
     end
     activity.start_pending = false
     if err or not result or not result.turn then
+      entry.policy_override_pending = nil
       if active_turn_error(err) then
         requeue_session_entry(session, entry)
         return
@@ -4209,7 +4470,11 @@ local function start_agent(session, snapshot, prompt, activity)
       notify(error_message(err, "could not start Codex turn"), vim.log.levels.ERROR)
       remove_activity(activity)
       if action then
-        handle_scheduler_action(session, action)
+        if action.waiting_for_restore then
+          restore_main_thread_settings(session, entry)
+        else
+          handle_scheduler_action(session, action)
+        end
       elseif scheduler_error then
         notify(error_message(scheduler_error, "could not release failed Codex work"), vim.log.levels.ERROR)
       end
@@ -4314,11 +4579,11 @@ requeue_session_entry = function(session, entry)
   if not lease or lease.item_id ~= entry.id then
     return false
   end
-  if entry.kind == "declaration" then
+  if entry.policy_overridden then
     -- A rejected turn/start never applied its per-turn settings. If an
     -- override event did arrive despite the error, session.settings differs
     -- from the restore target and the normal restore path still runs.
-    entry.declaration_override_pending = nil
+    entry.policy_override_pending = nil
   end
   local action, err = session.scheduler:start_failed(lease.token, {
     retry = true,
@@ -4501,6 +4766,7 @@ function M.submit(text, opts)
         snapshot = snapshot,
         route = route,
         prompt = routed_agent_prompt(route),
+        bounded_patch = route.bounded_patch == true,
         summary = summary_text(route.label or "Codex", route.prompt),
       },
     })

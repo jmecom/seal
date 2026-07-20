@@ -34,6 +34,14 @@ local function request(fake, method, index)
   return matches[index or #matches]
 end
 
+local function response(fake, id)
+  for _, item in ipairs(fake.responses) do
+    if item.id == id then
+      return item
+    end
+  end
+end
+
 local function fake_client()
   local fake = {
     requests = {},
@@ -202,6 +210,7 @@ function tests.routes_only_known_prefixes()
   local targeted = seal._route(" TARGETED: fix only the parser edge case ")
   equal(targeted.mode, "agent", "targeted should remain a main-thread prompt")
   equal(targeted.prompt, "fix only the parser edge case", "targeted should strip its control prefix")
+  truthy(targeted.bounded_patch, "targeted should use the bounded patch lifecycle")
   truthy(targeted.instruction:find("minimum necessary", 1, true), "targeted should add the minimal-change policy")
   local interface = seal._route("INTERFACE: storage backend")
   equal(interface.kind, "interface", "interface should remain an inline declaration")
@@ -213,6 +222,15 @@ function tests.routes_only_known_prefixes()
   equal(seal._route("fix: this bug").mode, "agent", "unknown colon prefixes should remain freeform")
   equal(seal._route("https://example.com").mode, "agent", "URLs should remain freeform")
   equal(seal._route("  preserve me  ").prompt, "  preserve me  ", "freeform whitespace should be preserved")
+
+  setup(nil, {
+    agent_prefixes = {
+      targeted = "Use the project's custom minimal-change wording.",
+      refactor = "Use the project's custom refactor wording.",
+    },
+  })
+  truthy(seal._route("targeted: fix it").bounded_patch, "custom targeted wording must preserve its boundary")
+  truthy(seal._route("refactor: extract it").bounded_patch, "custom refactor wording must preserve its boundary")
 end
 
 function tests.normalizes_nested_indentation()
@@ -262,17 +280,35 @@ function tests.freeform_uses_main_thread_unchanged()
 end
 
 function tests.targeted_adds_minimal_change_guidance_to_the_main_thread()
-  setup({ "local value = 1" })
+  setup({ "local value = 1" }, {
+    main_approval_policy = "never",
+    main_approvals_reviewer = "auto_review",
+  })
   truthy(seal.submit("TARGETED: fix only the parser edge case"), "targeted prompt should submit")
   local turn = request(fake, "turn/start")
   equal(turn.params.threadId, "main-thread", "targeted should use the persistent thread")
   truthy(request(fake, "thread/fork") == nil, "targeted must not create a declaration fork")
   truthy(turn.params.outputSchema == nil, "targeted must not constrain the agent response")
-  equal(turn.params.approvalPolicy, "untrusted", "targeted patches should use the same review gate")
-  equal(turn.params.approvalsReviewer, "user", "targeted reviews should not be delegated")
+  equal(turn.params.approvalPolicy, "untrusted", "targeted patches should force the review gate")
+  equal(turn.params.approvalsReviewer, "user", "targeted reviews should stay with the user")
+  local restore = request(fake, "thread/settings/update")
+  equal(restore.params.approvalPolicy, "never", "targeted should restore the thread's previous approval policy")
+  equal(restore.params.approvalsReviewer, "auto_review", "targeted should restore the previous reviewer")
   truthy(
     turn.params.input[1].text:find("minimum necessary", 1, true),
     "Codex should receive the minimal-change policy"
+  )
+  truthy(
+    turn.params.input[1].text:find("do not run tests, builds, linters, formatters", 1, true),
+    "targeted should prohibit verification commands"
+  )
+  truthy(
+    turn.params.input[1].text:find("Propose exactly one file-change patch", 1, true),
+    "targeted should request one patch"
+  )
+  truthy(
+    turn.params.input[1].text:find("Do not delegate this request to subagents", 1, true),
+    "targeted should keep the bounded turn on the policy-controlled root agent"
   )
   truthy(
     turn.params.input[1].text:find("\n\nRequest:\nfix only the parser edge case", 1, true),
@@ -304,6 +340,7 @@ function tests.refactor_adds_minimal_behavior_preserving_guidance()
     turn.params.input[1].text:find("Preserve existing behavior and public APIs", 1, true),
     "refactor should preserve behavior and public APIs by default"
   )
+  truthy(seal._route("refactor: extract it").bounded_patch, "refactor should use the bounded patch lifecycle")
   truthy(
     turn.params.input[1].text:find("extract the parsing branch", 1, true),
     "refactor should include the user's request"
@@ -313,6 +350,61 @@ function tests.refactor_adds_minimal_behavior_preserving_guidance()
   setup({ "" })
   truthy(not seal.submit("refactor:   "), "an empty refactor prompt should not submit")
   truthy(request(fake, "thread/start") == nil, "an empty refactor prompt should not open a thread")
+end
+
+function tests.bounded_policy_restore_accepts_app_server_workspace_defaults()
+  setup({ "local value = 1" }, {
+    main_approval_policy = "never",
+    main_approvals_reviewer = "auto_review",
+  })
+  local original_request = fake.request
+  local restore_callback
+  function fake:request(method, params, callback)
+    if method == "thread/settings/update" then
+      table.insert(self.requests, { method = method, params = params })
+      restore_callback = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("targeted: update the value")
+  local session = seal._state.live["/tmp/seal-project"]
+  local entry = session.current
+  truthy(restore_callback ~= nil, "the prior thread policy should be awaiting restoration")
+
+  local server_workspace_policy = {
+    type = "workspaceWrite",
+    writableRoots = {},
+    networkAccess = false,
+    excludeTmpdirEnvVar = false,
+    excludeSlashTmp = false,
+  }
+  seal._notification("thread/settings/updated", {
+    threadId = "main-thread",
+    threadSettings = {
+      approvalPolicy = "untrusted",
+      approvalsReviewer = "user",
+      sandboxPolicy = server_workspace_policy,
+      activePermissionProfile = vim.NIL,
+    },
+  })
+  equal(entry.restore_settings.approvalPolicy, "never",
+    "serialized workspace defaults must not make the temporary policy become the restore target")
+  equal(entry.restore_settings.approvalsReviewer, "auto_review",
+    "the previous reviewer should survive the temporary policy notification")
+
+  restore_callback({})
+  seal._notification("thread/settings/updated", {
+    threadId = "main-thread",
+    threadSettings = {
+      approvalPolicy = "never",
+      approvalsReviewer = "auto_review",
+      sandboxPolicy = server_workspace_policy,
+      activePermissionProfile = vim.NIL,
+    },
+  })
+  truthy(entry.settings_restored, "the semantically identical app-server sandbox should finish restoration")
 end
 
 function tests.freeform_queues_behind_an_active_turn()
@@ -1255,11 +1347,180 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
   }, "Tab should approve the complete multi-file patch")
   truthy(seal._state.reviews["51"] == nil, "an accepted patch should leave the review queue")
   equal(vim.tbl_count(seal._state.activities), 1, "patch acceptance should keep the turn marker visible")
+  seal._notification("item/completed", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "patch-1", type = "fileChange", status = "completed", changes = changes },
+  })
+  truthy(request(fake, "turn/interrupt") == nil, "a freeform patch should not stop its agentic turn")
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
   })
   equal(vim.tbl_count(seal._state.activities), 0, "the marker should clear only when the turn finishes")
+end
+
+function tests.targeted_patch_stops_only_after_the_accepted_patch_is_applied()
+  setup({ "local value = 1" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("targeted: update the value")
+  local activity = seal._state.activities[1]
+  local source_path = vim.api.nvim_buf_get_name(0)
+  local changes = {
+    {
+      path = source_path,
+      kind = { type = "update" },
+      diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+    },
+  }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "bounded-patch", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 151,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "bounded-patch" },
+  })
+
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  equal(fake.responses[#fake.responses].result.decision, "accept", "the bounded patch should use normal review")
+  truthy(request(fake, "turn/interrupt") == nil, "acceptance must wait for app-server to apply the patch")
+
+  seal._notification("item/completed", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "bounded-patch", type = "fileChange", status = "completed", changes = changes },
+  })
+  equal(request(fake, "turn/interrupt").params, {
+    threadId = "main-thread",
+    turnId = "main-turn",
+  }, "the applied patch should stop its owning turn immediately")
+
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "interrupted" },
+  })
+  equal(activity.state, "done", "the expected post-apply interruption should be a successful result")
+  equal(vim.tbl_count(seal._state.activities), 0, "an expected bounded interruption should finish cleanly")
+end
+
+function tests.second_bounded_patch_is_rejected_and_invalidates_the_first_review()
+  setup({ "local value = 1" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("targeted: update one value")
+  local activity = seal._state.activities[1]
+  local source_path = vim.api.nvim_buf_get_name(0)
+  local function propose(item_id, request_id, value)
+    seal._notification("item/started", {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      item = {
+        id = item_id,
+        type = "fileChange",
+        status = "inProgress",
+        changes = {
+          {
+            path = source_path,
+            kind = { type = "update" },
+            diff = string.format("@@ -1 +1 @@\n-local value = 1\n+local value = %d", value),
+          },
+        },
+      },
+    })
+    seal._server_request({
+      id = request_id,
+      method = "item/fileChange/requestApproval",
+      params = {
+        threadId = "main-thread",
+        turnId = "main-turn",
+        itemId = item_id,
+        availableDecisions = { "accept", "decline", "cancel" },
+      },
+    })
+  end
+
+  propose("bounded-first", 161, 2)
+  truthy(seal._state.reviews["161"] ~= nil, "the first patch should wait for review")
+  propose("bounded-second", 162, 3)
+
+  equal(response(fake, 162).result.decision, "decline", "Seal should reject the second patch")
+  equal(response(fake, 161).result.decision, "decline", "the first review should become stale and be declined")
+  truthy(seal._state.reviews["161"] == nil, "a stopped bounded turn must not leave an acceptable review")
+  equal(request(fake, "turn/interrupt").params, {
+    threadId = "main-thread",
+    turnId = "main-turn",
+  }, "a second patch should stop the root turn")
+
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "interrupted" },
+  })
+  equal(activity.state, "failed", "violating the one-patch contract should fail the bounded work item")
+end
+
+function tests.bounded_v2_child_patch_inherits_review_and_stops_the_root_turn()
+  setup({ "" })
+  vim.api.nvim_set_option_value("modified", false, { buf = 0 })
+  seal.submit("refactor: extract the storage helper")
+  seal._notification("item/completed", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = {
+      id = "v2-child-activity",
+      type = "subAgentActivity",
+      agentThreadId = "bounded-child",
+      agentPath = "reader",
+      kind = "started",
+    },
+  })
+  local changes = {
+    {
+      path = "/tmp/seal-project/storage.lua",
+      kind = { type = "add" },
+      diff = "@@ -0,0 +1 @@\n+return {}",
+    },
+  }
+  seal._notification("item/started", {
+    threadId = "bounded-child",
+    turnId = "bounded-child-turn",
+    item = { id = "bounded-child-patch", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 163,
+    method = "item/fileChange/requestApproval",
+    params = {
+      threadId = "bounded-child",
+      turnId = "bounded-child-turn",
+      itemId = "bounded-child-patch",
+      availableDecisions = { "accept", "decline", "cancel" },
+    },
+  })
+  truthy(seal._state.reviews["163"] ~= nil, "a V2 child patch should inherit the bounded review")
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  truthy(request(fake, "turn/interrupt") == nil, "the root should keep running until the child patch applies")
+  seal._notification("item/completed", {
+    threadId = "bounded-child",
+    turnId = "bounded-child-turn",
+    item = { id = "bounded-child-patch", type = "fileChange", status = "completed", changes = changes },
+  })
+
+  equal(request(fake, "turn/interrupt").params, {
+    threadId = "main-thread",
+    turnId = "main-turn",
+  }, "an applied V2 child patch should stop the owning root turn")
+end
+
+function tests.bounded_turn_that_finishes_without_a_patch_fails()
+  setup({ "local value = 1" })
+  seal.submit("targeted: update the value")
+  local activity = seal._state.activities[1]
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  equal(activity.state, "failed", "bounded work should not succeed without its one applied patch")
 end
 
 function tests.prompting_from_patch_review_targets_the_source_buffer()
@@ -1461,6 +1722,33 @@ function tests.command_approvals_auto_accept_by_default()
     },
   })
   equal(fake.responses[#fake.responses].result.decision, "acceptForSession", "Seal should honor the available accept form")
+end
+
+function tests.targeted_and_refactor_decline_commands_that_require_approval()
+  for _, prompt in ipairs({ "targeted: update the value", "refactor: extract the branch" }) do
+    setup({ "local value = 1" }, {
+      select = function()
+        fail("bounded commands must not open an approval dialog")
+      end,
+    })
+    seal.submit(prompt)
+    seal._server_request({
+      id = 158,
+      method = "item/commandExecution/requestApproval",
+      params = {
+        threadId = "main-thread",
+        turnId = "main-turn",
+        itemId = "bounded-command",
+        command = "make test",
+        availableDecisions = { "accept", "decline", "cancel" },
+      },
+    })
+    equal(fake.responses[#fake.responses], {
+      id = 158,
+      result = { decision = "decline" },
+    }, "bounded turns should decline commands that cross the approval boundary")
+    truthy(request(fake, "turn/interrupt") == nil, "a declined command should let Codex proceed to its one patch")
+  end
 end
 
 function tests.command_approval_warns_about_unpreviewed_writes()
@@ -3712,6 +4000,7 @@ local order = {
   "freeform_uses_main_thread_unchanged",
   "targeted_adds_minimal_change_guidance_to_the_main_thread",
   "refactor_adds_minimal_behavior_preserving_guidance",
+  "bounded_policy_restore_accepts_app_server_workspace_defaults",
   "freeform_queues_behind_an_active_turn",
   "early_completion_waits_for_start_ownership_before_pumping",
   "freeform_uses_the_post_format_buffer_and_selection",
@@ -3748,11 +4037,16 @@ local order = {
   "rejected_declaration_start_does_not_wait_for_a_noop_restore",
   "server_request_is_resolved_without_an_interactive_client",
   "multi_file_patch_waits_for_review_and_acceptance",
+  "targeted_patch_stops_only_after_the_accepted_patch_is_applied",
+  "second_bounded_patch_is_rejected_and_invalidates_the_first_review",
+  "bounded_v2_child_patch_inherits_review_and_stops_the_root_turn",
+  "bounded_turn_that_finishes_without_a_patch_fails",
   "prompting_from_patch_review_targets_the_source_buffer",
   "modified_review_target_is_saved_before_acceptance",
   "external_review_target_change_remains_blocked",
   "unsafe_patch_has_no_accept_mapping",
   "command_approvals_auto_accept_by_default",
+  "targeted_and_refactor_decline_commands_that_require_approval",
   "command_approval_warns_about_unpreviewed_writes",
   "command_approval_honors_available_decisions",
   "dismissed_command_uses_the_advertised_cancel",
