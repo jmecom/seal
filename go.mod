@@ -1,4 +1,4 @@
-module github.com/jmhodges/seal
+module github.com/jmecom/seal
 
 go 1.23
 

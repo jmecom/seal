@@ -2,9 +2,9 @@ local M = {}
 
 local function change_kind(change)
   if type(change.kind) == "table" then
-    return change.kind.type or "update"
+    return type(change.kind.type) == "string" and change.kind.type or "update"
   end
-  return change.kind or "update"
+  return type(change.kind) == "string" and change.kind or "update"
 end
 
 local function move_path(change)
@@ -76,30 +76,35 @@ function M.open(opts)
   local lines = M.lines(opts.changes, opts.root, opts.warning)
   local width, height = dimensions(lines)
   local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(buf, "seal://review/" .. tostring(opts.id))
-  vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-  vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-  vim.api.nvim_set_option_value("filetype", "diff", { buf = buf })
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-
   local title = opts.can_accept
       and " Seal changes · Tab accept · Esc reject · q later "
     or " Seal changes · Esc reject · q later "
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    style = "minimal",
-    border = "rounded",
-    title = title,
-    title_pos = "center",
-    width = width,
-    height = math.max(1, height),
-    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
-    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-  })
-  vim.api.nvim_set_option_value("wrap", false, { win = win })
-
+  local opened, win = pcall(function()
+    vim.api.nvim_buf_set_name(buf, "seal://review/" .. tostring(opts.id))
+    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+    vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+    vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+    vim.api.nvim_set_option_value("filetype", "diff", { buf = buf })
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+    local created = vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      style = "minimal",
+      border = "rounded",
+      title = title,
+      title_pos = "center",
+      width = width,
+      height = math.max(1, height),
+      row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+      col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    })
+    vim.api.nvim_set_option_value("wrap", false, { win = created })
+    return created
+  end)
+  if not opened then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    error(win, 0)
+  end
   local view = {
     buf = buf,
     win = win,
@@ -134,14 +139,8 @@ function M.open(opts)
     vim.keymap.set("n", "<Tab>", function()
       decide("accept")
     end, { buffer = buf, nowait = true, silent = true, desc = "Accept the proposed Codex patch" })
-    vim.keymap.set("n", "a", function()
-      decide("accept")
-    end, { buffer = buf, nowait = true, silent = true, desc = "Accept the proposed Codex patch" })
   end
   vim.keymap.set("n", "<Esc>", function()
-    decide("decline")
-  end, { buffer = buf, nowait = true, silent = true, desc = "Reject the proposed Codex patch" })
-  vim.keymap.set("n", "d", function()
     decide("decline")
   end, { buffer = buf, nowait = true, silent = true, desc = "Reject the proposed Codex patch" })
   vim.keymap.set("n", "x", function()

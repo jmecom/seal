@@ -16,6 +16,8 @@ local bounded_agent_prefixes = {
 local defaults = {
   codex_command = "codex",
   bridge = nil,
+  startup_timeout_ms = 10000,
+  request_timeout_ms = 30000,
   max_context_chars = 120000,
   max_pending_items = 100,
   direct_reconcile_lines = 16,
@@ -98,6 +100,7 @@ local state = {
   buffer_errors = {},
   buffer_items = {},
   job_mappings = {},
+  global_keymaps = {},
   job_buffers = {},
   spinner_timer = nil,
   spinner_frame = 1,
@@ -118,6 +121,7 @@ local state = {
   reviews = {},
   command_requests = {},
   resolved_requests = {},
+  resolved_request_order = {},
   pending_unowned_requests = {},
   pending_unowned_request_sequence = 0,
   review_sequence = 0,
@@ -137,6 +141,7 @@ local handle_server_request
 local refresh_item_animation
 local replay_pending_owned_requests
 local revoke_root_ownership
+local mark_root_ownership_cancelled
 
 local function notify(message, level)
   if config.notify then
@@ -818,15 +823,6 @@ local function has_spinner_work()
   return next(state.animated_items) ~= nil
 end
 
-local function has_buffer_jobs(buf)
-  for _, item in pairs(state.buffer_items[buf] or {}) do
-    if item.kind == "declaration" and job_registered(item) then
-      return true
-    end
-  end
-  return false
-end
-
 local function buffer_model(buf, create)
   local model = state.buffer_models[buf]
   if model or not create or not vim.api.nvim_buf_is_valid(buf) then
@@ -863,8 +859,7 @@ local function register_item_anchor(item)
   if not model then
     return false
   end
-  item.anchor_id = item.anchor_id or item.id
-  model:add(item.anchor_id, snapshot_anchor(item.snapshot))
+  model:add(item.anchor, snapshot_anchor(item.snapshot))
   state.buffer_items[item.snapshot.buf] = state.buffer_items[item.snapshot.buf] or {}
   state.buffer_items[item.snapshot.buf][item.id] = item
   return true
@@ -872,8 +867,8 @@ end
 
 local function remove_item_anchor(item)
   local model = state.buffer_models[item.snapshot.buf]
-  if model and item.anchor_id then
-    model:remove(item.anchor_id)
+  if model and item.anchor then
+    model:remove(item.anchor)
   end
   local items = state.buffer_items[item.snapshot.buf]
   if items then
@@ -887,10 +882,10 @@ end
 local function job_position(job)
   local buf = job.snapshot.buf
   local model = state.buffer_models[buf]
-  if not model or not job.anchor_id or not vim.api.nvim_buf_is_valid(buf) then
+  if not model or not job.anchor or not vim.api.nvim_buf_is_valid(buf) then
     return nil
   end
-  local position = model:position(job.anchor_id)
+  local position = model:position(job.anchor)
   if not position then
     return nil
   end
@@ -1093,6 +1088,8 @@ local reconcile_buffer_lines
 local reconcile_buffer_tick
 local remove_activity
 local ensure_job_buffer
+local ensure_job_mappings
+local restore_job_mappings
 local render_preview
 local refresh_buffer_decorations
 
@@ -1194,6 +1191,7 @@ local function add_activity(activity)
     release_buffer_tracking_if_idle(snapshot.buf)
     return nil
   end
+  ensure_job_mappings(snapshot.buf)
   refresh_item_animation(activity)
   local rendered = render_spinner(activity)
   refresh_buffer_decorations(snapshot.buf)
@@ -1222,13 +1220,18 @@ remove_activity = function(activity, interrupt)
     local action = session.scheduler:cancel(activity.id, "agent activity removed")
     scheduler_action = action
     if activity.turn_id and session.current == activity then
-      revoke_root_ownership(session.root, "cancel")
+      mark_root_ownership_cancelled(session.root)
     end
     if interrupt ~= false and action and action.interrupt_turn_id and state.client then
       state.client:request("turn/interrupt", {
         threadId = session.thread_id,
         turnId = action.interrupt_turn_id,
-      }, function() end)
+      }, function(_, interrupt_error)
+        if interrupt_error then
+          notify("Could not stop the cancelled Codex turn: "
+            .. error_message(interrupt_error, "interrupt failed"), vim.log.levels.ERROR)
+        end
+      end)
     end
   end
   local buf = activity.snapshot.buf
@@ -1252,6 +1255,9 @@ remove_activity = function(activity, interrupt)
     end
   end
   refresh_buffer_decorations(buf)
+  if not has_buffer_items(buf) then
+    restore_job_mappings(buf)
+  end
   release_buffer_tracking_if_idle(buf)
   stop_spinner_if_idle()
   return true
@@ -1269,7 +1275,7 @@ local function clear_activities(predicate, interrupt)
   end
 end
 
-local function restore_job_mappings(buf)
+restore_job_mappings = function(buf)
   local mappings = state.job_mappings[buf]
   state.job_mappings[buf] = nil
   if not mappings or not vim.api.nvim_buf_is_valid(buf) then
@@ -1298,7 +1304,7 @@ local function restore_job_mappings(buf)
   end
 end
 
-local function job_at_cursor(buf)
+local function item_at_cursor(buf)
   local cursor = vim.api.nvim_win_get_cursor(0)
   local row = cursor[1] - 1
   local column = cursor[2]
@@ -1306,18 +1312,18 @@ local function job_at_cursor(buf)
   local same_row = {}
   local end_of_buffer = {}
   local line_count = vim.api.nvim_buf_line_count(buf)
-  for _, job in pairs(state.jobs) do
-    if job.snapshot.buf == buf then
-      local position = job_position(job)
+  for _, item in pairs(state.buffer_items[buf] or {}) do
+    if item_registered(item) and item.snapshot.buf == buf then
+      local position = job_position(item)
       if position and position[1] == row and position[2] == column then
-        table.insert(exact, job)
+        table.insert(exact, item)
       elseif position and position[1] == row then
-        table.insert(same_row, job)
+        table.insert(same_row, item)
       elseif position and position[1] == line_count and row == math.max(0, line_count - 1) then
         -- A whole-line edit can move a right-gravity extmark to the EOF
         -- boundary. The cursor cannot enter that boundary row, so let the
         -- final real line select the job while preserving its insertion point.
-        table.insert(end_of_buffer, job)
+        table.insert(end_of_buffer, item)
       end
     end
   end
@@ -1339,6 +1345,9 @@ local function job_at_cursor(buf)
     candidates = end_of_buffer
   end
   table.sort(candidates, function(left, right)
+    if left.kind ~= right.kind then
+      return left.kind == "declaration"
+    end
     return declaration_before(left, right)
   end)
   if #candidates > 0 then
@@ -1379,7 +1388,7 @@ local function replay_mapping(mapping, lhs, count)
   feed_mapping_keys(keys, mapping, count, mapping and mapping.expr == 1)
 end
 
-local function ensure_job_mappings(buf)
+ensure_job_mappings = function(buf)
   if state.job_mappings[buf] then
     return
   end
@@ -1393,16 +1402,18 @@ local function ensure_job_mappings(buf)
     }
     local callback = function()
       local count = vim.v.count
-      local job = job_at_cursor(buf)
-      if not job then
+      local item = item_at_cursor(buf)
+      if not item then
         -- A global mapping may change while Seal owns the temporary
         -- buffer-local dispatcher. Resolve it at dispatch time unless Seal
         -- shadowed a pre-existing buffer-local map.
         replay_mapping(mapping.previous or global_map(key), key, count)
+      elseif key == "<Tab>" and item.kind == "declaration" then
+        M.accept(item)
       elseif key == "<Tab>" then
-        M.accept(job)
+        replay_mapping(mapping.previous or global_map(key), key, count)
       else
-        M.reject(job)
+        M.reject(item)
       end
     end
     mapping.callback = callback
@@ -1457,7 +1468,7 @@ local function detach_job(job)
   end
   sync_job_aliases()
   refresh_buffer_decorations(buf)
-  if not has_buffer_jobs(buf) then
+  if not has_buffer_items(buf) then
     restore_job_mappings(buf)
   end
   release_buffer_tracking_if_idle(buf)
@@ -1483,14 +1494,19 @@ cancel_job = function(job, interrupt)
   job.cancelled = true
   local interrupt_turn_id = interrupt and was_generating and scheduler_action and scheduler_action.interrupt_turn_id
   if session and job.turn_id and session.current == job then
-    revoke_root_ownership(session.root, "cancel")
+    mark_root_ownership_cancelled(session.root)
   end
   if interrupt_turn_id and state.client then
     job.interrupt_requested = true
     state.client:request("turn/interrupt", {
       threadId = session.thread_id,
       turnId = interrupt_turn_id,
-    }, function() end)
+    }, function(_, interrupt_error)
+      if interrupt_error then
+        notify("Could not stop the cancelled Codex turn: "
+          .. error_message(interrupt_error, "interrupt failed"), vim.log.levels.ERROR)
+      end
+    end)
   end
   if scheduler_action then
     handle_scheduler_action(session, scheduler_action)
@@ -1632,6 +1648,7 @@ local function owned_turn_context(thread_id, turn_id)
       parent_turn_id = inherited.parent_turn_id,
       mode = inherited.mode,
       bounded_patch = inherited.bounded_patch,
+      cancelled = inherited.cancelled,
     }
     if turn_id then
       set_owned_turn(turn_id, context)
@@ -1663,6 +1680,7 @@ local function remember_collab_threads(params)
       parent_turn_id = params.turnId,
       mode = owner.mode,
       bounded_patch = owner.bounded_patch,
+      cancelled = owner.cancelled,
     })
   end
 end
@@ -1679,6 +1697,7 @@ local function remember_started_thread(thread)
       parent_turn_id = parent_owner.parent_turn_id,
       mode = parent_owner.mode,
       bounded_patch = parent_owner.bounded_patch,
+      cancelled = parent_owner.cancelled,
     })
   end
 end
@@ -1724,6 +1743,21 @@ end
 
 local function review_key(request_id)
   return tostring(request_id)
+end
+
+local max_resolved_requests = 1024
+
+local function remember_resolved_request(request_id)
+  local key = review_key(request_id)
+  if state.resolved_requests[key] then
+    return
+  end
+  state.resolved_requests[key] = true
+  table.insert(state.resolved_request_order, key)
+  while #state.resolved_request_order > max_resolved_requests do
+    local expired = table.remove(state.resolved_request_order, 1)
+    state.resolved_requests[expired] = nil
+  end
 end
 
 local max_pending_unowned_requests = 256
@@ -1832,9 +1866,28 @@ end
 
 local function buffer_for_path(path)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) and canonical_path(vim.api.nvim_buf_get_name(buf)) == path then
+    if vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_is_loaded(buf)
+      and canonical_path(vim.api.nvim_buf_get_name(buf)) == path
+    then
       return buf
     end
+  end
+end
+
+local function refresh_accepted_file_buffers(accepted)
+  local failures = {}
+  for path in pairs(accepted.paths or {}) do
+    local buf = buffer_for_path(path)
+    if buf then
+      local ok, refresh_error = preflight_buffer(buf)
+      if not ok then
+        table.insert(failures, tostring(refresh_error))
+      end
+    end
+  end
+  if #failures > 0 then
+    notify("Could not reload an applied Codex patch: " .. table.concat(failures, "; "), vim.log.levels.WARN)
   end
 end
 
@@ -2052,6 +2105,7 @@ resolve_file_review = function(review, decision)
       root = review.root,
       work_item_id = review.work_item_id,
       bounded_patch = review.bounded_patch == true,
+      paths = vim.deepcopy(review.targets or {}),
     }
     if review.bounded_patch then
       notify("Codex patch accepted; applying it before the bounded turn stops")
@@ -2195,6 +2249,38 @@ revoke_root_ownership = function(root, decision)
   end
 end
 
+mark_root_ownership_cancelled = function(root)
+  if not root then
+    return
+  end
+  local thread_ids = {}
+  for _, owner in pairs(state.owned_turns) do
+    if type(owner) == "table" and owner.root == root then
+      owner.cancelled = true
+      if owner.thread_id then
+        thread_ids[owner.thread_id] = true
+      end
+    end
+  end
+  for thread_id, owner in pairs(state.owned_threads) do
+    if type(owner) == "table" and owner.root == root then
+      owner.cancelled = true
+      thread_ids[thread_id] = true
+    end
+  end
+  state.ownership_generation = state.ownership_generation + 1
+  clear_reviews(function(review)
+    return review.root == root
+  end, "cancel")
+  local session = state.live[root]
+  if session then
+    thread_ids[session.thread_id] = true
+  end
+  for thread_id in pairs(thread_ids) do
+    clear_command_requests(thread_id, nil, "cancel")
+  end
+end
+
 local function command_details(params, item)
   local parts = {}
   local command = not_null(params.command) or (item and not_null(item.command))
@@ -2259,7 +2345,33 @@ local function command_decision_choices(params, can_accept)
   return choices, fallback
 end
 
-local function automatic_command_decision(params)
+local function automatic_command_decision(params, item)
+  local command = not_null(params.command) or (item and not_null(item.command))
+  if command == nil or command == "" then
+    local advertised = not_null(params.availableDecisions)
+    if type(advertised) == "table" then
+      for _, decision in ipairs(advertised) do
+        if decision == "decline" then
+          return "decline"
+        end
+      end
+      for _, decision in ipairs(advertised) do
+        if decision == "cancel" then
+          return "cancel"
+        end
+      end
+      return nil
+    end
+    return "decline"
+  end
+  -- A command approval can carry capabilities that are broader than running
+  -- the displayed command in the configured sandbox. Those requests need an
+  -- explicit decision even when ordinary commands are auto-approved.
+  if not_null(params.networkApprovalContext) ~= nil
+    or not_null(params.additionalPermissions) ~= nil
+  then
+    return nil
+  end
   local advertised = not_null(params.availableDecisions)
   if type(advertised) ~= "table" then
     return "accept"
@@ -2390,6 +2502,17 @@ local function replay_pending_server_requests(session, turn_id)
   end
 end
 
+local function discard_unbound_session_events(session)
+  local unbound = session.unbound_turns or {}
+  session.unbound_turns = {}
+  for turn_id in pairs(unbound) do
+    session.scheduler:discard_turn_events(turn_id)
+    if session.pending_server_requests then
+      session.pending_server_requests[turn_id] = nil
+    end
+  end
+end
+
 local function accept_start_response(session, entry, turn_id)
   local scheduler = session and session.scheduler
   local token = session and session.current_lease_token
@@ -2423,10 +2546,10 @@ local function accept_start_response(session, entry, turn_id)
     end
   end
   if not owns_requests then
-    if session.pending_server_requests then
-      session.pending_server_requests[turn_id] = nil
-    end
     if action.already_completed then
+      if session.pending_server_requests then
+        session.pending_server_requests[turn_id] = nil
+      end
       revoke_root_ownership(session.root)
       for _, event in ipairs(action.events or {}) do
         local item = event.payload and event.payload.item
@@ -2439,6 +2562,17 @@ local function accept_start_response(session, entry, turn_id)
       if entry.restore_advance then
         entry.restore_advance()
       end
+    elseif action.interrupt_turn_id then
+      set_owned_turn(turn_id, {
+        root = session.root,
+        thread_id = session.thread_id,
+        mode = entry.mode,
+        bounded_patch = entry.bounded_patch,
+        cancelled = true,
+      })
+      replay_pending_server_requests(session, turn_id)
+    elseif session.pending_server_requests then
+      session.pending_server_requests[turn_id] = nil
     end
   else
     -- Collab ownership can be observed before the turn/start response. Replay
@@ -2456,7 +2590,12 @@ local function accept_start_response(session, entry, turn_id)
     state.client:request("turn/interrupt", {
       threadId = session.thread_id,
       turnId = action.interrupt_turn_id,
-    }, function() end)
+    }, function(_, interrupt_error)
+      if interrupt_error then
+        notify("Could not stop the cancelled Codex turn: "
+          .. error_message(interrupt_error, "interrupt failed"), vim.log.levels.ERROR)
+      end
+    end)
   end
 
   for _, event in ipairs(action.events or {}) do
@@ -2484,7 +2623,7 @@ handle_notification = function(method, params)
   elseif method == "item/fileChange/patchUpdated" then
     update_file_change_item(params)
   elseif method == "serverRequest/resolved" then
-    state.resolved_requests[review_key(params.requestId)] = true
+    remember_resolved_request(params.requestId)
     forget_pending_unowned_request(params.requestId)
     local review = state.reviews[review_key(params.requestId)]
     if review then
@@ -2504,6 +2643,14 @@ handle_notification = function(method, params)
       and accepted
     then
       notify("Codex could not apply the complete reviewed patch; inspect the workspace", vim.log.levels.ERROR)
+    end
+    if params.item.type == "fileChange"
+      and params.item.status == "completed"
+      and type(accepted) == "table"
+    then
+      vim.schedule(function()
+        refresh_accepted_file_buffers(accepted)
+      end)
     end
     if params.item.type == "fileChange" and type(accepted) == "table" and accepted.bounded_patch then
       local session = state.live[accepted.root]
@@ -2554,6 +2701,8 @@ handle_notification = function(method, params)
         session.current_lease_token = nil
         session.busy = false
         session.preflight_blocked = nil
+        session.settings_blocked = false
+        session.blocked_restore = nil
       end
       clear_reviews(function(review)
         return review.thread_id == params.threadId
@@ -2680,6 +2829,8 @@ handle_notification = function(method, params)
       session.current_lease_token = nil
       session.busy = false
       session.preflight_blocked = nil
+      session.settings_blocked = false
+      session.blocked_restore = nil
     end
     clear_reviews(function(review)
       return review.thread_id == params.threadId
@@ -2747,6 +2898,11 @@ handle_notification = function(method, params)
       set_owned_turn(params.turn.id, nil)
     end
     local entry = session and session.current
+    local turn_error = params.turn and params.turn.error
+    local turn_error_message = type(turn_error) == "table" and turn_error.message or turn_error
+    if entry and turn_error_message then
+      entry.notification_error = tostring(turn_error_message)
+    end
     local completes_entry = entry and lease and lease.turn_id == completed_turn_id
     local completes_external = session
       and completed_turn_id
@@ -2772,7 +2928,16 @@ handle_notification = function(method, params)
       session.active_turn_id = nil
       session.busy = false
       session.status = { type = "idle" }
-      notify("Codex turn finished; use :SealChat to inspect it")
+      local turn_status = params.turn and params.turn.status
+      if turn_status == "completed"
+        or turn_status == "interrupted" and entry and entry.bounded_patch_applied
+      then
+        notify("Codex turn finished; use :SealChat to inspect it")
+      else
+        notify("Codex turn failed: "
+          .. (entry and entry.notification_error or tostring(turn_error_message or turn_status or "unknown error")),
+        vim.log.levels.ERROR)
+      end
       if refresh_chat then
         vim.schedule(function()
           refresh_chat(params.threadId)
@@ -2860,6 +3025,14 @@ handle_notification = function(method, params)
     return
   end
 
+  if method == "error" then
+    local session = find_session_by_thread(params.threadId)
+    local entry = session and session.current
+    if entry and (not notification_turn_id or not entry.turn_id or entry.turn_id == notification_turn_id) then
+      entry.notification_error = params.error and params.error.message or "Codex turn failed"
+    end
+  end
+
   local job = state.jobs_by_thread[params.threadId]
   if not job or job.phase ~= "generating" then
     local session = find_session_by_thread(params.threadId)
@@ -2902,6 +3075,23 @@ handle_server_request = function(request)
     or false
   local turn_id = params.turnId or (session and session.active_turn_id)
   local owner = owned_turn_context(params.threadId, turn_id)
+  if owner and owner.cancelled then
+    forget_pending_unowned_request(request.id)
+    if request.method == "item/commandExecution/requestApproval"
+      or request.method == "item/fileChange/requestApproval"
+    then
+      state.client:respond(request.id, { decision = bounded_rejection_decision(params) })
+    elseif request.method == "item/permissions/requestApproval" then
+      state.client:respond(request.id, { permissions = {}, scope = "turn" })
+    elseif request.method == "item/tool/requestUserInput" then
+      state.client:respond(request.id, { answers = {} })
+    elseif request.method == "mcpServer/elicitation/request" then
+      state.client:respond(request.id, { action = "decline" })
+    else
+      state.client:respond_error(request.id, -32601, "Seal cancelled the owning turn")
+    end
+    return
+  end
   is_generation = is_generation or (owner and owner.mode == "declaration") or false
   if not is_generation and not owner then
     local lease = session and session.scheduler and session.scheduler:current_lease()
@@ -2981,13 +3171,13 @@ handle_server_request = function(request)
       end
       return
     end
-    local decision = config.auto_approve_commands and automatic_command_decision(params)
+    local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
+    local decision = config.auto_approve_commands and automatic_command_decision(params, item)
     if decision then
       if not state.client:respond(request.id, { decision = decision }) then
         notify("Could not auto-approve the Codex command", vim.log.levels.ERROR)
       end
     else
-      local item = state.approval_items[approval_item_key(params.threadId, turn_id, params.itemId)]
       request_command_decision(request, item)
     end
     return
@@ -3018,6 +3208,8 @@ local function client()
     bridge = config.bridge,
     codex_command = config.codex_command,
     transport_factory = config.transport_factory,
+    startup_timeout_ms = config.startup_timeout_ms,
+    request_timeout_ms = config.request_timeout_ms,
     on_notification = function(method, params)
       if state.client == active_client then
         handle_notification(method, params)
@@ -3043,6 +3235,7 @@ local function client()
       state.approval_items = {}
       state.accepted_file_items = {}
       state.resolved_requests = {}
+      state.resolved_request_order = {}
       state.pending_unowned_requests = {}
       state.pending_unowned_request_sequence = 0
       clear_activities()
@@ -3383,37 +3576,6 @@ local function capture_snapshot(opts)
     selection = selection,
     selection_range = selection_range,
   }
-end
-
-local function refresh_snapshot(snapshot)
-  if not vim.api.nvim_buf_is_valid(snapshot.buf) then
-    return nil
-  end
-  local lines = vim.api.nvim_buf_get_lines(snapshot.buf, 0, -1, false)
-  local row = math.max(1, math.min(snapshot.row + 1, #lines))
-  local line = lines[row] or ""
-  if snapshot.selection_range then
-    local line1 = math.min(snapshot.selection_range.line1, #lines)
-    local line2 = math.min(snapshot.selection_range.line2, #lines)
-    snapshot.selection = capture_selection(snapshot.buf, line1, math.max(line1, line2))
-  end
-  local text, first, last = bounded_excerpt(lines, row, snapshot.selection)
-  snapshot.changedtick = vim.api.nvim_buf_get_changedtick(snapshot.buf)
-  snapshot.row = row - 1
-  snapshot.column = math.min(snapshot.column, #line)
-  snapshot.line = line
-  snapshot.replace_blank = line:match("^%s*$") ~= nil
-  snapshot.base_indent = line:match("^%s*") or ""
-  snapshot.file = vim.api.nvim_buf_get_name(snapshot.buf)
-  local current_disk = disk_state(snapshot.file)
-  snapshot.file_stamp = current_disk.stamp
-  snapshot.file_digest = current_disk.digest
-  snapshot.filetype = vim.api.nvim_get_option_value("filetype", { buf = snapshot.buf })
-  snapshot.modified = vim.api.nvim_get_option_value("modified", { buf = snapshot.buf })
-  snapshot.excerpt = text
-  snapshot.excerpt_first = first
-  snapshot.excerpt_last = last
-  return snapshot
 end
 
 local function anchor_snapshot(snapshot)
@@ -4162,6 +4324,7 @@ local function start_declaration(session, snapshot, route, job)
         requeue_session_entry(session, entry)
         return
       end
+      discard_unbound_session_events(session)
       local action, scheduler_error = session.scheduler:start_failed(lease_token, {
         error = error_message(turn_err, "could not start declaration turn"),
       })
@@ -4394,7 +4557,7 @@ local function start_agent(session, snapshot, prompt, activity)
       -- The temporary context extmarks above survived the controlled save.
       -- Use their restored position to resolve BufferModel ambiguity instead
       -- of accepting the model's guessed replacement boundary.
-      model:resolve(activity.anchor_id, snapshot_anchor(snapshot))
+      model:resolve(activity.anchor, snapshot_anchor(snapshot))
     end
     if not sync_item_snapshot(activity, nil, true) then
       activity.preserve_selection_edits = nil
@@ -4464,6 +4627,7 @@ local function start_agent(session, snapshot, prompt, activity)
         requeue_session_entry(session, entry)
         return
       end
+      discard_unbound_session_events(session)
       local action, scheduler_error = session.scheduler:start_failed(lease_token, {
         error = error_message(err, "could not start Codex turn"),
       })
@@ -4689,6 +4853,8 @@ pump_session = function(session)
     })
     if not action then
       notify(error_message(err, "could not finish rejected Seal work"), vim.log.levels.ERROR)
+    elseif action.waiting_for_restore then
+      restore_main_thread_settings(session, entry)
     else
       handle_scheduler_action(session, action)
     end
@@ -4814,9 +4980,15 @@ local function selected_job(job_id)
     return job_registered(job_id) and job_id or nil
   end
   if type(job_id) == "number" then
-    return state.jobs[job_id]
+    local canonical = work_store:get(job_id)
+    return canonical
+      and canonical.kind == "declaration"
+      and job_registered(canonical)
+      and canonical
+      or nil
   end
-  return job_at_cursor(vim.api.nvim_get_current_buf())
+  local item = item_at_cursor(vim.api.nvim_get_current_buf())
+  return item and item.kind == "declaration" and item or nil
 end
 
 sync_item_snapshot = function(item, changedtick, include_context)
@@ -4827,14 +4999,14 @@ sync_item_snapshot = function(item, changedtick, include_context)
     return false
   end
   local model = state.buffer_models[item.snapshot.buf]
-  local context = model and item.anchor_id and model:context(item.anchor_id, {
+  local context = model and item.anchor and model:context(item.anchor, {
     include_selection_text = include_context,
   }) or nil
   if not context then
     return false
   end
 
-  local position = model:position(item.anchor_id)
+  local position = model:position(item.anchor)
   local function selection_point_lost(point)
     local ambiguity = point and point.ambiguity
     if not ambiguity then
@@ -4848,9 +5020,9 @@ sync_item_snapshot = function(item, changedtick, include_context)
   if position.selection
     and (selection_point_lost(position.selection.start) or selection_point_lost(position.selection.finish))
   then
-    model:set_selection(item.anchor_id, nil)
-    context = model:context(item.anchor_id, { include_selection_text = include_context })
-    position = model:position(item.anchor_id)
+    model:set_selection(item.anchor, nil)
+    context = model:context(item.anchor, { include_selection_text = include_context })
+    position = model:position(item.anchor)
   end
 
   local snapshot = item.snapshot
@@ -4908,6 +5080,16 @@ reconcile_buffer_lines = function(buf, changedtick, first, last, new_last)
   -- safely recover the model.
   if state.buffer_errors[buf] then
     return
+  end
+  -- Neovim reports deleting every line as an empty replacement range even
+  -- though the buffer immediately contains its required single empty line.
+  -- Reconcile the model against that actual post-edit shape.
+  if first == 0
+    and new_last == 0
+    and vim.api.nvim_buf_line_count(buf) == 1
+    and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == ""
+  then
+    new_last = 1
   end
   local direct_limit = math.max(0, math.floor(tonumber(config.direct_reconcile_lines) or 0))
   local direct = (last - first) <= direct_limit and (new_last - first) <= direct_limit
@@ -4995,7 +5177,7 @@ function M.accept(job_id)
       resolved_row = position[1]
       resolved_column = 0
     end
-    if not model or not model:resolve(job.anchor_id, {
+    if not model or not model:resolve(job.anchor, {
       row = resolved_row,
       column = resolved_column,
       affinity = "right",
@@ -5094,7 +5276,7 @@ function M.accept(job_id)
       local sibling = candidate.item
       if item_registered(sibling) and model then
         local method = candidate.ambiguous and model.relocate or model.resolve
-        local moved_ok, moved = pcall(method, model, sibling.anchor_id, {
+        local moved_ok, moved = pcall(method, model, sibling.anchor, {
           row = boundary,
           column = 0,
           affinity = "right",
@@ -5133,12 +5315,19 @@ function M.accept(job_id)
 end
 
 function M.reject(job_id)
-  local job = selected_job(job_id)
-  if not job then
+  local item
+  if type(job_id) == "table" then
+    item = item_registered(job_id) and job_id or nil
+  elseif type(job_id) == "number" then
+    item = work_store:get(job_id)
+  else
+    item = item_at_cursor(vim.api.nvim_get_current_buf())
+  end
+  if not item then
     return false
   end
-  local generating = job.phase == "generating"
-  local changed = cancel_job(job, true)
+  local generating = item.phase == "generating"
+  local changed = item.kind == "declaration" and cancel_job(item, true) or remove_activity(item, true)
   if changed then
     notify(generating and "Seal job cancelled" or "Declaration discarded")
   end
@@ -5225,58 +5414,98 @@ end
 
 function M.new_thread()
   local root = current_project_root()
-  client():start(function(ok, err)
+  local requesting_client = client()
+  requesting_client:start(function(ok, err)
     if not ok then
       notify(error_message(err, "could not start Codex"), vim.log.levels.ERROR)
       return
     end
-    local previous = state.live[root]
-    if previous and previous.status and previous.status.type == "active" and not previous.active_turn_id then
-      notify("Wait for the active Codex turn before starting a new thread", vim.log.levels.WARN)
+    if state.client ~= requesting_client then
       return
     end
-    if previous then
-      revoke_root_ownership(root, "cancel")
-    end
 
-    local function start_new()
-      clear_activities(function(activity)
-        return activity.root == root
-      end, false)
-      clear_jobs(function(job)
-        return job.snapshot.root == root
-      end, false)
-      purge_retired_work(root)
-      if previous then
-        clear_reviews(function(review)
-          return review.thread_id == previous.thread_id
-        end)
-        clear_command_requests(previous.thread_id)
-        clear_pending_unowned_requests(previous.thread_id)
-      end
-      state.live[root] = nil
-      state.sessions[root] = nil
-      close_chat()
-      start_thread(root, function(session, start_err)
-        if not session then
-          notify(error_message(start_err, "could not start a new thread"), vim.log.levels.ERROR)
-          return
+    local function replace_thread(previous, waiting_callbacks)
+      local function resume_waiters(session, load_error)
+        for _, callback in ipairs(waiting_callbacks or {}) do
+          callback(session, load_error)
         end
-        notify("Started a new Codex thread")
-      end)
+      end
+      if previous and previous.status and previous.status.type == "active" and not previous.active_turn_id then
+        notify("Wait for the active Codex turn before starting a new thread", vim.log.levels.WARN)
+        resume_waiters(previous)
+        return
+      end
+
+      local function start_new()
+        if previous then
+          revoke_root_ownership(root, "cancel")
+        end
+        clear_activities(function(activity)
+          return activity.root == root
+        end, false)
+        clear_jobs(function(job)
+          return job.snapshot.root == root
+        end, false)
+        purge_retired_work(root)
+        if previous then
+          clear_reviews(function(review)
+            return review.thread_id == previous.thread_id
+          end)
+          clear_command_requests(previous.thread_id)
+          clear_pending_unowned_requests(previous.thread_id)
+        end
+        state.live[root] = nil
+        state.sessions[root] = nil
+        close_chat()
+        start_thread(root, function(session, start_err)
+          if not session then
+            notify(error_message(start_err, "could not start a new thread"), vim.log.levels.ERROR)
+            return
+          end
+          notify("Started a new Codex thread")
+        end, requesting_client)
+      end
+
+      local function unsubscribe_previous()
+        unsubscribe_thread(previous and previous.thread_id, function(_, unsubscribe_error)
+          if unsubscribe_error then
+            notify(error_message(unsubscribe_error, "could not detach the old Codex thread"), vim.log.levels.ERROR)
+            resume_waiters(previous)
+            return
+          end
+          start_new()
+        end)
+      end
+
+      if not previous then
+        start_new()
+      elseif previous.active_turn_id then
+        requesting_client:request("turn/interrupt", {
+          threadId = previous.thread_id,
+          turnId = previous.active_turn_id,
+        }, function(_, interrupt_error)
+          if interrupt_error then
+            notify(error_message(interrupt_error, "could not stop the old Codex turn"), vim.log.levels.ERROR)
+            resume_waiters(previous)
+            return
+          end
+          unsubscribe_previous()
+        end)
+      else
+        unsubscribe_previous()
+      end
     end
 
-    if not previous then
-      start_new()
-    elseif previous.active_turn_id then
-      client():request("turn/interrupt", {
-        threadId = previous.thread_id,
-        turnId = previous.active_turn_id,
-      }, function()
-        unsubscribe_thread(previous.thread_id, start_new)
-      end)
+    local loading = state.loading[root]
+    if loading then
+      local waiting_callbacks = loading.callbacks
+      -- Serialize the explicit replacement behind the in-flight load. This
+      -- prevents two thread/start responses from racing to own the project.
+      loading.callbacks = { function(session)
+        replace_thread(session, waiting_callbacks)
+      end }
     else
-      unsubscribe_thread(previous.thread_id, start_new)
+      replace_thread(state.live[root])
     end
   end)
 end
@@ -5301,6 +5530,7 @@ function M.stop()
   state.approval_items = {}
   state.accepted_file_items = {}
   state.resolved_requests = {}
+  state.resolved_request_order = {}
   state.pending_unowned_requests = {}
   state.pending_unowned_request_sequence = 0
   state.stopping = false
@@ -5361,8 +5591,27 @@ local function command(name, callback, opts)
   vim.api.nvim_create_user_command(name, callback, opts or {})
 end
 
+local function global_keymap(mode, lhs)
+  for _, mapping in ipairs(vim.api.nvim_get_keymap(mode)) do
+    if mapping.lhs == lhs then
+      return mapping
+    end
+  end
+end
+
+local function clear_setup_keymaps()
+  for _, mapping in ipairs(state.global_keymaps or {}) do
+    local current = global_keymap(mapping.mode, mapping.lhs)
+    if current and current.callback == mapping.callback then
+      pcall(vim.keymap.del, mapping.mode, mapping.lhs)
+    end
+  end
+  state.global_keymaps = {}
+end
+
 function M.setup(opts)
   opts = opts or {}
+  clear_setup_keymaps()
   config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
   if opts.client and state.client ~= opts.client then
     local previous_client = state.client
@@ -5377,6 +5626,7 @@ function M.setup(opts)
       state.approval_items = {}
       state.accepted_file_items = {}
       state.resolved_requests = {}
+      state.resolved_request_order = {}
       state.pending_unowned_requests = {}
       state.pending_unowned_request_sequence = 0
     end
@@ -5409,7 +5659,7 @@ function M.setup(opts)
   end, { desc = "Accept Seal declaration" })
   command("SealReject", function()
     M.reject()
-  end, { desc = "Reject Seal declaration" })
+  end, { desc = "Cancel or reject Seal job" })
   command("SealChat", M.chat, { desc = "Inspect the Seal conversation" })
   command("SealReview", M.review, { desc = "Review a pending Codex patch" })
   command("SealAttach", M.attach, { desc = "Copy the Codex TUI attach command" })
@@ -5556,15 +5806,23 @@ function M.setup(opts)
   end
 
   if config.keymaps.prompt then
-    vim.keymap.set("n", config.keymaps.prompt, M.prompt, { desc = "Seal prompt" })
-    vim.keymap.set("x", config.keymaps.prompt, function()
-      local first = vim.fn.line("'<")
-      local last = vim.fn.line("'>")
+    local normal_prompt = M.prompt
+    local visual_prompt = function()
+      local cursor_line = vim.fn.line(".")
+      local visual_line = vim.fn.line("v")
+      local first = math.min(cursor_line, visual_line)
+      local last = math.max(cursor_line, visual_line)
       M.prompt({ range = 2, line1 = first, line2 = last })
-    end, { desc = "Seal prompt with selection" })
+    end
+    vim.keymap.set("n", config.keymaps.prompt, normal_prompt, { desc = "Seal prompt" })
+    vim.keymap.set("x", config.keymaps.prompt, visual_prompt, { desc = "Seal prompt with selection" })
+    table.insert(state.global_keymaps, { mode = "n", lhs = config.keymaps.prompt, callback = normal_prompt })
+    table.insert(state.global_keymaps, { mode = "x", lhs = config.keymaps.prompt, callback = visual_prompt })
   end
   if config.keymaps.chat then
-    vim.keymap.set("n", config.keymaps.chat, M.chat, { desc = "Seal chat" })
+    local chat = M.chat
+    vim.keymap.set("n", config.keymaps.chat, chat, { desc = "Seal chat" })
+    table.insert(state.global_keymaps, { mode = "n", lhs = config.keymaps.chat, callback = chat })
   end
   return M
 end
@@ -5579,6 +5837,7 @@ M._excerpt = excerpt
 M._state = state
 M._reset = function()
   M.stop()
+  clear_setup_keymaps()
   work_store = WorkItems.new()
   state.client = nil
   state.sessions = {}
@@ -5593,6 +5852,7 @@ M._reset = function()
   state.buffer_errors = {}
   state.buffer_items = {}
   state.job_mappings = {}
+  state.global_keymaps = {}
   state.job_buffers = {}
   state.spinner_timer = nil
   state.spinner_frame = 1
@@ -5608,6 +5868,7 @@ M._reset = function()
   state.approval_items = {}
   state.accepted_file_items = {}
   state.resolved_requests = {}
+  state.resolved_request_order = {}
   state.pending_unowned_requests = {}
   state.pending_unowned_request_sequence = 0
   state.reviews = {}

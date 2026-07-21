@@ -516,6 +516,26 @@ function tests.context_can_skip_large_selection_text()
     "prompt capture should still materialize selection text on demand")
 end
 
+function tests.relocate_does_not_alias_selection_ambiguity()
+  local model = buffer_model.new({ "selected", "tail" })
+  model:add("selection", {
+    row = 2,
+    column = 0,
+    selection = {
+      start = { row = 0, column = 0 },
+      finish = { row = 0, column = 8 },
+    },
+  })
+  model:reconcile_edit(0, 1, {})
+  local selection_current = model:position("selection").selection.start.ambiguity.current
+  model:relocate("selection", { row = 1, column = 0 })
+
+  local position = model:position("selection")
+  truthy(position.ambiguity.current ~= nil, "the relocated point should record its current position")
+  equal(position.selection.start.ambiguity.current, selection_current,
+    "relocating the point must not mutate the selection edge's ambiguity record")
+end
+
 local order = {
   "add_remove_and_context_share_one_snapshot",
   "same_text_whole_buffer_replacement_preserves_every_row",
@@ -536,6 +556,7 @@ local order = {
   "changed_slice_does_not_collapse_old_duplicates_exactly",
   "equal_sized_edit_does_not_copy_the_buffer_tail",
   "context_can_skip_large_selection_text",
+  "relocate_does_not_alias_selection_ambiguity",
 }
 
 for _, name in ipairs(order) do

@@ -278,9 +278,10 @@ function Scheduler:_enqueue_item(item, opts)
     return nil, scheduler_error("invalid_item_id", "scheduler item IDs cannot be nil")
   end
   if self.meta[id] then
+    local existing = self.items[id]
     return nil, scheduler_error("duplicate_item", "scheduler item already exists: " .. tostring(id), {
       item_id = id,
-      state = self.items[id].state,
+      state = existing and existing.state or nil,
     })
   end
   if self.items[id] and self.items[id] ~= item then
@@ -360,10 +361,6 @@ function Scheduler:require_restore(token)
     })
   end
   lease.restore_required = true
-  local meta = self.meta[lease.item_id]
-  if meta then
-    meta.restore_required = true
-  end
   return copy_lease(lease)
 end
 
@@ -402,6 +399,12 @@ function Scheduler:start_next(opts)
         return nil, transition_err
       end
       self.generation = generation
+      local restore_required = opts.restore_required == nil and self.meta[id].restore_required
+        or opts.restore_required == true
+      -- An enqueue-time restore requirement applies to this start attempt.
+      -- A later retry must establish its own requirement after it actually
+      -- changes thread settings.
+      self.meta[id].restore_required = false
       local lease = {
         item_id = id,
         generation = generation,
@@ -409,8 +412,7 @@ function Scheduler:start_next(opts)
         phase = "starting",
         turn_id = nil,
         dispatched = false,
-        restore_required = opts.restore_required == nil and self.meta[id].restore_required
-          or opts.restore_required == true,
+        restore_required = restore_required,
         restore_done = false,
         restore_ok = nil,
         retry = false,
@@ -790,6 +792,9 @@ function Scheduler:unblock_item(id)
   local item, item_err = self:_item(id)
   if not item then
     return nil, item_err
+  end
+  if self.current and self.current.item_id == id then
+    return nil, invalid_transition(item, "queued", "a leased item cannot be unblocked")
   end
   local _, transition_err = self:_transition(item, "queued", nil, { event = "unblock_item" })
   if transition_err then

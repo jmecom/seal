@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,9 +14,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 )
@@ -39,6 +43,7 @@ type controlEvent struct {
 type output struct {
 	mu      sync.Mutex
 	encoder *json.Encoder
+	writer  io.Writer
 }
 
 type processExit struct {
@@ -55,31 +60,54 @@ func (o *output) control(event controlEvent) {
 func (o *output) message(message []byte) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if _, err := os.Stdout.Write(message); err != nil {
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, message); err != nil {
+		return fmt.Errorf("invalid app-server JSON: %w", err)
+	}
+	if _, err := o.writer.Write(compact.Bytes()); err != nil {
 		return err
 	}
-	_, err := os.Stdout.Write([]byte{'\n'})
+	_, err := o.writer.Write([]byte{'\n'})
 	return err
 }
 
-func reserveAddress() (string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+func reserveEndpoint() (string, func(), error) {
+	directory, err := os.MkdirTemp("", "seal-app-server-")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		return "", err
-	}
-	return "ws://" + address, nil
+	cleanup := func() { _ = os.RemoveAll(directory) }
+	return "unix://" + filepath.Join(directory, "app.sock"), cleanup, nil
 }
 
-func connect(ctx context.Context, url string) (*websocket.Conn, error) {
+func connect(ctx context.Context, endpoint string, exited *processExit) (*websocket.Conn, error) {
 	deadline := time.Now().Add(connectTimeout)
 	var lastErr error
+	dialURL := endpoint
+	client := &http.Client{Timeout: time.Second}
+	if strings.HasPrefix(endpoint, "unix://") {
+		socket := strings.TrimPrefix(endpoint, "unix://")
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", socket)
+			},
+		}
+		defer transport.CloseIdleConnections()
+		client.Transport = transport
+		dialURL = "ws://localhost/"
+	}
 	for time.Now().Before(deadline) {
-		conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-			HTTPClient: &http.Client{Timeout: time.Second},
+		select {
+		case <-exited.done:
+			if exited.err == nil {
+				return nil, errors.New("Codex app-server exited during startup")
+			}
+			return nil, fmt.Errorf("Codex app-server exited during startup: %w", exited.err)
+		default:
+		}
+		conn, _, err := websocket.Dial(ctx, dialURL, &websocket.DialOptions{
+			HTTPClient: client,
 		})
 		if err == nil {
 			conn.SetReadLimit(maxMessageSize)
@@ -89,19 +117,27 @@ func connect(ctx context.Context, url string) (*websocket.Conn, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-exited.done:
+			if exited.err == nil {
+				return nil, errors.New("Codex app-server exited during startup")
+			}
+			return nil, fmt.Errorf("Codex app-server exited during startup: %w", exited.err)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return nil, fmt.Errorf("connect to %s: %w", url, lastErr)
+	return nil, fmt.Errorf("connect to %s: %w", endpoint, lastErr)
 }
 
-func forwardInput(ctx context.Context, conn *websocket.Conn) error {
-	scanner := bufio.NewScanner(os.Stdin)
+func forwardInput(ctx context.Context, reader io.Reader, conn *websocket.Conn) error {
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), maxMessageSize)
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
 		if len(line) == 0 {
 			continue
+		}
+		if !utf8.Valid(line) {
+			return errors.New("app-server input contains invalid UTF-8")
 		}
 		writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 		err := conn.Write(writeCtx, websocket.MessageText, line)
@@ -130,19 +166,24 @@ func stopProcess(command *exec.Cmd, exited *processExit) {
 	case <-exited.done:
 	case <-time.After(time.Second):
 		_ = command.Process.Kill()
-		<-exited.done
+		select {
+		case <-exited.done:
+		case <-time.After(time.Second):
+		}
 	}
 }
 
 func run(ctx context.Context, codex string, out *output) error {
-	url, err := reserveAddress()
+	url, cleanup, err := reserveEndpoint()
 	if err != nil {
-		return fmt.Errorf("reserve app-server address: %w", err)
+		return fmt.Errorf("reserve app-server endpoint: %w", err)
 	}
+	defer cleanup()
 
 	command := exec.Command(codex, "app-server", "--listen", url)
-	command.Stdout = io.Discard
+	command.Stdout = nil
 	command.Stderr = os.Stderr
+	command.WaitDelay = time.Second
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start Codex app-server: %w", err)
 	}
@@ -154,7 +195,7 @@ func run(ctx context.Context, codex string, out *output) error {
 	}()
 	defer stopProcess(command, exited)
 
-	conn, err := connect(ctx, url)
+	conn, err := connect(ctx, url, exited)
 	if err != nil {
 		return err
 	}
@@ -162,7 +203,7 @@ func run(ctx context.Context, codex string, out *output) error {
 	out.control(controlEvent{Event: "ready", URL: url})
 
 	inputErr := make(chan error, 1)
-	go func() { inputErr <- forwardInput(ctx, conn) }()
+	go func() { inputErr <- forwardInput(ctx, os.Stdin, conn) }()
 	messages := make(chan []byte)
 	readErr := make(chan error, 1)
 	go func() {
@@ -213,7 +254,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	out := &output{encoder: json.NewEncoder(os.Stdout)}
+	out := &output{encoder: json.NewEncoder(os.Stdout), writer: os.Stdout}
 	if err := run(ctx, *codex, out); err != nil {
 		out.control(controlEvent{Event: "error", Message: err.Error()})
 		os.Exit(1)

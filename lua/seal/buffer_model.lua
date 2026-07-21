@@ -589,6 +589,7 @@ function Model:relocate(id, point)
   local preserved = anchor.ambiguity
     or anchor.selection
       and (anchor.selection.start.ambiguity or anchor.selection.finish.ambiguity)
+  preserved = preserved and copy_value(preserved) or nil
   local replacement = normalize_point(self._lines, {
     row = point.row,
     column = point.column,

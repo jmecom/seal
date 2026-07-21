@@ -7,6 +7,10 @@ package.path = table.concat({
 }, ";")
 
 local seal = require("seal")
+local test_root = vim.fn.tempname() .. "-seal-project"
+local second_root = test_root .. "-second"
+local other_root = test_root .. "-other"
+vim.fn.mkdir(test_root, "p")
 
 local function fail(message)
   error(message, 2)
@@ -22,6 +26,11 @@ local function truthy(value, message)
   if not value then
     fail(message)
   end
+end
+
+local function has_parser(language)
+  local ok, parser = pcall(vim.treesitter.get_parser, 0, language, { error = false })
+  return ok and parser ~= nil
 end
 
 local function request(fake, method, index)
@@ -101,7 +110,7 @@ local function fake_client()
       callback({
         thread = {
           id = params.threadId,
-          cwd = "/tmp/seal-project",
+          cwd = test_root,
           status = self.thread_status or { type = "idle" },
           turns = params.includeTurns and (self.thread_turns or {}) or {},
         },
@@ -165,7 +174,7 @@ local function setup(lines, overrides, before_setup)
     client = fake,
     save_before_agent = false,
     root = function()
-      return "/tmp/seal-project"
+      return test_root
     end,
     notify = function(message, level)
       table.insert(notifications, { message = message, level = level })
@@ -185,7 +194,7 @@ local function setup(lines, overrides, before_setup)
   end
   buffer_sequence = buffer_sequence + 1
   vim.bo.filetype = "lua"
-  local buffer_path = string.format("/tmp/seal-project/example-%d.lua", buffer_sequence)
+  local buffer_path = string.format(test_root .. "/example-%d.lua", buffer_sequence)
   vim.fn.delete(buffer_path)
   vim.api.nvim_buf_set_name(0, buffer_path)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, lines or { "" })
@@ -256,6 +265,51 @@ function tests.visual_selection_shares_the_context_budget()
   local context_chars = vim.fn.strchars(snapshot.excerpt) + vim.fn.strchars(snapshot.selection)
   truthy(context_chars <= 20, "selection and excerpt must share max_context_chars")
   truthy(snapshot.selection:sub(-#"…") == "…", "an oversized visual selection should be truncated")
+end
+
+function tests.visual_prompt_mapping_uses_the_active_selection()
+  setup({ "first", "second", "third" }, {
+    input = function(_, callback)
+      callback("explain this selection")
+    end,
+    keymaps = { prompt = "gA", chat = false },
+  })
+  vim.cmd("normal! ggVj")
+  local mapping = vim.fn.maparg("gA", "x", false, true)
+  truthy(type(mapping.callback) == "function", "the visual prompt mapping should be installed")
+  mapping.callback()
+
+  local activity = seal._state.activities[1]
+  truthy(activity ~= nil, "the visual mapping should submit a prompt")
+  equal(activity.snapshot.selection_range, { line1 = 1, line2 = 2 },
+    "the prompt should use the selection that is active when the mapping runs")
+  equal(activity.snapshot.selection, "first\nsecond", "the selected text should not come from stale visual marks")
+end
+
+function tests.repeated_setup_removes_only_its_old_global_keymaps()
+  setup({ "" }, { keymaps = { prompt = "gA", chat = "gC" } })
+  local replacement = function() end
+  vim.keymap.set("n", "gA", replacement)
+  seal.setup({
+    client = fake,
+    save_before_agent = false,
+    root = function()
+      return test_root
+    end,
+    notify = function(message, level)
+      table.insert(notifications, { message = message, level = level })
+    end,
+    keymaps = { prompt = "gB", chat = false },
+  })
+  equal(vim.fn.maparg("gA", "n", false, true).callback, replacement,
+    "setup must preserve a user mapping that replaced Seal's old mapping")
+  truthy(vim.fn.maparg("gA", "x", false, true).callback == nil,
+    "setup should remove Seal's old visual mapping")
+  truthy(vim.fn.maparg("gC", "n", false, true).callback == nil,
+    "setup should remove Seal's old chat mapping")
+  truthy(type(vim.fn.maparg("gB", "n", false, true).callback) == "function",
+    "setup should install the new prompt mapping")
+  vim.keymap.del("n", "gA")
 end
 
 function tests.freeform_uses_main_thread_unchanged()
@@ -369,7 +423,7 @@ function tests.bounded_policy_restore_accepts_app_server_workspace_defaults()
   end
 
   seal.submit("targeted: update the value")
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   local entry = session.current
   truthy(restore_callback ~= nil, "the prior thread policy should be awaiting restoration")
 
@@ -695,7 +749,7 @@ function tests.post_write_other_buffer_mutation_blocks_freeform_turn()
   local path = vim.fn.tempname() .. ".lua"
   vim.api.nvim_buf_set_name(0, path)
   local other = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_buf_set_name(other, "/tmp/seal-project/post-write-other.lua")
+  vim.api.nvim_buf_set_name(other, test_root .. "/post-write-other.lua")
   vim.api.nvim_buf_set_lines(other, 0, -1, false, { "local saved = true" })
   vim.api.nvim_set_option_value("modified", false, { buf = other })
   local group = vim.api.nvim_create_augroup("SealPostWriteOtherTest", { clear = true })
@@ -794,7 +848,7 @@ function tests.completed_turn_does_not_check_unrelated_projects()
   setup({ "local current = true" }, {
     root = function(buf)
       local path = vim.api.nvim_buf_get_name(buf)
-      return path:find("seal%-other%-project") and "/tmp/seal-other-project" or "/tmp/seal-project"
+      return path:find("seal%-other%-project") and other_root or test_root
     end,
   })
   seal.submit("change this project")
@@ -852,7 +906,7 @@ end
 function tests.freeform_refuses_other_modified_project_buffers()
   setup({ "local current = true" })
   local other = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_buf_set_name(other, "/tmp/seal-project/other-unsaved.lua")
+  vim.api.nvim_buf_set_name(other, test_root .. "/other-unsaved.lua")
   vim.api.nvim_buf_set_lines(other, 0, -1, false, { "local unsaved = true" })
 
   seal.submit("change the project")
@@ -888,6 +942,11 @@ function tests.chat_reads_and_renders_the_backing_thread()
   truthy(rendered:find("## You\n\nexplain the value", 1, true), "chat should render the user message")
   truthy(rendered:find("## Codex\n\nIt is the cached value.", 1, true), "chat should render the Codex answer")
   truthy(not rendered:find("secret noisy command", 1, true), "chat should omit tool activity")
+  fake.thread_turns[1].items[3].text = "It is the refreshed cached value."
+  vim.fn.maparg("r", "n", false, true).callback()
+  rendered = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  truthy(rendered:find("It is the refreshed cached value.", 1, true),
+    "the chat refresh mapping should re-read and render the backing thread")
   seal.submit("follow up from chat")
   equal(fake.main_turn_count, 1, "a chat follow-up should queue behind the active turn")
   seal._notification("turn/completed", {
@@ -940,7 +999,7 @@ function tests.wiped_chat_ignores_a_delayed_refresh()
   held_read({
     thread = {
       id = "main-thread",
-      cwd = "/tmp/seal-project",
+      cwd = test_root,
       status = { type = "idle" },
       turns = {},
     },
@@ -1150,7 +1209,7 @@ function tests.declaration_retries_after_a_tui_turn_wins_the_start_race()
     return job.turn_id == "main-turn"
   end, 5), "the declaration should retry after the TUI turn")
   complete_declaration("function after_tui() end")
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   truthy(session.scheduler:current_lease() == nil, "the retried declaration must restore and release its second lease")
   seal.submit("follow the retried declaration")
   equal(fake.main_turn_count, 2, "a later prompt should start after the retried restore barrier")
@@ -1210,7 +1269,7 @@ function tests.failed_settings_restore_blocks_the_next_turn()
   seal.submit("fun: second")
   complete_declaration("function first() end")
   equal(fake.main_turn_count, 1, "the second turn must not start with declaration permissions")
-  truthy(seal._state.live["/tmp/seal-project"].settings_blocked, "the unsafe thread should remain blocked")
+  truthy(seal._state.live[test_root].settings_blocked, "the unsafe thread should remain blocked")
   equal(seal._state.jobs[1].phase, "ready", "the completed declaration should still reach preview")
   equal(seal._state.jobs[2].phase, "generating", "the queued declaration should remain pending")
 end
@@ -1230,7 +1289,7 @@ function tests.rejected_declaration_start_does_not_wait_for_a_noop_restore()
   seal.submit("fun: reject before applying settings")
   truthy(request(fake, "thread/settings/update") == nil,
     "a rejected start must not enqueue an A-to-A restore and wait for a notification")
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   truthy(session.scheduler:current_lease() == nil, "the failed start should release its restore lease")
   truthy(vim.tbl_isempty(seal._state.jobs), "the rejected declaration should leave no stale marker")
 end
@@ -1246,7 +1305,7 @@ function tests.server_request_is_resolved_without_an_interactive_client()
   seal._server_request({
     id = 41,
     method = "item/commandExecution/requestApproval",
-    params = { threadId = "thread-a", turnId = "seal-turn" },
+    params = { threadId = "thread-a", turnId = "seal-turn", command = "make test" },
   })
   equal(fake.responses[#fake.responses], {
     id = 41,
@@ -1304,7 +1363,7 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
       diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
     },
     {
-      path = "/tmp/seal-project/storage.lua",
+      path = test_root .. "/storage.lua",
       kind = { type = "add" },
       diff = "@@ -0,0 +1 @@\n+return {}",
     },
@@ -1330,7 +1389,7 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
 
   vim.fn.maparg("q", "n", false, true).callback()
   truthy(seal._state.reviews["51"] ~= nil, "closing the view should defer rather than approve the patch")
-  truthy(seal.review("/tmp/seal-project"), ":SealReview should reopen the pending patch")
+  truthy(seal.review(test_root), ":SealReview should reopen the pending patch")
   review = seal._state.reviews["51"]
   equal(vim.api.nvim_get_current_buf(), review.view.buf, "the reopened review should be current")
   truthy(review.warning == nil, "the unchanged review should remain acceptable: " .. tostring(review.warning))
@@ -1358,6 +1417,140 @@ function tests.multi_file_patch_waits_for_review_and_acceptance()
     turn = { id = "main-turn", status = "completed" },
   })
   equal(vim.tbl_count(seal._state.activities), 0, "the marker should clear only when the turn finishes")
+end
+
+function tests.accepted_patch_reloads_its_open_buffer_when_the_item_completes()
+  setup({ "local value = 1" })
+  vim.fn.mkdir(test_root, "p")
+  vim.cmd("silent write")
+  seal.submit("update the value")
+  local source_path = vim.api.nvim_buf_get_name(0)
+  local changes = {
+    {
+      path = source_path,
+      kind = { type = "update" },
+      diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+    },
+  }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "patch-reload", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 164,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "patch-reload" },
+  })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  vim.fn.writefile({ "local value = 2" }, source_path)
+  seal._notification("item/completed", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "patch-reload", type = "fileChange", status = "completed", changes = changes },
+  })
+
+  truthy(vim.wait(500, function()
+    return vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "local value = 2"
+  end, 5), "an applied patch should reload its unmodified open buffer before the turn finishes")
+  equal(vim.tbl_count(seal._state.activities), 1, "reloading the patch should not finish the owning turn")
+end
+
+function tests.failed_patch_application_is_reported_and_cleared()
+  setup({ "local value = 1" })
+  vim.fn.mkdir(test_root, "p")
+  vim.cmd("silent write")
+  seal.submit("update the value")
+  local changes = { {
+    path = vim.api.nvim_buf_get_name(0),
+    kind = { type = "update" },
+    diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+  } }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "failed-patch", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 166,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "failed-patch" },
+  })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  seal._notification("item/completed", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "failed-patch", type = "fileChange", status = "failed", changes = changes },
+  })
+  local reported = false
+  for _, notification in ipairs(notifications) do
+    if notification.message:find("could not apply", 1, true) then
+      reported = true
+    end
+  end
+  truthy(reported, "a failed accepted patch should surface an error: " .. vim.inspect(notifications))
+  equal(vim.tbl_count(seal._state.accepted_file_items), 0,
+    "a terminal failed patch must leave no stale accepted-item state")
+end
+
+function tests.accepted_patch_preserves_edits_made_while_codex_applies_it()
+  setup({ "local value = 1" })
+  vim.fn.mkdir(test_root, "p")
+  vim.cmd("silent write")
+  seal.submit("update the value")
+  local source_path = vim.api.nvim_buf_get_name(0)
+  local changes = { {
+    path = source_path,
+    kind = { type = "update" },
+    diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+  } }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "modified-patch", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 167,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "modified-patch" },
+  })
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "local unsaved = true" })
+  vim.fn.writefile({ "local value = 2" }, source_path)
+  seal._notification("item/completed", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "modified-patch", type = "fileChange", status = "completed", changes = changes },
+  })
+  vim.wait(50)
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), { "local unsaved = true" },
+    "patch refresh must not replace edits made after acceptance")
+  truthy(seal._state.file_conflicts[vim.api.nvim_get_current_buf()] ~= nil,
+    "the editor/disk divergence should remain latched for manual resolution")
+end
+
+function tests.rejecting_a_bounded_patch_stops_its_turn()
+  setup({ "local value = 1" })
+  seal.submit("targeted: update the value")
+  local changes = { {
+    path = vim.api.nvim_buf_get_name(0),
+    kind = { type = "update" },
+    diff = "@@ -1 +1 @@\n-local value = 1\n+local value = 2",
+  } }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "rejected-bounded-patch", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 168,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "rejected-bounded-patch" },
+  })
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+  equal(response(fake, 168).result.decision, "decline", "the bounded patch should be rejected")
+  equal(request(fake, "turn/interrupt").params.turnId, "main-turn",
+    "rejecting a bounded patch should stop its owning turn")
 end
 
 function tests.targeted_patch_stops_only_after_the_accepted_patch_is_applied()
@@ -1477,7 +1670,7 @@ function tests.bounded_v2_child_patch_inherits_review_and_stops_the_root_turn()
   })
   local changes = {
     {
-      path = "/tmp/seal-project/storage.lua",
+      path = test_root .. "/storage.lua",
       kind = { type = "add" },
       diff = "@@ -0,0 +1 @@\n+return {}",
     },
@@ -1521,6 +1714,21 @@ function tests.bounded_turn_that_finishes_without_a_patch_fails()
     turn = { id = "main-turn", status = "completed" },
   })
   equal(activity.state, "failed", "bounded work should not succeed without its one applied patch")
+end
+
+function tests.numeric_work_ids_do_not_fall_through_to_legacy_kind_indexes()
+  setup({ "", "" }, { activity = { interval_ms = 100000 } })
+  seal.submit("run an agent turn")
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  seal.submit("fun: queued declaration")
+  local declaration = seal._state.jobs[1]
+  truthy(declaration and declaration.id ~= 1 and declaration.legacy_id == 1,
+    "the fixture should create the legacy/unified ID collision")
+  truthy(not seal.accept(1), "an agent's unified ID must not select a declaration through its legacy ID")
+  truthy(seal._state.jobs[1] == declaration, "the colliding declaration should remain untouched")
+  truthy(seal.reject(1), "reject should resolve the unified agent work item")
+  truthy(seal._state.jobs[1] == declaration, "rejecting the agent ID must not cancel the declaration")
+  seal.reject(declaration)
 end
 
 function tests.prompting_from_patch_review_targets_the_source_buffer()
@@ -1569,15 +1777,48 @@ function tests.prompting_from_patch_review_targets_the_source_buffer()
   truthy(request(fake, "thread/fork") == nil, "the declaration should stay in the backing chat")
   equal(seal._state.jobs[1].thread_id, nil, "the declaration should wait for the active targeted turn")
 
-  seal.reject(1)
+  seal.reject(seal._state.jobs[1])
   truthy(request(fake, "turn/interrupt") == nil, "rejecting a queued declaration should not interrupt the targeted turn")
-  seal.review("/tmp/seal-project")
+  seal.review(test_root)
+  vim.fn.maparg("<Esc>", "n", false, true).callback()
+end
+
+function tests.unloaded_named_buffers_do_not_block_patch_review()
+  setup({ "local source = true" })
+  local target_path = test_root .. "/unloaded-target.lua"
+  vim.fn.writefile({ "local target = true" }, target_path)
+  local leftover = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(leftover, target_path)
+  vim.api.nvim_buf_set_lines(leftover, 0, -1, false, { "stale unloaded text" })
+  vim.api.nvim_set_option_value("modified", false, { buf = leftover })
+  vim.cmd("silent bunload " .. leftover)
+  truthy(vim.api.nvim_buf_is_valid(leftover) and not vim.api.nvim_buf_is_loaded(leftover),
+    "the fixture should retain a valid unloaded buffer")
+
+  seal.submit("update the unloaded target")
+  local changes = { {
+    path = target_path,
+    kind = { type = "update" },
+    diff = "@@ -1 +1 @@\n-local target = true\n+local target = false",
+  } }
+  seal._notification("item/started", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    item = { id = "unloaded-target-patch", type = "fileChange", status = "inProgress", changes = changes },
+  })
+  seal._server_request({
+    id = 169,
+    method = "item/fileChange/requestApproval",
+    params = { threadId = "main-thread", turnId = "main-turn", itemId = "unloaded-target-patch" },
+  })
+  truthy(seal._state.reviews["169"].warning == nil,
+    "an unloaded :bdelete leftover should not be compared as an empty live buffer")
   vim.fn.maparg("<Esc>", "n", false, true).callback()
 end
 
 function tests.modified_review_target_is_saved_before_acceptance()
   setup({ "local value = 1" })
-  vim.fn.mkdir("/tmp/seal-project", "p")
+  vim.fn.mkdir(test_root, "p")
   vim.cmd("silent write")
   seal.submit("change this value")
   local source = vim.api.nvim_get_current_buf()
@@ -1618,7 +1859,7 @@ end
 
 function tests.external_review_target_change_remains_blocked()
   setup({ "local value = 1" })
-  vim.fn.mkdir("/tmp/seal-project", "p")
+  vim.fn.mkdir(test_root, "p")
   vim.cmd("silent write")
   local source_path = vim.api.nvim_buf_get_name(0)
   seal.submit("change this value")
@@ -1724,6 +1965,41 @@ function tests.command_approvals_auto_accept_by_default()
   equal(fake.responses[#fake.responses].result.decision, "acceptForSession", "Seal should honor the available accept form")
 end
 
+function tests.command_escalations_require_explicit_approval_even_when_commands_auto_accept()
+  local prompts = {}
+  setup({ "" }, {
+    select = function(items, opts, callback)
+      table.insert(prompts, opts.prompt)
+      callback(items[2])
+    end,
+  })
+  seal.submit("run a command")
+
+  for index, escalation in ipairs({
+    { networkApprovalContext = { host = "example.com" } },
+    { additionalPermissions = { fileSystem = { "/outside-workspace" } } },
+  }) do
+    local params = vim.tbl_extend("force", {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "command-escalation-" .. index,
+      command = "make test",
+      availableDecisions = { "accept", "decline", "cancel" },
+    }, escalation)
+    seal._server_request({
+      id = 160 + index,
+      method = "item/commandExecution/requestApproval",
+      params = params,
+    })
+    equal(fake.responses[#fake.responses].result.decision, "decline",
+      "capability escalation must not inherit ordinary command auto-approval")
+  end
+
+  equal(#prompts, 2, "each escalation should open an explicit approval prompt")
+  truthy(prompts[1]:find("Network request:", 1, true), "network context should be visible")
+  truthy(prompts[2]:find("Additional permissions:", 1, true), "additional permissions should be visible")
+end
+
 function tests.targeted_and_refactor_decline_commands_that_require_approval()
   for _, prompt in ipairs({ "targeted: update the value", "refactor: extract the branch" }) do
     setup({ "local value = 1" }, {
@@ -1769,7 +2045,7 @@ function tests.command_approval_warns_about_unpreviewed_writes()
       id = "command-1",
       type = "commandExecution",
       command = command,
-      cwd = "/tmp/seal-project",
+      cwd = test_root,
       status = "inProgress",
     },
   })
@@ -1794,7 +2070,7 @@ function tests.command_approval_warns_about_unpreviewed_writes()
     "command approval should explain its weaker review boundary"
   )
   truthy(approval_prompt:find("remove-important-file", 1, true), "the approval must not truncate a dangerous suffix")
-  truthy(approval_prompt:find("/tmp/seal-project", 1, true), "the approval should show the working directory")
+  truthy(approval_prompt:find(test_root, 1, true), "the approval should show the working directory")
   truthy(approval_prompt:find("local-workspace", 1, true), "the approval should show the execution environment")
   truthy(approval_prompt:find("run the requested test", 1, true), "the approval should show Codex's reason")
 end
@@ -1851,20 +2127,20 @@ end
 function tests.external_resolution_surfaces_the_next_patch_review()
   setup({ "" })
   seal.submit("make two changes")
-  seal._state.live["/tmp/second-project"] = {
-    root = "/tmp/second-project",
+  seal._state.live[second_root] = {
+    root = second_root,
     thread_id = "second-thread",
     active_turn_id = "second-turn",
   }
   seal._state.owned_turns["second-turn"] = {
-    root = "/tmp/second-project",
+    root = second_root,
     thread_id = "second-thread",
   }
   for index = 1, 2 do
     local item_id = "queued-patch-" .. index
     local thread_id = index == 1 and "main-thread" or "second-thread"
     local turn_id = index == 1 and "main-turn" or "second-turn"
-    local project = index == 1 and "/tmp/seal-project" or "/tmp/second-project"
+    local project = index == 1 and test_root or second_root
     seal._notification("item/started", {
       threadId = thread_id,
       turnId = turn_id,
@@ -1954,7 +2230,7 @@ function tests.seal_owned_child_thread_can_request_patch_review()
       status = "inProgress",
       changes = {
         {
-          path = "/tmp/seal-project/child.lua",
+          path = test_root .. "/child.lua",
           kind = { type = "add" },
           diff = "@@ -0,0 +1 @@\n+return true",
         },
@@ -1968,7 +2244,7 @@ function tests.seal_owned_child_thread_can_request_patch_review()
   })
 
   local review = seal._state.reviews["55"]
-  truthy(review and review.root == "/tmp/seal-project", "a Seal-owned child should inherit the main review root")
+  truthy(review and review.root == test_root, "a Seal-owned child should inherit the main review root")
   vim.fn.maparg("<Esc>", "n", false, true).callback()
   equal(fake.responses[#fake.responses].result.decision, "decline", "child patches should use the same review decision")
 end
@@ -1990,7 +2266,7 @@ function tests.unobserved_child_approval_fails_closed()
       status = "inProgress",
       changes = {
         {
-          path = "/tmp/seal-project/racy.lua",
+          path = test_root .. "/racy.lua",
           kind = { type = "add" },
           diff = "@@ -0,0 +1 @@\n+return true",
         },
@@ -2078,6 +2354,47 @@ function tests.declarations_run_fifo_on_the_shared_thread()
   seal.reject(2)
 end
 
+function tests.failed_interrupt_keeps_cancelled_turn_requests_fail_closed()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  function fake:request(method, params, callback)
+    if method == "turn/interrupt" then
+      table.insert(self.requests, { method = method, params = params })
+      callback(nil, { message = "interrupt transport failed" })
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("fun: cancel safely")
+  seal.reject(1)
+  local response_count = #fake.responses
+  seal._server_request({
+    id = 165,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      command = "send data elsewhere",
+      availableDecisions = { "accept", "decline" },
+    },
+  })
+  equal(#fake.responses, response_count + 1, "a request from the still-running cancelled turn must be answered")
+  equal(fake.responses[#fake.responses].result.decision, "decline",
+    "an interrupt failure must not restore the cancelled turn's approval authority")
+  local reported = false
+  for _, notification in ipairs(notifications) do
+    if notification.message:find("interrupt transport failed", 1, true) then
+      reported = true
+    end
+  end
+  truthy(reported, "the interrupt failure should be visible")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "interrupted" },
+  })
+end
+
 function tests.cancel_before_turn_start_response_waits_for_confirmed_ownership()
   setup({ "" }, { activity = { interval_ms = 100000 } })
   local original_request = fake.request
@@ -2155,6 +2472,41 @@ function tests.turn_started_notification_waits_for_start_response_ownership()
     threadId = "main-thread",
     turn = { id = "notification-turn", status = "interrupted" },
   })
+end
+
+function tests.thread_failure_clears_a_stale_settings_restore_block()
+  setup({ "" })
+  seal.submit("explain this file")
+  local session = seal._state.live[test_root]
+  session.settings_blocked = true
+  session.blocked_restore = { approvalPolicy = "never" }
+  seal._notification("thread/status/changed", {
+    threadId = "main-thread",
+    status = { type = "systemError" },
+  })
+  truthy(not session.settings_blocked, "a dead thread cannot satisfy an old settings restoration")
+  equal(session.blocked_restore, nil, "resetting a dead thread should discard the stale restore target")
+end
+
+function tests.failed_agent_turn_reports_the_server_error()
+  setup({ "" })
+  seal.submit("perform a task")
+  seal._notification("error", {
+    threadId = "main-thread",
+    turnId = "main-turn",
+    error = { message = "tool execution exploded" },
+  })
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "failed", error = { message = "tool execution exploded" } },
+  })
+  local surfaced = false
+  for _, notification in ipairs(notifications) do
+    if notification.message:find("tool execution exploded", 1, true) then
+      surfaced = true
+    end
+  end
+  truthy(surfaced, "a failed agent turn should surface the app-server error")
 end
 
 function tests.closed_shared_thread_clears_its_jobs()
@@ -2266,8 +2618,8 @@ function tests.agent_spinners_render_before_app_server_is_ready()
   truthy(summary:find("targeted · fix the build logger", 1, true), "the marker should show the newest request")
   truthy(summary:find("2 requests here", 1, true), "the marker should preserve the collocated request count")
   truthy(
-    seal._state.job_mappings[vim.api.nvim_get_current_buf()] == nil,
-    "informational markers must not install declaration mappings"
+    seal._state.job_mappings[vim.api.nvim_get_current_buf()] ~= nil,
+    "agent markers should install the documented Esc cancellation dispatcher"
   )
 
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "local edited = true" })
@@ -2368,7 +2720,7 @@ end
 function tests.delayed_old_client_exit_preserves_restarted_activity()
   seal._reset()
   notifications = {}
-  local project = "/tmp/seal-project"
+  local project = test_root
   local transports = {}
   seal.setup({
     transport_factory = function(_, _, on_exit)
@@ -2442,7 +2794,7 @@ function tests.status_batch_preserves_submission_order()
   held_read({
     thread = {
       id = "main-thread",
-      cwd = "/tmp/seal-project",
+      cwd = test_root,
       status = { type = "idle" },
     },
   })
@@ -2511,6 +2863,23 @@ function tests.mapping_away_from_marker_preserves_global_behavior()
   vim.keymap.del("n", "<Tab>")
 end
 
+function tests.escape_at_agent_markers_cancels_normal_and_targeted_turns()
+  for _, prompt in ipairs({ "explain this file", "targeted: update this file" }) do
+    setup({ "" }, { activity = { interval_ms = 100000 } })
+    seal.submit(prompt)
+    local escape = vim.fn.maparg("<Esc>", "n", false, true)
+    truthy(type(escape.callback) == "function", "agent markers should install the documented cancel mapping")
+    escape.callback()
+    equal(vim.tbl_count(seal._state.activities), 0, "Esc should remove the selected agent marker")
+    equal(request(fake, "turn/interrupt").params.turnId, "main-turn",
+      "Esc should stop the selected agent turn")
+    seal._notification("turn/completed", {
+      threadId = "main-thread",
+      turn = { id = "main-turn", status = "interrupted" },
+    })
+  end
+end
+
 function tests.rejecting_one_queued_job_keeps_its_sibling()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: first")
@@ -2524,7 +2893,13 @@ function tests.rejecting_one_queued_job_keeps_its_sibling()
   truthy(seal._state.jobs[2] ~= nil, "the queued sibling job should remain")
   equal(seal._state.spinner_timer, nil, "a queued sibling should remain visible without consuming animation ticks")
   seal.reject(2)
-  equal(request(fake, "turn/interrupt"), interrupt, "rejecting the queued sibling should not send another interrupt")
+  local interrupt_count = 0
+  for _, sent in ipairs(fake.requests) do
+    if sent.method == "turn/interrupt" then
+      interrupt_count = interrupt_count + 1
+    end
+  end
+  equal(interrupt_count, 1, "rejecting the queued sibling should not send another interrupt")
 end
 
 function tests.multiple_jobs_share_and_restore_buffer_mappings()
@@ -2600,7 +2975,7 @@ function tests.buffer_edit_reanchors_all_jobs()
   seal.submit("fun: second")
 
   local other = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_buf_set_name(other, "/tmp/seal-project/parallel-other.lua")
+  vim.api.nvim_buf_set_name(other, test_root .. "/parallel-other.lua")
   vim.api.nvim_set_option_value("filetype", "lua", { buf = other })
   vim.api.nvim_buf_set_lines(other, 0, -1, false, { "" })
   seal.submit("fun: other buffer", { buf = other, cursor = { 1, 0 } })
@@ -2630,6 +3005,27 @@ function tests.buffer_edit_reanchors_all_jobs()
   seal.reject(2)
   seal.reject(3)
   vim.api.nvim_buf_delete(other, { force = true })
+end
+
+function tests.deleting_every_line_keeps_buffer_reconciliation_usable()
+  for _, direct_limit in ipairs({ 16, 0 }) do
+    setup({ "only line" }, {
+      activity = { interval_ms = 100000 },
+      direct_reconcile_lines = direct_limit,
+    })
+    seal.submit("fun: survive an empty buffer")
+    local job = seal._state.jobs[1]
+    local model = seal._state.buffer_models[vim.api.nvim_get_current_buf()]
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, {})
+
+    truthy(vim.wait(500, function()
+      return seal._state.buffer_errors[job.snapshot.buf] == nil
+        and vim.deep_equal(model:lines(), { "" })
+    end, 5), "deleting all lines should reconcile the required empty buffer line")
+    truthy(seal._state.jobs[1] == job, "the active request should remain usable after deleting all lines")
+    complete_declaration("function survives_empty_buffer() end")
+    truthy(seal.reject(job), "the reconciled request should remain actionable")
+  end
 end
 
 function tests.deleting_marked_line_keeps_and_reanchors_job()
@@ -2770,8 +3166,35 @@ function tests.new_thread_interrupts_and_detaches_old_thread()
   seal._notification("serverRequest/resolved", { threadId = "old-child-thread", requestId = 96 })
 end
 
+function tests.new_thread_serializes_with_an_inflight_session_start()
+  setup({ "" }, { activity = { interval_ms = 100000 } })
+  local original_request = fake.request
+  local starts = {}
+  function fake:request(method, params, callback)
+    if method == "thread/start" then
+      table.insert(self.requests, { method = method, params = params })
+      table.insert(starts, callback)
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+
+  seal.submit("prompt while the session starts")
+  equal(#starts, 1, "the prompt should begin one project thread")
+  seal.new_thread()
+  equal(#starts, 1, ":SealNew must wait for the in-flight project thread response")
+
+  starts[1]({ thread = { id = "superseded-thread", status = { type = "idle" } } })
+  equal(#starts, 2, "the replacement should start only after the first load is resolved and detached")
+  starts[2]({ thread = { id = "replacement-thread", status = { type = "idle" } } })
+  equal(seal._state.live[test_root].thread_id, "replacement-thread",
+    "the replacement response should be the only live project session")
+  equal(vim.tbl_count(seal._state.activities), 0,
+    "work submitted to the explicitly replaced session should be cancelled")
+end
+
 complete_declaration = function(code)
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   local entry = session and session.current
   local thread_id = session and session.thread_id or "main-thread"
   local turn_id = entry and entry.turn_id or "main-turn"
@@ -2853,7 +3276,7 @@ function tests.queued_jobs_dispatch_in_their_own_buffers()
   seal.submit("fun: first buffer declaration")
 
   local second_buf = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_buf_set_name(second_buf, "/tmp/seal-project/parallel-second-buffer.lua")
+  vim.api.nvim_buf_set_name(second_buf, test_root .. "/parallel-second-buffer.lua")
   vim.api.nvim_set_option_value("filetype", "lua", { buf = second_buf })
   vim.api.nvim_buf_set_lines(second_buf, 0, -1, false, { "" })
   seal.submit("fun: second buffer declaration", { buf = second_buf, cursor = { 1, 0 } })
@@ -2888,7 +3311,7 @@ function tests.failed_freeform_preflight_keeps_other_buffer_preview()
   local path = vim.fn.tempname() .. ".lua"
   vim.api.nvim_buf_set_name(source, path)
   local other = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_buf_set_name(other, "/tmp/seal-project/preflight-preview.lua")
+  vim.api.nvim_buf_set_name(other, test_root .. "/preflight-preview.lua")
   vim.api.nvim_set_option_value("filetype", "lua", { buf = other })
   vim.api.nvim_buf_set_lines(other, 0, -1, false, { "" })
   seal.submit("fun: keep this preview", { buf = other, cursor = { 1, 0 } })
@@ -3193,7 +3616,7 @@ end
 function tests.buffer_rename_blocks_preview_rendering()
   setup({ "" })
   seal.submit("fun: stale after rename")
-  vim.api.nvim_buf_set_name(0, "/tmp/seal-project/renamed-before-preview.lua")
+  vim.api.nvim_buf_set_name(0, test_root .. "/renamed-before-preview.lua")
   complete_declaration("function stale_after_rename() end")
   truthy(seal._state.preview == nil, "a result for the old buffer path must not be rendered")
 end
@@ -3202,7 +3625,7 @@ function tests.buffer_rename_blocks_preview_acceptance()
   setup({ "" })
   seal.submit("fun: stale after rename")
   complete_declaration("function stale_after_rename() end")
-  vim.api.nvim_buf_set_name(0, "/tmp/seal-project/renamed-after-preview.lua")
+  vim.api.nvim_buf_set_name(0, test_root .. "/renamed-after-preview.lua")
   truthy(not seal.accept(), "a preview for the old buffer path must not be accepted")
   truthy(seal._state.preview == nil, "the renamed preview should be cleared")
 end
@@ -3246,7 +3669,7 @@ end
 function tests.python_type_alias_reaches_preview_by_default()
   setup({ "" })
   vim.bo.filetype = "python"
-  vim.api.nvim_buf_set_name(0, "/tmp/seal-project/storage_types.py")
+  vim.api.nvim_buf_set_name(0, test_root .. "/storage_types.py")
   seal.submit("type: represent values stored on disk")
   complete_declaration("StorageValue: TypeAlias = dict[str, str]")
 
@@ -3291,6 +3714,9 @@ end
 function tests.javascript_arrow_function_is_accepted()
   setup({ "" }, { validate_declarations = true })
   vim.bo.filetype = "javascript"
+  if not has_parser("javascript") then
+    return
+  end
   local snapshot = seal._capture()
   local valid, reason = seal._validate_declaration(snapshot, { "const load = () => true;" }, "function")
   truthy(valid, reason or "a JavaScript arrow function should validate as one function")
@@ -3298,23 +3724,27 @@ end
 
 function tests.interface_equivalents_are_accepted()
   setup({ "" }, { validate_declarations = true })
-  vim.bo.filetype = "rust"
-  local snapshot = seal._capture()
-  local rust_valid, rust_reason = seal._validate_declaration(snapshot, {
-    "pub trait Storage {",
-    "    fn load(&self, key: &str) -> String;",
-    "}",
-  }, "interface")
-  truthy(rust_valid, rust_reason or "a Rust trait should satisfy an interface request")
+  if has_parser("rust") then
+    vim.bo.filetype = "rust"
+    local snapshot = seal._capture()
+    local rust_valid, rust_reason = seal._validate_declaration(snapshot, {
+      "pub trait Storage {",
+      "    fn load(&self, key: &str) -> String;",
+      "}",
+    }, "interface")
+    truthy(rust_valid, rust_reason or "a Rust trait should satisfy an interface request")
+  end
 
-  vim.bo.filetype = "go"
-  snapshot = seal._capture()
-  local go_valid, go_reason = seal._validate_declaration(snapshot, {
-    "type Storage interface {",
-    "    Load(key string) string",
-    "}",
-  }, "interface")
-  truthy(go_valid, go_reason or "a Go interface declaration should validate through its type wrapper")
+  if has_parser("go") then
+    vim.bo.filetype = "go"
+    local snapshot = seal._capture()
+    local go_valid, go_reason = seal._validate_declaration(snapshot, {
+      "type Storage interface {",
+      "    Load(key string) string",
+      "}",
+    }, "interface")
+    truthy(go_valid, go_reason or "a Go interface declaration should validate through its type wrapper")
+  end
 end
 
 function tests.failed_editor_apply_keeps_the_canonical_preview()
@@ -3386,7 +3816,7 @@ function tests.collocated_ready_and_blocked_jobs_remain_actionable()
   local third = seal._state.jobs[3]
   vim.api.nvim_buf_set_lines(0, 0, 1, false, { "local changed = true" })
   complete_declaration("function first_ready() end")
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   truthy(vim.wait(1000, function()
     return session.preflight_blocked == second.id
   end, 5), "the second ambiguous request should block before dispatch")
@@ -3455,9 +3885,9 @@ end
 
 function tests.blocked_agent_retries_in_fifo_order_after_save()
   setup({ "local source = true" }, { save_before_agent = false, activity = { interval_ms = 100000 } })
-  vim.fn.mkdir("/tmp/seal-project", "p")
+  vim.fn.mkdir(test_root, "p")
   local other = vim.api.nvim_create_buf(true, false)
-  local other_path = "/tmp/seal-project/seal-blocked-retry.lua"
+  local other_path = test_root .. "/seal-blocked-retry.lua"
   vim.fn.delete(other_path)
   vim.api.nvim_buf_set_name(other, other_path)
   vim.api.nvim_buf_set_lines(other, 0, -1, false, { "local dirty = true" })
@@ -3508,7 +3938,7 @@ function tests.one_hundred_marks_share_one_fast_buffer_model()
   equal(vim.tbl_count(seal._state.jobs), 100, "all marks should remain canonical and independently addressable")
   equal(#seal._state.buffer_models[buf]:ids(), 100, "one shared model should own all buffer anchors")
   equal(vim.tbl_count(seal._state.animated_items), 1, "only the leased turn should animate")
-  equal(#seal._state.live["/tmp/seal-project"].scheduler:queue_ids(), 99,
+  equal(#seal._state.live[test_root].scheduler:queue_ids(), 99,
     "the remaining requests should stay as static FIFO IDs")
 
   local original_diff = vim.diff
@@ -3570,7 +4000,7 @@ function tests.delayed_settings_restore_cannot_mutate_a_reset_scheduler()
   seal.submit("fun: close while restoring settings")
   truthy(held_restore ~= nil, "the declaration should have a pending settings restoration")
   seal._notification("thread/closed", { threadId = "main-thread" })
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   local reset_scheduler = session.scheduler
   local ok, callback_error = pcall(held_restore, {})
   truthy(ok, "a delayed restore callback must be ignored after reset: " .. tostring(callback_error))
@@ -3582,7 +4012,7 @@ function tests.cancelled_running_item_retires_until_its_lease_finishes()
   setup({ "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: cancel after dispatch")
   local job = seal._state.jobs[1]
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   seal._notification("item/started", {
     threadId = "main-thread",
     turnId = "main-turn",
@@ -3608,7 +4038,10 @@ function tests.cancelled_running_item_retires_until_its_lease_finishes()
       availableDecisions = { "accept", "decline" },
     },
   })
-  equal(#fake.responses, response_count, "canceling a running item must revoke its child's command authority")
+  equal(#fake.responses, response_count + 1,
+    "canceling a running item must answer its child's command request fail-closed")
+  equal(fake.responses[#fake.responses].result.decision, "decline",
+    "a cancelled child must not retain command authority")
 
   seal._notification("turn/completed", {
     threadId = "main-thread",
@@ -3645,6 +4078,7 @@ function tests.early_server_request_replays_only_after_turn_confirmation()
     params = {
       threadId = "main-thread",
       turnId = "early-owned-turn",
+      command = "make test",
       availableDecisions = { "accept", "decline" },
     },
   })
@@ -3656,6 +4090,42 @@ function tests.early_server_request_replays_only_after_turn_confirmation()
     threadId = "main-thread",
     turn = { id = "early-owned-turn", status = "completed" },
   })
+end
+
+function tests.nonretryable_start_failure_discards_buffered_turn_events()
+  setup({ "" })
+  local original_request = fake.request
+  local held_start
+  function fake:request(method, params, callback)
+    if method == "turn/start" then
+      table.insert(self.requests, { method = method, params = params })
+      held_start = callback
+      return
+    end
+    return original_request(self, method, params, callback)
+  end
+  seal.submit("start a turn that fails")
+  seal._notification("turn/started", {
+    threadId = "main-thread",
+    turn = { id = "orphaned-start-event", status = "inProgress" },
+  })
+  local session = seal._state.live[test_root]
+  truthy(next(session.scheduler.pending_turn_events) ~= nil, "the early event should be buffered before the response")
+  held_start(nil, { message = "request was rejected" })
+  equal(next(session.scheduler.pending_turn_events), nil,
+    "a terminal start failure must discard events that can no longer be correlated")
+  equal(next(session.unbound_turns or {}), nil, "the failed attempt must clear its unbound-turn index")
+end
+
+function tests.resolved_request_deduplication_is_bounded()
+  setup({ "" })
+  for request_id = 1, 1100 do
+    seal._notification("serverRequest/resolved", { requestId = request_id })
+  end
+  equal(vim.tbl_count(seal._state.resolved_requests), 1024,
+    "resolved request deduplication should retain only its bounded recent window")
+  truthy(seal._state.resolved_requests["1"] == nil and seal._state.resolved_requests["1100"],
+    "the bounded window should expire the oldest request IDs first")
 end
 
 function tests.buffered_collab_ownership_replays_an_exact_child_request()
@@ -3757,9 +4227,11 @@ function tests.cancelled_start_never_replays_an_early_server_request()
   })
   seal.reject(1)
   held_start({ turn = { id = "cancelled-early-turn" } })
-  equal(#fake.responses, response_count, "a canceled item must not approve a buffered command")
+  equal(#fake.responses, response_count + 1, "a canceled item must answer its buffered command fail-closed")
+  equal(response(fake, 91).result.decision, "decline", "the cancelled parent command should be declined")
   vim.wait(20)
-  equal(#fake.responses, response_count, "a canceled parent must not claim or approve its buffered child")
+  equal(#fake.responses, response_count + 2, "a canceled parent must answer its observed child fail-closed")
+  equal(response(fake, 93).result.decision, "decline", "the cancelled child command should be declined")
   equal(request(fake, "turn/interrupt").params.turnId, "cancelled-early-turn",
     "the exact confirmed canceled turn should be interrupted")
   seal._notification("turn/completed", {
@@ -3862,7 +4334,7 @@ function tests.inflight_restore_converges_on_the_latest_external_settings()
       activePermissionProfile = vim.NIL,
     },
   })
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   equal(session.settings.approvalPolicy, "untrusted", "local session state should converge on the final policy")
   equal(session.settings.approvalsReviewer, "user", "local session state should converge on the final reviewer")
   equal(#restore_callbacks, 2, "a later external A should win without another Seal write")
@@ -3884,7 +4356,7 @@ function tests.settings_restore_clears_a_stale_permission_profile()
   end
   seal.submit("fun: clear a stale permission profile")
   truthy(held_restore ~= nil, "the declaration should begin restoring its thread settings")
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   session.settings.activePermissionProfile = { id = "stale-profile" }
   held_restore({})
   equal(session.settings.activePermissionProfile.id, "stale-profile",
@@ -3944,7 +4416,7 @@ function tests.external_completion_during_restore_does_not_revive_busy_state()
     },
   })
   held_start(nil, { message = "thread already has an active turn" })
-  local session = seal._state.live["/tmp/seal-project"]
+  local session = seal._state.live[test_root]
   equal(session.external_turn_id, "external-race-turn", "the retry should wait for the external turn")
   truthy(held_restore ~= nil, "the failed declaration start should be restoring settings")
   seal._notification("turn/completed", {
@@ -3976,7 +4448,7 @@ function tests.prompt_keeps_originating_snapshot()
     client = fake,
     save_before_agent = false,
     root = function()
-      return "/tmp/seal-project"
+      return test_root
     end,
     notify = function(message, level)
       table.insert(notifications, { message = message, level = level })
@@ -3992,11 +4464,59 @@ function tests.prompt_keeps_originating_snapshot()
   truthy(request(fake, "turn/start") == nil, "changed origin buffer should prevent submission")
 end
 
+function tests.review_defaults_null_kinds_and_cleans_up_after_open_failure()
+  local Review = require("seal.review")
+  local lines = Review.lines({ {
+    path = test_root .. "/example.lua",
+    kind = vim.NIL,
+    diff = "@@ -1 +1 @@\n-old\n+new",
+  } }, test_root)
+  truthy(lines[1]:find("UPDATE example.lua", 1, true) ~= nil,
+    "a protocol null kind should render as an update")
+
+  local original_open_win = vim.api.nvim_open_win
+  vim.api.nvim_open_win = function()
+    error("forced review window failure")
+  end
+  local ok = pcall(Review.open, {
+    id = "failed-open",
+    root = test_root,
+    changes = {},
+    can_accept = false,
+    on_decision = function() end,
+    on_defer = function() end,
+  })
+  vim.api.nvim_open_win = original_open_win
+  truthy(not ok, "the injected window failure should propagate")
+  equal(vim.fn.bufnr("seal://review/failed-open"), -1,
+    "a failed review window must not leave a named scratch buffer behind")
+
+  local decision
+  Review.open({
+    id = "cancel-key",
+    root = test_root,
+    changes = {},
+    can_accept = true,
+    on_decision = function(value)
+      decision = value
+    end,
+    on_defer = function() end,
+  })
+  truthy(vim.fn.maparg("a", "n", false, true).callback == nil,
+    "ordinary editing keys must not decide a patch")
+  truthy(vim.fn.maparg("d", "n", false, true).callback == nil,
+    "ordinary editing keys must not reject a patch")
+  vim.fn.maparg("x", "n", false, true).callback()
+  equal(decision, "cancel", "x should reject the patch and stop its turn")
+end
+
 local order = {
   "routes_only_known_prefixes",
   "normalizes_nested_indentation",
   "large_context_keeps_cursor_line",
   "visual_selection_shares_the_context_budget",
+  "visual_prompt_mapping_uses_the_active_selection",
+  "repeated_setup_removes_only_its_old_global_keymaps",
   "freeform_uses_main_thread_unchanged",
   "targeted_adds_minimal_change_guidance_to_the_main_thread",
   "refactor_adds_minimal_behavior_preserving_guidance",
@@ -4037,15 +4557,22 @@ local order = {
   "rejected_declaration_start_does_not_wait_for_a_noop_restore",
   "server_request_is_resolved_without_an_interactive_client",
   "multi_file_patch_waits_for_review_and_acceptance",
+  "accepted_patch_reloads_its_open_buffer_when_the_item_completes",
+  "failed_patch_application_is_reported_and_cleared",
+  "accepted_patch_preserves_edits_made_while_codex_applies_it",
+  "rejecting_a_bounded_patch_stops_its_turn",
   "targeted_patch_stops_only_after_the_accepted_patch_is_applied",
   "second_bounded_patch_is_rejected_and_invalidates_the_first_review",
   "bounded_v2_child_patch_inherits_review_and_stops_the_root_turn",
   "bounded_turn_that_finishes_without_a_patch_fails",
+  "numeric_work_ids_do_not_fall_through_to_legacy_kind_indexes",
   "prompting_from_patch_review_targets_the_source_buffer",
+  "unloaded_named_buffers_do_not_block_patch_review",
   "modified_review_target_is_saved_before_acceptance",
   "external_review_target_change_remains_blocked",
   "unsafe_patch_has_no_accept_mapping",
   "command_approvals_auto_accept_by_default",
+  "command_escalations_require_explicit_approval_even_when_commands_auto_accept",
   "targeted_and_refactor_decline_commands_that_require_approval",
   "command_approval_warns_about_unpreviewed_writes",
   "command_approval_honors_available_decisions",
@@ -4057,8 +4584,11 @@ local order = {
   "unobserved_child_request_never_opens_a_review",
   "tui_owned_child_thread_is_not_claimed_by_seal",
   "declarations_run_fifo_on_the_shared_thread",
+  "failed_interrupt_keeps_cancelled_turn_requests_fail_closed",
   "cancel_before_turn_start_response_waits_for_confirmed_ownership",
   "turn_started_notification_waits_for_start_response_ownership",
+  "thread_failure_clears_a_stale_settings_restore_block",
+  "failed_agent_turn_reports_the_server_error",
   "closed_shared_thread_clears_its_jobs",
   "collocated_jobs_are_preserved_and_selected_newest_first",
   "spinner_renders_before_app_server_is_ready",
@@ -4071,17 +4601,20 @@ local order = {
   "status_batch_preserves_submission_order",
   "spinner_is_anchored_and_animates_in_place",
   "mapping_away_from_marker_preserves_global_behavior",
+  "escape_at_agent_markers_cancels_normal_and_targeted_turns",
   "rejecting_one_queued_job_keeps_its_sibling",
   "multiple_jobs_share_and_restore_buffer_mappings",
   "closed_source_buffer_discards_ready_jobs_and_mappings",
   "mapping_installed_during_a_job_is_not_clobbered",
   "mapping_restoration_preserves_replace_keycodes",
   "buffer_edit_reanchors_all_jobs",
+  "deleting_every_line_keeps_buffer_reconciliation_usable",
   "deleting_marked_line_keeps_and_reanchors_job",
   "insert_mode_away_from_marker_keeps_and_reanchors_job",
   "undo_away_from_marker_keeps_job",
   "editing_selected_context_keeps_job",
   "new_thread_interrupts_and_detaches_old_thread",
+  "new_thread_serializes_with_an_inflight_session_start",
   "early_result_replays_after_late_start_response",
   "queued_jobs_dispatch_in_their_own_buffers",
   "failed_freeform_preflight_keeps_other_buffer_preview",
@@ -4121,6 +4654,8 @@ local order = {
   "delayed_settings_restore_cannot_mutate_a_reset_scheduler",
   "cancelled_running_item_retires_until_its_lease_finishes",
   "early_server_request_replays_only_after_turn_confirmation",
+  "nonretryable_start_failure_discards_buffered_turn_events",
+  "resolved_request_deduplication_is_bounded",
   "buffered_collab_ownership_replays_an_exact_child_request",
   "cancelled_start_never_replays_an_early_server_request",
   "external_settings_before_start_response_become_restore_target",
@@ -4128,6 +4663,7 @@ local order = {
   "settings_restore_clears_a_stale_permission_profile",
   "external_completion_during_restore_does_not_revive_busy_state",
   "prompt_keeps_originating_snapshot",
+  "review_defaults_null_kinds_and_cleans_up_after_open_failure",
 }
 
 for _, name in ipairs(order) do
@@ -4136,4 +4672,7 @@ for _, name in ipairs(order) do
 end
 
 seal._reset()
+vim.fn.delete(test_root, "rf")
+vim.fn.delete(second_root, "rf")
+vim.fn.delete(other_root, "rf")
 io.stdout:write(string.format("%d tests passed\n", #order))

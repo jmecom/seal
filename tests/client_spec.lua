@@ -42,13 +42,16 @@ local function new_fake_transport(options)
     sent = {},
     stop_calls = 0,
     send_ok = true,
+    runs = {},
   }
 
   function fake.factory(_, on_line, on_exit)
     fake.factory_calls = fake.factory_calls + 1
+    local run = { on_line = on_line, on_exit = on_exit }
+    table.insert(fake.runs, run)
     fake.on_line = on_line
     fake.on_exit = on_exit
-    fake.transport = {
+    run.transport = {
       send = function(_, line)
         table.insert(fake.sent, vim.json.decode(line))
         return fake.send_ok
@@ -60,7 +63,8 @@ local function new_fake_transport(options)
         end
       end,
     }
-    return fake.transport
+    fake.transport = run.transport
+    return run.transport
   end
 
   function fake:emit(message)
@@ -364,6 +368,96 @@ test("stops the transport and rejects subsequent requests", function()
 
   client:stop()
   assert_equal(1, fake.stop_calls, "stop should be idempotent after the transport is gone")
+end)
+
+test("fails a request immediately when the transport cannot send", function()
+  local fake = new_fake_transport()
+  local client = Client.new({ transport_factory = fake.factory })
+  start_ready(client, fake)
+  fake.send_ok = false
+  local result
+  client:request("thread/read", {}, function(_, err)
+    result = err
+  end)
+  assert_equal({ message = "could not send the app-server message" }, result)
+  assert_equal({}, client.pending, "a failed send must not leave a pending request")
+end)
+
+test("times out startup and requests with actionable errors", function()
+  local startup_fake = new_fake_transport()
+  local startup_result
+  local startup_client = Client.new({
+    transport_factory = startup_fake.factory,
+    startup_timeout_ms = 10,
+  })
+  startup_client:start(function(ok, err)
+    startup_result = { ok = ok, err = err }
+  end)
+  wait_until(function()
+    return startup_result ~= nil
+  end, "startup timeout did not release its waiter")
+  assert_equal(false, startup_result.ok)
+  assert_true(startup_result.err:find("startup timed out", 1, true) ~= nil)
+  assert_equal(1, startup_fake.stop_calls)
+
+  local request_fake = new_fake_transport()
+  local request_client = Client.new({
+    transport_factory = request_fake.factory,
+    request_timeout_ms = 10,
+  })
+  start_ready(request_client, request_fake)
+  local request_error
+  request_client:request("thread/read", {}, function(_, err)
+    request_error = err
+  end)
+  wait_until(function()
+    return request_error ~= nil
+  end, "request timeout did not release its callback")
+  assert_true(request_error.message:find("request timed out", 1, true) ~= nil)
+  assert_equal({}, request_client.pending)
+end)
+
+test("rejects invalid UTF-8 before it reaches the shared transport", function()
+  local fake = new_fake_transport()
+  local client = Client.new({ transport_factory = fake.factory })
+  start_ready(client, fake)
+  local sent_before = #fake.sent
+  local request_error
+  client:request("turn/start", { input = string.char(255) }, function(_, err)
+    request_error = err
+  end)
+  assert_true(request_error and request_error.message:find("valid UTF-8", 1, true) ~= nil)
+  assert_equal(sent_before, #fake.sent, "invalid UTF-8 must not be written to the bridge")
+end)
+
+test("ignores an old transport exit after restart", function()
+  local fake = new_fake_transport()
+  local client = Client.new({ transport_factory = fake.factory })
+  start_ready(client, fake)
+  local first = fake.runs[1]
+  client:stop()
+
+  local restarted
+  client:start(function(ok, err)
+    restarted = { ok = ok, err = err }
+  end)
+  local second = fake.runs[2]
+  second.on_line(vim.json.encode({ seal = { event = "ready", url = "ws://127.0.0.1:4600" } }))
+  wait_until(function()
+    return fake.sent[#fake.sent] and fake.sent[#fake.sent].method == "initialize"
+  end)
+  local initialize = fake.sent[#fake.sent]
+  second.on_line(vim.json.encode({ id = initialize.id, result = {} }))
+  wait_until(function()
+    return restarted ~= nil
+  end)
+  assert_equal({ ok = true }, restarted)
+
+  first.on_exit(0, true)
+  vim.wait(20)
+  assert_true(client.ready, "a stale exit must not reset the restarted client")
+  assert_true(client.transport == second.transport, "a stale exit must not discard the new transport")
+  assert_equal("ws://127.0.0.1:4600", client:url())
 end)
 
 local failures = {}

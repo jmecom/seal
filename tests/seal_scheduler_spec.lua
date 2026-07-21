@@ -378,9 +378,11 @@ function tests.retry_requeues_by_original_fifo_order_after_restore()
   equal(second_attempt.item_id, "first", "the same item should receive the retry lease")
   equal(second_attempt.generation, 2, "a retry must use a new generation")
   truthy(second_attempt.token ~= first_attempt.token, "a retry must use a new token")
+  truthy(not second_attempt.restore_required, "a restored attempt must not carry its old restoration barrier")
   local _, stale_err = scheduler:start_succeeded(first_attempt.token, "stale-turn")
   error_code(stale_err, "stale_start_attempt", "an old response must not bind the retry lease")
 
+  scheduler:require_restore(second_attempt.token)
   scheduler:start_succeeded(second_attempt.token, "retry-turn")
   scheduler:restore_finished(second_attempt.token, true)
   scheduler:finish_turn("retry-turn", "done")
@@ -468,6 +470,34 @@ function tests.blocked_items_are_removed_and_can_be_requeued()
   equal(scheduler:queue_ids(), { "first", "second" }, "unblocking should restore submission order")
 end
 
+function tests.leased_blocked_item_cannot_be_unblocked()
+  local scheduler = Scheduler.new()
+  scheduler:enqueue("first", nil, { restore_required = true })
+  local lease = scheduler:start_next()
+  scheduler:start_failed(lease.token, { retry = true, error = "busy" })
+
+  local unblocked, err = scheduler:unblock_item("first")
+  equal(unblocked, nil, "a finalizing lease must remain out of the queue")
+  error_code(err, "invalid_transition", "leased unblock should fail explicitly")
+  equal(scheduler:queue_ids(), {}, "the leased item must not also appear in the queue")
+  truthy(scheduler:validate(), "rejected unblock must preserve scheduler invariants")
+  scheduler:restore_finished(lease.token, true)
+end
+
+function tests.clear_block_requeues_only_unleased_blocked_items()
+  local scheduler = Scheduler.new()
+  scheduler:enqueue("first")
+  scheduler:enqueue("second")
+  scheduler:block_item("first", "restore failed")
+  scheduler:set_block({ code = "restore_failed" })
+
+  local action = scheduler:clear_block({ requeue_items = true })
+  equal(action.requeued, { "first" }, "clear_block should report the items it made runnable")
+  equal(scheduler:queue_ids(), { "first", "second" },
+    "recovery should restore original FIFO order without duplicating siblings")
+  truthy(scheduler:validate(), "clear_block recovery should preserve scheduler invariants")
+end
+
 function tests.invalid_transitions_return_structured_errors()
   local scheduler = Scheduler.new()
   scheduler:enqueue("item")
@@ -490,6 +520,16 @@ function tests.invalid_transitions_return_structured_errors()
   truthy(scheduler:forget("item"), "terminal items should be removable")
 end
 
+function tests.duplicate_item_error_survives_a_missing_canonical_object()
+  local scheduler = Scheduler.new()
+  scheduler:enqueue("item")
+  scheduler.items.item = nil
+  local duplicate, err = scheduler:enqueue("item")
+  equal(duplicate, nil, "the retained scheduler metadata should still reject the duplicate ID")
+  error_code(err, "duplicate_item", "the duplicate should return a structured error instead of crashing")
+  equal(err.state, nil, "the error should tolerate a separately purged canonical object")
+end
+
 local order = {
   "queue_contains_ids_and_issues_one_lease",
   "external_registry_owns_the_canonical_lifecycle",
@@ -510,7 +550,10 @@ local order = {
   "queued_cancellation_is_eager_and_does_not_touch_siblings",
   "running_cancellation_targets_only_the_owned_turn",
   "blocked_items_are_removed_and_can_be_requeued",
+  "leased_blocked_item_cannot_be_unblocked",
+  "clear_block_requeues_only_unleased_blocked_items",
   "invalid_transitions_return_structured_errors",
+  "duplicate_item_error_survives_a_missing_canonical_object",
 }
 
 for _, name in ipairs(order) do

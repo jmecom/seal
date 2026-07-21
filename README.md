@@ -83,7 +83,7 @@ The project root, file path, file type, cursor line and byte column, nearby buff
 
 Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. A writable turn blocked by another modified project buffer remains queued and retries after the buffers are saved; later prompts cannot overtake it. After any main-thread turn, Seal reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
 
-Normal Seal turns keep Codex's `untrusted` approval policy so file changes still reach Seal's review boundary. Seal auto-approves command-execution requests by default, while every Seal-owned file-change request opens the complete patch in a read-only diff window before Seal answers. `targeted:` and `refactor:` are the exception: Seal declines commands that require approval, rejects a second patch proposal, and stops the owning turn after the first accepted patch completes. If Codex unexpectedly delegates despite the bounded prompt, observed child patch requests inherit the same review and one-patch handling. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself is not atomic and can partially fail. Seal queues concurrent file-change requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Opening a new Seal prompt from the review defers it and targets the underlying editable source buffer. When you accept, Seal saves modified target buffers before approving the patch; Codex will apply clean hunks or report that its patch no longer applies. External disk changes and save/format conflicts still block acceptance.
+Normal Seal turns keep Codex's `untrusted` approval policy so file changes still reach Seal's review boundary. Seal auto-approves displayed command-execution requests by default, but requests that add network access or permissions always require an explicit decision. Every Seal-owned file-change request opens the complete patch in a read-only diff window before Seal answers. `targeted:` and `refactor:` are the exception: Seal declines commands that require approval, rejects a second patch proposal, and stops the owning turn after the first accepted patch completes. If Codex unexpectedly delegates despite the bounded prompt, observed child patch requests inherit the same review and one-patch handling. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself is not atomic and can partially fail. Seal queues concurrent file-change requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Opening a new Seal prompt from the review defers it and targets the underlying editable source buffer. When you accept, Seal saves modified target buffers before approving the patch; Codex will apply clean hunks or report that its patch no longer applies. Once app-server reports that the accepted patch was applied, Seal immediately reloads unmodified target buffers. Edits made while the patch was applying are preserved and latched as conflicts for manual resolution. External disk changes and save/format conflicts still block acceptance.
 
 This is an app-server approval UI, not a universal filesystem barrier. A formatter, generator, script, MCP tool, or shell command that app-server executes without requesting approval can change files directly without a patch preview. App-server can also skip a prompt after another attached client grants session-wide approval, and custom Codex or Seal permission settings can disable prompts. The bounded-prefix prompt and command declines prevent the normal verification path, but they cannot override permissions granted elsewhere. App-server does not expose a per-turn collaboration-tool switch, so the no-subagent rule is a model instruction rather than a hard security boundary. Set `auto_approve_commands = false` to restore per-command dialogs for normal turns. Turns started from an attached Codex TUI use that TUI's permissions and are not presented as Seal-reviewed turns. Keep the workspace sandbox enabled; Seal's path checks are a review safeguard, not a replacement for it.
 
@@ -106,16 +106,22 @@ Seal does not block model output based on language-specific AST shapes. Prefixes
 ```lua
 require("seal").setup({
   codex_command = "codex",
+  -- bridge = "/absolute/path/to/seal-bridge",
+  startup_timeout_ms = 10000,
+  request_timeout_ms = 30000,
   main_sandbox = "workspace-write",
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
   auto_approve_commands = true,
   save_before_agent = true,
   validate_declarations = false,
+  max_context_chars = 120000,
   max_pending_items = 100,
+  direct_reconcile_lines = 16,
   activity = {
     interval_ms = 80,
     max_summary_cells = 56,
+    frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
   },
   keymaps = {
     prompt = "<leader>ai",
@@ -138,6 +144,7 @@ require("seal").setup({
 
 `declaration_instructions` is keyed by the resolved declaration kind, so aliases such as `fn` share the `function` instruction.
 Custom `agent_prefixes.targeted` and `agent_prefixes.refactor` strings replace only the wording; those two prefixes remain bounded patch turns.
+Set `bridge` only when the built `bin/seal-bridge` cannot be discovered through Neovim's `runtimepath`. Startup and request timeouts release queued editor work if a live process stops responding.
 
 The model, reasoning level, and other defaults come from the normal Codex configuration. Seal gives declaration turns a temporary read-only policy and bounded patch turns a temporary user-review policy, then restores the thread's previous sandbox and review settings for subsequent Seal or TUI turns.
 
