@@ -4,11 +4,11 @@ Seal is a small Neovim interface for a real Codex session.
 
 Press one key, enter a prompt, and Seal routes it in one of three ways:
 
-- A normal prompt goes unchanged to one persistent Codex thread. Seal immediately leaves a spinner and prompt summary at the originating cursor until the turn finishes. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
-- `targeted:` and `refactor:` use that same thread as bounded patch turns. Codex may inspect the repository, then proposes one reviewed patch and stops after app-server applies it. These turns do not run tests, builds, linters, or formatters.
+- A normal prompt goes unchanged to one persistent Codex thread without adding inline status to the source buffer. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
+- `targeted:` and `refactor:` use that same thread as bounded patch turns and leave a spinner and prompt summary at the originating cursor while they run. Codex may inspect the repository, then proposes one reviewed patch and stops after app-server applies it. These turns do not run tests, builds, linters, or formatters.
 - `fun:`, `type:`, `class:`, and other declaration prefixes use read-only turns in the same conversation. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview.
 
-You can mark several prompts immediately. On each project thread, Seal keeps every request visible and runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Only the request that owns the current turn animates; queued markers are static. Collocated requests share one marker with a count and remain independently addressable, newest first.
+You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Prefixed requests remain visible inline; only the request that owns the current turn animates, while queued markers are static. Collocated visible requests share one marker with a count and remain independently addressable, newest first.
 
 Codex owns the agent loop, tools, conversation history, and compaction. Seal keeps only one thread ID per project root in the current Neovim process.
 
@@ -97,7 +97,7 @@ Seal never opens a terminal or Zellij pane. Permission expansion and structured 
 
 `SealChat` replaces the current buffer with a read-only conversation view. Press `r` to refresh and `q` to return. It shows persisted user and Codex messages from every normal, targeted, and declaration turn while omitting tool activity, editor context attachments, and system instructions.
 
-The backing session is a normal Codex app-server thread. To use the full Codex TUI for that exact conversation, run `:SealAttach`, switch to your existing Zellij terminal pane, and paste the copied command. Seal only copies the `codex resume --remote ...` command; it never creates or controls the pane.
+The backing session is a normal Codex app-server thread. You can run `:SealAttach` before sending any prompt, switch to your existing Zellij terminal pane, and paste the copied command. The remote TUI creates the empty chat and Seal adopts it; a Seal prompt entered while the TUI is connecting waits for that handoff, then appears in the visible TUI conversation. Once the chat has processed a turn and has durable history, later `:SealAttach` calls copy an exact `codex resume --remote ...` command instead. Seal only copies the command; it never creates or controls the pane. A standalone TUI that was not started with the copied `--remote` endpoint cannot be adopted while it is already running.
 
 Seal does not block model output based on language-specific AST shapes. Prefixes constrain the Codex prompt, and the inline preview plus `Tab` is the approval boundary. Set `validate_declarations = true` to opt into the stricter Tree-sitter check that requires one syntax unit of the requested kind.
 
@@ -109,6 +109,8 @@ require("seal").setup({
   -- bridge = "/absolute/path/to/seal-bridge",
   startup_timeout_ms = 10000,
   request_timeout_ms = 30000,
+  attach_timeout_ms = 120000,
+  verbose = false,
   main_sandbox = "workspace-write",
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
@@ -144,7 +146,8 @@ require("seal").setup({
 
 `declaration_instructions` is keyed by the resolved declaration kind, so aliases such as `fn` share the `function` instruction.
 Custom `agent_prefixes.targeted` and `agent_prefixes.refactor` strings replace only the wording; those two prefixes remain bounded patch turns.
-Set `bridge` only when the built `bin/seal-bridge` cannot be discovered through Neovim's `runtimepath`. A startup or request timeout retires that app-server connection because a timed-out mutating request may still complete remotely; the next prompt starts a fresh connection instead of accepting a late response into the wrong session.
+Set `bridge` only when the built `bin/seal-bridge` cannot be discovered through Neovim's `runtimepath`. `attach_timeout_ms` bounds how long prompts wait for a copied empty-chat TUI command to connect. A startup or request timeout retires that app-server connection because a timed-out mutating request may still complete remotely; the next prompt starts a fresh connection instead of accepting a late response into the wrong session.
+Set `verbose = true` to show routine prompt-sent and turn-finished notifications. Errors, warnings, reviews, cancellations, and decisions are always shown.
 
 The model, reasoning level, and other defaults come from the normal Codex configuration. Seal gives declaration turns a temporary read-only policy and bounded patch turns a temporary user-review policy, then restores the thread's previous sandbox and review settings for subsequent Seal or TUI turns.
 

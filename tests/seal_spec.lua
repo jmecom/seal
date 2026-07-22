@@ -116,7 +116,14 @@ local function fake_client()
         serviceTier = "fast",
       })
     elseif method == "thread/resume" then
-      callback(nil, { message = "missing" })
+      local result = self.thread_resume_results and self.thread_resume_results[params.threadId]
+      if type(result) == "function" then
+        result(callback, params)
+      elseif result then
+        callback(vim.deepcopy(result))
+      else
+        callback(nil, { message = "missing" })
+      end
     elseif method == "thread/read" then
       callback({
         thread = {
@@ -368,6 +375,36 @@ function tests.freeform_uses_main_thread_unchanged()
   equal(request(fake, "thread/start").params.approvalPolicy, "untrusted", "the main thread should review patches")
   equal(request(fake, "thread/start").params.approvalsReviewer, "user", "the main thread should not auto-review")
   equal(request(fake, "thread/start").params.sandbox, "workspace-write", "the main thread should be workspace-writing")
+end
+
+function tests.routine_turn_notifications_require_verbose_mode()
+  setup({ "local value = 1" })
+  seal.submit("explain this file")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  for _, notification in ipairs(notifications) do
+    truthy(not notification.message:find("Prompt sent to Codex", 1, true),
+      "default mode should not announce prompt dispatch")
+    truthy(not notification.message:find("Codex turn finished", 1, true),
+      "default mode should not announce routine completion")
+  end
+
+  setup({ "local value = 1" }, { verbose = true })
+  seal.submit("explain this file")
+  seal._notification("turn/completed", {
+    threadId = "main-thread",
+    turn = { id = "main-turn", status = "completed" },
+  })
+  local sent = false
+  local finished = false
+  for _, notification in ipairs(notifications) do
+    sent = sent or notification.message:find("Prompt sent to Codex", 1, true) ~= nil
+    finished = finished or notification.message:find("Codex turn finished", 1, true) ~= nil
+  end
+  truthy(sent, "verbose mode should announce prompt dispatch")
+  truthy(finished, "verbose mode should announce routine completion")
 end
 
 function tests.targeted_adds_minimal_change_guidance_to_the_main_thread()
@@ -1000,18 +1037,140 @@ function tests.chat_reads_and_renders_the_backing_thread()
   equal(vim.api.nvim_get_current_buf(), source, "closing chat should return to the source buffer")
 end
 
-function tests.attach_copies_the_real_tui_command()
+function tests.attach_before_a_prompt_lets_the_side_tui_create_the_shared_thread()
+  setup({ "" }, {
+    attach_timeout_ms = 100000,
+    copy = function(value)
+      copied = value
+    end,
+  })
+  local resume_callback
+  fake.thread_resume_results = {
+    ["side-pane-thread"] = function(callback)
+      resume_callback = callback
+    end,
+  }
+  seal.attach()
+  truthy(copied:find("codex", 1, true), "attach command should invoke Codex")
+  truthy(not copied:find("resume", 1, true),
+    "an empty chat should let the TUI create a materialized thread instead of resuming an empty rollout")
+  truthy(copied:find("--remote", 1, true), "attach command should use the app-server transport")
+  truthy(copied:find("ws://127.0.0.1:4567", 1, true), "attach command should use Seal's live endpoint")
+  truthy(copied:find(test_root, 1, true), "the new TUI chat should start in the Seal project")
+  truthy(request(fake, "thread/start") == nil,
+    ":SealAttach should not create an unresumable empty app-server thread")
+  truthy(seal.status().attaching, "Seal should wait to adopt the side-pane thread")
+
+  seal.submit("targeted: update the visible chat")
+  truthy(request(fake, "turn/start") == nil,
+    "a prompt entered during handoff should wait for the TUI-created thread")
+  seal._notification("thread/started", {
+    thread = {
+      id = "unrelated-thread",
+      cwd = second_root,
+      status = { type = "idle" },
+      modelProvider = "openai",
+      parentThreadId = vim.NIL,
+    },
+  })
+  truthy(seal.status().attaching, "an unrelated thread must not steal the pending handoff")
+  seal._notification("thread/started", {
+    thread = {
+      id = "side-pane-thread",
+      cwd = test_root,
+      status = { type = "idle" },
+      modelProvider = "openai",
+      parentThreadId = vim.NIL,
+    },
+  })
+  local resume = request(fake, "thread/resume")
+  equal(resume.params, {
+    threadId = "side-pane-thread",
+    excludeTurns = true,
+  }, "Seal should subscribe its own app-server connection before adopting the TUI thread")
+  truthy(resume_callback ~= nil, "the adoption handoff should wait for the subscription response")
+  truthy(request(fake, "turn/start") == nil,
+    "a waiting prompt must not start before Seal is subscribed to its lifecycle events")
+  truthy(seal.status().attaching, "the handoff should remain pending while Seal subscribes")
+
+  resume_callback({
+    thread = {
+      id = "side-pane-thread",
+      cwd = test_root,
+      status = { type = "idle" },
+      turns = {},
+    },
+    model = "gpt-test",
+    modelProvider = "openai",
+    approvalPolicy = "untrusted",
+    approvalsReviewer = "user",
+    sandbox = { type = "workspaceWrite", writableRoots = {}, networkAccess = false },
+  })
+  local turn = request(fake, "turn/start")
+  equal(turn.params.threadId, "side-pane-thread",
+    "the waiting targeted prompt should run in the chat created by the side TUI")
+  truthy(turn.params.input[1].text:find("update the visible chat", 1, true) ~= nil,
+    "the side-pane turn should receive the original prompt")
+  equal(seal.status().thread_id, "side-pane-thread", "Seal should retain the adopted TUI chat")
+  truthy(not seal.status().attaching, "the handoff should finish after thread/started")
+end
+
+function tests.attach_resumes_a_thread_after_its_first_turn_materializes()
   setup({ "" }, {
     copy = function(value)
       copied = value
     end,
   })
+  seal.submit("materialize the shared chat")
   seal.attach()
-  truthy(copied:find("codex", 1, true), "attach command should invoke Codex")
-  truthy(copied:find("resume", 1, true), "attach command should resume the live thread")
-  truthy(copied:find("--remote", 1, true), "attach command should use the app-server transport")
-  truthy(copied:find("ws://127.0.0.1:4567", 1, true), "attach command should use Seal's live endpoint")
+  truthy(copied:find("resume", 1, true), "a materialized thread should use exact resume")
+  truthy(copied:find("--remote", 1, true), "resume should use the app-server transport")
+  truthy(copied:find("ws://127.0.0.1:4567", 1, true), "resume should use Seal's live endpoint")
   truthy(copied:find("main-thread", 1, true), "attach command should target the backing chat thread")
+end
+
+function tests.attach_keeps_the_empty_fallback_subscribed_until_adoption()
+  setup({ "" }, {
+    attach_timeout_ms = 100000,
+    copy = function(value)
+      copied = value
+    end,
+  })
+  seal.chat()
+  equal(seal.status().thread_id, "main-thread", "chat should create the empty fallback thread")
+
+  fake.thread_resume_results = {
+    ["side-pane-thread"] = {
+      thread = {
+        id = "side-pane-thread",
+        cwd = test_root,
+        status = { type = "idle" },
+        turns = {},
+      },
+      model = "gpt-test",
+      modelProvider = "openai",
+      approvalPolicy = "untrusted",
+      approvalsReviewer = "user",
+      sandbox = { type = "workspaceWrite", writableRoots = {}, networkAccess = false },
+    },
+  }
+
+  seal.attach()
+  truthy(seal.status().attaching, "attach should replace an unmaterialized fallback")
+  truthy(request(fake, "thread/unsubscribe") == nil,
+    "the fallback must remain subscribed while it can still be restored")
+
+  seal._notification("thread/started", {
+    thread = {
+      id = "side-pane-thread",
+      cwd = test_root,
+      status = { type = "idle" },
+      modelProvider = "openai",
+      parentThreadId = vim.NIL,
+    },
+  })
+  equal(request(fake, "thread/unsubscribe").params.threadId, "main-thread",
+    "the obsolete fallback should detach after the side-pane thread is adopted")
 end
 
 function tests.wiped_chat_ignores_a_delayed_refresh()
@@ -2881,7 +3040,7 @@ function tests.insert_leave_noop_formatter_keeps_the_startup_spinner()
   seal.reject(job.id)
 end
 
-function tests.agent_spinners_render_before_app_server_is_ready()
+function tests.only_prefixed_agent_prompts_render_before_app_server_is_ready()
   setup({ "local value = 1" }, { activity = { interval_ms = 100000 } })
   local held_start
   function fake:start(callback)
@@ -2889,15 +3048,21 @@ function tests.agent_spinners_render_before_app_server_is_ready()
   end
 
   truthy(seal.submit("explain the build logger"), "a normal agent prompt should submit")
-  truthy(seal.submit("targeted: fix the build logger"), "a targeted prompt should submit")
-  truthy(held_start ~= nil, "both prompts should be waiting on the same app-server startup")
-  equal(vim.tbl_count(seal._state.activities), 2, "both agent markers should render immediately")
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
-  equal(#markers, 1, "collocated agent work should use one compact marker")
+  equal(#markers, 0, "an unprefixed prompt should not leave an inline marker")
+  equal(seal._state.spinner_timer, nil, "an unprefixed prompt should not start the inline animation timer")
+
+  truthy(seal.submit("targeted: fix the build logger"), "a targeted prompt should submit")
+  truthy(held_start ~= nil, "both prompts should be waiting on the same app-server startup")
+  equal(vim.tbl_count(seal._state.activities), 2, "both prompts should retain their lifecycle state")
+  markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
+  equal(#markers, 1, "only the prefixed prompt should render inline")
   local summary = markers[1][4].virt_text[2][1]
-  truthy(summary:find("targeted · fix the build logger", 1, true), "the marker should show the newest request")
-  truthy(summary:find("2 requests here", 1, true), "the marker should preserve the collocated request count")
+  truthy(summary:find("targeted · fix the build logger", 1, true), "the marker should show the prefixed request")
+  truthy(not summary:find("2 requests here", 1, true),
+    "a hidden normal prompt should not inflate the inline request count")
+  truthy(seal._state.spinner_timer ~= nil, "the prefixed prompt should animate while it waits")
   truthy(
     seal._state.job_mappings[vim.api.nvim_get_current_buf()] ~= nil,
     "agent markers should install the documented Esc cancellation dispatcher"
@@ -4900,6 +5065,7 @@ local order = {
   "repeated_setup_removes_only_its_old_global_keymaps",
   "repeated_setup_removes_leader_keymaps_after_termcode_expansion",
   "freeform_uses_main_thread_unchanged",
+  "routine_turn_notifications_require_verbose_mode",
   "targeted_adds_minimal_change_guidance_to_the_main_thread",
   "refactor_adds_minimal_behavior_preserving_guidance",
   "bounded_policy_restore_accepts_app_server_workspace_defaults",
@@ -4924,7 +5090,9 @@ local order = {
   "completed_turn_preserves_a_modified_external_conflict",
   "freeform_refuses_other_modified_project_buffers",
   "chat_reads_and_renders_the_backing_thread",
-  "attach_copies_the_real_tui_command",
+  "attach_before_a_prompt_lets_the_side_tui_create_the_shared_thread",
+  "attach_resumes_a_thread_after_its_first_turn_materializes",
+  "attach_keeps_the_empty_fallback_subscribed_until_adoption",
   "wiped_chat_ignores_a_delayed_refresh",
   "declaration_queues_during_active_main_turn",
   "declaration_uses_shared_read_only_turn",
@@ -4982,7 +5150,7 @@ local order = {
   "collocated_jobs_are_preserved_and_selected_newest_first",
   "spinner_renders_before_app_server_is_ready",
   "insert_leave_noop_formatter_keeps_the_startup_spinner",
-  "agent_spinners_render_before_app_server_is_ready",
+  "only_prefixed_agent_prompts_render_before_app_server_is_ready",
   "concurrent_initial_prompts_run_fifo",
   "session_read_failure_clears_immediate_agent_spinner",
   "app_server_start_failure_clears_immediate_spinners",

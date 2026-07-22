@@ -6,6 +6,7 @@ local Scheduler = require("seal.scheduler")
 local WorkItems = require("seal.work_items")
 
 local M = {}
+M._attach_flow = {}
 local activity_namespace = vim.api.nvim_create_namespace("seal-activity")
 local context_namespace = vim.api.nvim_create_namespace("seal-context")
 local bounded_agent_prefixes = {
@@ -18,6 +19,8 @@ local defaults = {
   bridge = nil,
   startup_timeout_ms = 10000,
   request_timeout_ms = 30000,
+  attach_timeout_ms = 120000,
+  verbose = false,
   max_context_chars = 120000,
   max_pending_items = 100,
   direct_reconcile_lines = 16,
@@ -91,6 +94,7 @@ local state = {
   sessions = {},
   live = {},
   loading = {},
+  attach_waiting = {},
   work_items = work_store,
   items = work_store.items,
   jobs = work_store.jobs,
@@ -951,7 +955,10 @@ local function build_buffer_layout(buf)
   local groups = {}
   local layout = {}
   for _, item in pairs(state.buffer_items[buf] or {}) do
-    if item_registered(item) and item.snapshot.buf == buf then
+    if item_registered(item)
+      and (item.kind ~= "agent" or item.show_inline ~= false)
+      and item.snapshot.buf == buf
+    then
       local position = job_position(item)
       if position then
         local key = tostring(position[1]) .. ":" .. tostring(position[2])
@@ -1014,6 +1021,7 @@ end
 
 local function item_should_animate(item)
   return item_registered(item)
+    and (item.kind ~= "agent" or item.show_inline ~= false)
     and item.phase == "generating"
     and (item.awaiting_session or item.state == "starting" or item.state == "running")
 end
@@ -1058,6 +1066,10 @@ end
 
 local function render_spinner(job, layout)
   local buf = job.snapshot.buf
+  if job.kind == "agent" and job.show_inline == false then
+    clear_item_extmark(job)
+    return true
+  end
   if job.phase ~= "generating" or job.invalidated or not vim.api.nvim_buf_is_valid(buf) then
     return false
   end
@@ -2521,6 +2533,7 @@ local function bind_session_entry_turn(session, entry, turn_id)
   end
   entry.turn_id = turn_id
   entry.confirmed_turn = true
+  session.materialized = true
   if newly_confirmed then
     session.status_generation = (session.status_generation or 0) + 1
   end
@@ -2593,6 +2606,7 @@ local function accept_start_response(session, entry, turn_id)
 
   entry.turn_id = turn_id
   entry.confirmed_turn = true
+  session.materialized = true
   session.status_generation = (session.status_generation or 0) + 1
   session.busy = true
   session.status = { type = "active", activeFlags = {} }
@@ -2734,6 +2748,9 @@ handle_notification = function(method, params)
   end
 
   if method == "thread/started" and params.thread then
+    if M._attach_flow.adopt and M._attach_flow.adopt(params.thread) then
+      return
+    end
     remember_started_thread(params.thread)
     set_thread_status(params.thread.id, params.thread.status)
     return
@@ -2908,6 +2925,7 @@ handle_notification = function(method, params)
   if method == "turn/started" then
     local session = find_session_by_thread(params.threadId)
     if session and params.turn then
+      session.materialized = true
       session.status_generation = (session.status_generation or 0) + 1
       session.busy = true
       session.status = { type = "active", activeFlags = {} }
@@ -2995,7 +3013,9 @@ handle_notification = function(method, params)
       if turn_status == "completed"
         or turn_status == "interrupted" and entry and entry.bounded_patch_applied
       then
-        notify("Codex turn finished; use :SealChat to inspect it")
+        if config.verbose then
+          notify("Codex turn finished; use :SealChat to inspect it")
+        end
       elseif turn_status == "interrupted"
         and entry
         and (entry.state == "cancelled" or entry.bounded_patch_rejected)
@@ -3267,6 +3287,41 @@ handle_server_request = function(request)
   end
 end
 
+function M._attach_flow.stop_timer(pending)
+  if not pending then
+    return
+  end
+  local timer = pending.timer
+  pending.timer = nil
+  if timer and not timer:is_closing() then
+    timer:stop()
+    timer:close()
+  end
+end
+
+function M._attach_flow.finish(root, pending, session, err)
+  if state.attach_waiting[root] ~= pending then
+    return false
+  end
+  state.attach_waiting[root] = nil
+  M._attach_flow.stop_timer(pending)
+  for _, callback in ipairs(pending.callbacks or {}) do
+    callback(session, err)
+  end
+  return true
+end
+
+function M._attach_flow.clear(message)
+  local waiting = state.attach_waiting
+  state.attach_waiting = {}
+  for _, pending in pairs(waiting) do
+    M._attach_flow.stop_timer(pending)
+    for _, callback in ipairs(pending.callbacks or {}) do
+      callback(nil, message)
+    end
+  end
+end
+
 local function handle_client_exit(active_client, expected)
   if state.client ~= active_client then
     return
@@ -3276,6 +3331,7 @@ local function handle_client_exit(active_client, expected)
   end
   state.live = {}
   state.loading = {}
+  M._attach_flow.clear("Codex app-server stopped while waiting for the side-pane chat")
   reset_ownership()
   state.approval_items = {}
   state.accepted_file_items = {}
@@ -3334,6 +3390,10 @@ end
 local function remember_thread(root, result)
   local thread = result.thread
   local status = thread.status or { type = "idle" }
+  local thread_path = not_null(thread.path)
+  local uv = vim.uv or vim.loop
+  local materialized = type(thread.turns) == "table" and #thread.turns > 0
+    or type(thread_path) == "string" and uv.fs_stat(thread_path) ~= nil
   local scheduler = new_project_scheduler(root)
   local session = {
     root = root,
@@ -3344,6 +3404,8 @@ local function remember_thread(root, result)
     scheduler = scheduler,
     queue = scheduler.queue,
     current = nil,
+    thread_path = thread_path,
+    materialized = materialized,
     settings_epoch = 0,
     settings = {
       model = result.model,
@@ -3359,6 +3421,56 @@ local function remember_thread(root, result)
   state.live[root] = session
   state.sessions[root] = { thread_id = thread.id }
   return session
+end
+
+function M._attach_flow.adopt(thread)
+  if type(thread) ~= "table"
+    or not thread.id
+    or not_null(thread.parentThreadId) ~= nil
+    or type(thread.cwd) ~= "string"
+  then
+    return false
+  end
+  for root, pending in pairs(state.attach_waiting) do
+    if pending.client == state.client and canonical_path(thread.cwd) == canonical_path(root) then
+      if pending.adopting_thread_id then
+        return true
+      end
+      if thread.id == pending.previous_thread_id then
+        return false
+      end
+
+      pending.adopting_thread_id = thread.id
+      pending.client:request("thread/resume", {
+        threadId = thread.id,
+        excludeTurns = true,
+      }, function(result, err)
+        if state.attach_waiting[root] ~= pending or state.client ~= pending.client then
+          return
+        end
+        if err or not result or not result.thread or result.thread.id ~= thread.id then
+          if pending.previous then
+            state.live[root] = pending.previous
+            state.sessions[root] = { thread_id = pending.previous.thread_id }
+          end
+          local message = error_message(err, "could not subscribe Seal to the side-pane Codex chat")
+          M._attach_flow.finish(root, pending, pending.previous, message)
+          notify(message, vim.log.levels.ERROR)
+          return
+        end
+
+        local session = remember_thread(root, result)
+        session.materialized = false
+        if pending.previous_thread_id then
+          pending.client:request("thread/unsubscribe", { threadId = pending.previous_thread_id }, function() end)
+        end
+        M._attach_flow.finish(root, pending, session)
+        notify("Seal attached to the side-pane Codex chat")
+      end)
+      return true
+    end
+  end
+  return false
 end
 
 local function start_thread(root, callback, requesting_client)
@@ -3394,6 +3506,10 @@ end
 local function ensure_session(root, callback)
   if state.live[root] then
     callback(state.live[root])
+    return
+  end
+  if state.attach_waiting[root] then
+    table.insert(state.attach_waiting[root].callbacks, callback)
     return
   end
   if state.loading[root] then
@@ -4720,7 +4836,9 @@ local function start_agent(session, snapshot, prompt, activity)
       return
     end
     accept_start_response(session, entry, result.turn.id)
-    notify("Prompt sent to Codex; use :SealChat to inspect it")
+    if config.verbose then
+      notify("Prompt sent to Codex; use :SealChat to inspect it")
+    end
   end)
   return true
 end
@@ -5011,6 +5129,7 @@ function M.submit(text, opts)
         route = route,
         prompt = routed_agent_prompt(route),
         bounded_patch = route.bounded_patch == true,
+        show_inline = route.label ~= nil,
         summary = summary_text(route.label or "Codex", route.prompt),
       },
     })
@@ -5455,44 +5574,135 @@ function M.chat(requested_root)
   end)
 end
 
+function M._attach_flow.copy_command(args, message)
+  local escaped = {}
+  for _, arg in ipairs(args) do
+    table.insert(escaped, vim.fn.shellescape(tostring(arg)))
+  end
+  local attach = table.concat(escaped, " ")
+  local ok, copy_error
+  if config.copy then
+    ok, copy_error = pcall(config.copy, attach)
+  else
+    ok, copy_error = pcall(function()
+      vim.fn.setreg("+", attach)
+      vim.fn.setreg('"', attach)
+    end)
+  end
+  if not ok then
+    notify("Could not copy the Codex attach command: " .. tostring(copy_error), vim.log.levels.ERROR)
+    return false
+  end
+  notify(message)
+  return true
+end
+
+function M._attach_flow.resume(root, session, requesting_client)
+  return M._attach_flow.copy_command({
+    config.codex_command,
+    "resume",
+    "--remote",
+    requesting_client:url(),
+    session.thread_id,
+  }, "Copied the Codex attach command; paste it in your Zellij pane")
+end
+
+function M._attach_flow.begin_empty(root, previous, requesting_client)
+  local pending = state.attach_waiting[root]
+  if pending then
+    return M._attach_flow.copy_command(pending.args,
+      "Copied the pending side-pane command again; paste it in your Zellij pane")
+  end
+
+  local args = {
+    config.codex_command,
+    "--remote",
+    requesting_client:url(),
+    "--cd",
+    root,
+    "--sandbox",
+    config.main_sandbox,
+    "--ask-for-approval",
+    config.main_approval_policy,
+  }
+  pending = {
+    args = args,
+    callbacks = {},
+    client = requesting_client,
+    previous = previous,
+    previous_thread_id = previous and previous.thread_id or nil,
+  }
+  state.attach_waiting[root] = pending
+  state.live[root] = nil
+  state.sessions[root] = nil
+
+  local timeout = math.max(1000, tonumber(config.attach_timeout_ms) or 120000)
+  pending.timer = vim.defer_fn(function()
+    if state.attach_waiting[root] ~= pending then
+      return
+    end
+    if pending.previous and state.client == pending.client then
+      state.live[root] = pending.previous
+      state.sessions[root] = { thread_id = pending.previous.thread_id }
+    end
+    M._attach_flow.finish(
+      root,
+      pending,
+      pending.previous,
+      string.format("side-pane Codex did not connect within %d seconds", math.floor(timeout / 1000))
+    )
+    notify("Side-pane Codex did not connect; run :SealAttach to try again", vim.log.levels.WARN)
+  end, timeout)
+
+  if not M._attach_flow.copy_command(args,
+    "Copied a new side-pane Codex command; Seal will use that chat when it connects")
+  then
+    if previous then
+      state.live[root] = previous
+      state.sessions[root] = { thread_id = previous.thread_id }
+    end
+    M._attach_flow.finish(root, pending, previous, "could not copy the side-pane Codex command")
+    return false
+  end
+  return true
+end
+
 function M.attach(requested_root)
   local root = current_project_root(requested_root)
-  ensure_session(root, function(session, err)
-    if not session then
-      notify(error_message(err, "could not create a Codex session"), vim.log.levels.ERROR)
-      return
-    end
-    local args = {
-      config.codex_command,
-      "resume",
-      "--remote",
-      client():url(),
-      session.thread_id,
-    }
-    local escaped = {}
-    for _, arg in ipairs(args) do
-      table.insert(escaped, vim.fn.shellescape(tostring(arg)))
-    end
-    local attach = table.concat(escaped, " ")
-    local ok, copy_error
-    if config.copy then
-      ok, copy_error = pcall(config.copy, attach)
-    else
-      ok, copy_error = pcall(function()
-        vim.fn.setreg("+", attach)
-        vim.fn.setreg('"', attach)
-      end)
-    end
+  local requesting_client = client()
+  requesting_client:start(function(ok, err)
     if not ok then
-      notify("Could not copy the Codex attach command: " .. tostring(copy_error), vim.log.levels.ERROR)
+      notify(error_message(err, "could not start Codex"), vim.log.levels.ERROR)
       return
     end
-    notify("Copied the Codex attach command; paste it in your Zellij pane")
+    if state.client ~= requesting_client then
+      return
+    end
+    local function attach_session(session, session_error)
+      if session_error then
+        notify(error_message(session_error, "could not load the Codex session"), vim.log.levels.ERROR)
+        return
+      end
+      if session and session.materialized then
+        M._attach_flow.resume(root, session, requesting_client)
+      else
+        M._attach_flow.begin_empty(root, session, requesting_client)
+      end
+    end
+    if state.live[root] or state.loading[root] or state.sessions[root] then
+      ensure_session(root, attach_session)
+    else
+      attach_session(nil)
+    end
   end)
 end
 
 function M.new_thread()
   local root = current_project_root()
+  local attaching = state.attach_waiting[root]
+  if attaching then
+    M._attach_flow.finish(root, attaching, nil, "started a different Seal thread")
+  end
   local requesting_client = client()
   requesting_client:start(function(ok, err)
     if not ok then
@@ -5609,6 +5819,7 @@ function M.stop()
   stop_spinner_if_idle()
   close_chat()
   local stopped_client = state.client
+  M._attach_flow.clear("Seal stopped while waiting for the side-pane chat")
   state.client = nil
   state.loading = {}
   if stopped_client then
@@ -5671,6 +5882,7 @@ function M.status()
     running_count = running,
     applying_count = applying,
     pending_reviews = pending_reviews,
+    attaching = state.attach_waiting[root] ~= nil,
     remote = state.client and state.client:url() or nil,
   }
 end
@@ -5722,6 +5934,7 @@ function M.setup(opts)
       state.pending_unowned_requests = {}
       state.pending_unowned_request_sequence = 0
     end
+    M._attach_flow.clear("Seal client changed while waiting for the side-pane chat")
     state.client = opts.client
     state.loading = {}
     if previous_client then
@@ -5938,6 +6151,7 @@ M._reset = function()
   state.sessions = {}
   state.live = {}
   state.loading = {}
+  state.attach_waiting = {}
   state.work_items = work_store
   state.items = work_store.items
   state.jobs = work_store.jobs
