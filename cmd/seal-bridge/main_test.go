@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,6 +14,7 @@ import (
 )
 
 func TestReserveEndpointUsesAPrivateUnixSocketPath(t *testing.T) {
+	t.Setenv("TMPDIR", "/tmp/"+strings.Repeat("very-long-segment-", 8))
 	endpoint, cleanup, err := reserveEndpoint()
 	if err != nil {
 		t.Fatal(err)
@@ -25,9 +27,27 @@ func TestReserveEndpointUsesAPrivateUnixSocketPath(t *testing.T) {
 	if !strings.HasPrefix(endpoint, "unix://") || info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("endpoint is not private: %q mode=%o", endpoint, info.Mode().Perm())
 	}
+	if socket := strings.TrimPrefix(endpoint, "unix://"); len(socket) >= maxSocketPath {
+		t.Fatalf("endpoint exceeds the portable Unix socket limit: %q", socket)
+	}
 	cleanup()
 	if _, err := os.Stat(directory); !os.IsNotExist(err) {
 		t.Fatalf("cleanup did not remove %q", directory)
+	}
+}
+
+func TestMalformedServerMessageReportsAnErrorWithoutBreakingFraming(t *testing.T) {
+	var buffer bytes.Buffer
+	out := &output{encoder: json.NewEncoder(&buffer), writer: &buffer}
+	if err := forwardServerMessage(out, []byte("{not-json")); err != nil {
+		t.Fatal(err)
+	}
+	var event controlMessage
+	if err := json.Unmarshal(bytes.TrimSpace(buffer.Bytes()), &event); err != nil {
+		t.Fatalf("malformed frame did not produce a valid control event: %v", err)
+	}
+	if event.Seal.Event != "error" || !strings.Contains(event.Seal.Message, "invalid JSON") {
+		t.Fatalf("unexpected control event: %#v", event)
 	}
 }
 
@@ -47,6 +67,31 @@ func TestForwardInputRejectsInvalidUTF8BeforeWriting(t *testing.T) {
 	err := forwardInput(context.Background(), input, nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
 		t.Fatalf("expected invalid UTF-8 error, got %v", err)
+	}
+}
+
+func TestScanInputAcceptsAProtocolRecordLargerThanScannerDefault(t *testing.T) {
+	payload := []byte(`{"input":"` + strings.Repeat("x", 128<<10) + `"}`)
+	var received []byte
+	err := scanInput(bytes.NewReader(append(payload, '\n')), func(line []byte) error {
+		received = append([]byte(nil), line...)
+		return nil
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF after the large record, got %v", err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("large protocol record was truncated: got %d bytes, want %d", len(received), len(payload))
+	}
+}
+
+func TestAppServerCommandDoesNotCreateAStdoutCopyPipe(t *testing.T) {
+	command := appServerCommand("codex", "unix:///tmp/seal-test.sock")
+	if command.Stdout != nil {
+		t.Fatalf("app-server stdout must be inherited directly, got %T", command.Stdout)
+	}
+	if command.WaitDelay <= 0 {
+		t.Fatal("app-server command must bound pipe shutdown")
 	}
 }
 

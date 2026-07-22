@@ -500,6 +500,10 @@ function Model:lines()
   return copy_lines(self._lines)
 end
 
+function Model:line_count()
+  return #self._lines
+end
+
 function Model:ids()
   local ids = {}
   for id in pairs(self._anchors) do

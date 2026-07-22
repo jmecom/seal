@@ -415,6 +415,102 @@ test("times out startup and requests with actionable errors", function()
   end, "request timeout did not release its callback")
   assert_true(request_error.message:find("request timed out", 1, true) ~= nil)
   assert_equal({}, request_client.pending)
+  assert_equal(false, request_client.ready, "a timed-out request leaves the server outcome unknown")
+  assert_equal(nil, request_client.transport, "the unknown generation must be discarded")
+  assert_equal(1, request_fake.stop_calls)
+end)
+
+test("startup timeout invalidates its initialize request before restart", function()
+  local fake = new_fake_transport()
+  local first_result
+  local client = Client.new({
+    transport_factory = fake.factory,
+    startup_timeout_ms = 10,
+    request_timeout_ms = 100,
+  })
+  client:start(function(ok, err)
+    first_result = { ok = ok, err = err }
+  end)
+  local first = fake.runs[1]
+  first.on_line(vim.json.encode({ seal = { event = "ready", url = "ws://127.0.0.1:4700" } }))
+  wait_until(function()
+    return fake.sent[1] and fake.sent[1].method == "initialize"
+  end)
+  local stale_initialize = fake.sent[1]
+  wait_until(function()
+    return first_result ~= nil
+  end, "startup timeout did not finish")
+  assert_equal({}, client.pending, "the timed-out initialize request must not survive its generation")
+  assert_equal(nil, client.transport)
+
+  first.on_line(vim.json.encode({ id = stale_initialize.id, result = {} }))
+  vim.wait(20)
+  assert_equal(1, #fake.sent, "a just-late handshake from the stopped transport must be ignored")
+
+  local restarted
+  client:start(function(ok, err)
+    restarted = { ok = ok, err = err }
+  end)
+  local second = fake.runs[2]
+  second.on_line(vim.json.encode({ seal = { event = "ready", url = "ws://127.0.0.1:4701" } }))
+  wait_until(function()
+    return fake.sent[2] and fake.sent[2].method == "initialize"
+  end)
+  second.on_line(vim.json.encode({ id = fake.sent[2].id, result = {} }))
+  wait_until(function()
+    return restarted ~= nil
+  end)
+  assert_equal({ ok = true }, restarted)
+  vim.wait(120)
+  assert_true(client.ready, "the stale initialize timer must not stop the replacement transport")
+  assert_true(client.transport == second.transport)
+end)
+
+test("late response after a request timeout cannot bind on a replacement generation", function()
+  local fake = new_fake_transport()
+  local exits = {}
+  local client = Client.new({
+    transport_factory = fake.factory,
+    request_timeout_ms = 10,
+    on_exit = function(code, expected)
+      table.insert(exits, { code = code, expected = expected })
+    end,
+  })
+  start_ready(client, fake)
+  local first = fake.runs[1]
+  local callbacks = 0
+  local timeout_error
+  local turn_id = client:request("turn/start", {}, function(_, err)
+    callbacks = callbacks + 1
+    timeout_error = err
+  end)
+  wait_until(function()
+    return timeout_error ~= nil
+  end)
+  assert_equal(1, callbacks)
+  assert_equal({ { code = 0, expected = true } }, exits,
+    "the client should deliberately retire the desynchronized generation")
+
+  first.on_line(vim.json.encode({ id = turn_id, result = { turn = { id = "late-turn" } } }))
+  vim.wait(20)
+  assert_equal(1, callbacks, "the late acknowledgement must remain detached")
+
+  local restarted
+  client:start(function(ok, err)
+    restarted = { ok = ok, err = err }
+  end)
+  local second = fake.runs[2]
+  second.on_line(vim.json.encode({ seal = { event = "ready", url = "ws://127.0.0.1:4800" } }))
+  wait_until(function()
+    return fake.sent[#fake.sent] and fake.sent[#fake.sent].method == "initialize"
+  end)
+  local initialize = fake.sent[#fake.sent]
+  second.on_line(vim.json.encode({ id = initialize.id, result = {} }))
+  wait_until(function()
+    return restarted ~= nil
+  end)
+  assert_equal({ ok = true }, restarted)
+  assert_true(client.transport == second.transport)
 end)
 
 test("rejects invalid UTF-8 before it reaches the shared transport", function()

@@ -153,8 +153,13 @@ function Client:_error(message)
   end
 end
 
-function Client:_send(message)
-  if not self.transport then
+function Client:_send(message, generation, transport)
+  transport = transport or self.transport
+  generation = generation or self.transport_generation
+  if not transport
+    or self.transport ~= transport
+    or self.transport_generation ~= generation
+  then
     return false, "Codex app-server is not connected"
   end
   local encoded_ok, encoded = pcall(vim.json.encode, message)
@@ -164,19 +169,30 @@ function Client:_send(message)
   if not valid_utf8(encoded) then
     return false, "app-server messages must contain valid UTF-8"
   end
-  if not self.transport:send(encoded) then
+  if not transport:send(encoded) then
     return false, "could not send the app-server message"
   end
   return true
 end
 
-function Client:_request(method, params, callback)
+function Client:_request(method, params, callback, generation, transport)
+  generation = generation or self.transport_generation
+  transport = transport or self.transport
   local id = self.next_id
   self.next_id = id + 1
   local key = tostring(id)
-  local pending = { callback = callback or function() end }
+  local pending = {
+    callback = callback or function() end,
+    generation = generation,
+    transport = transport,
+    method = method,
+  }
   self.pending[key] = pending
-  local sent, send_error = self:_send({ id = id, method = method, params = params or {} })
+  local sent, send_error = self:_send(
+    { id = id, method = method, params = params or {} },
+    generation,
+    transport
+  )
   if not sent then
     self.pending[key] = nil
     pending.callback(nil, { message = send_error })
@@ -187,10 +203,18 @@ function Client:_request(method, params, callback)
     if self.pending[key] ~= pending then
       return
     end
-    self.pending[key] = nil
-    pending.callback(nil, {
-      message = string.format("Codex app-server request timed out after %d ms: %s", timeout, method),
-    })
+    local message = string.format(
+      "Codex app-server request timed out after %d ms: %s",
+      timeout,
+      pending.method
+    )
+    -- A mutating request can still complete after its local timer fires. The
+    -- client cannot safely correlate that late result after reporting failure,
+    -- so retire the whole transport generation before another request starts.
+    if not self:_abort_transport(pending.generation, pending.transport, message, true) then
+      self.pending[key] = nil
+      pending.callback(nil, { message = message })
+    end
   end, timeout)
   return id
 end
@@ -216,7 +240,32 @@ function Client:_finish_start(error_message)
   end
 end
 
-function Client:_handle(message)
+function Client:_abort_transport(generation, transport, message, expected)
+  if self.transport_generation ~= generation or self.transport ~= transport then
+    return false
+  end
+  self.transport_generation = self.transport_generation + 1
+  self.transport = nil
+  self.ready = false
+  self.remote_url = nil
+  local had_waiters = self.starting or #self.waiters > 0
+  self.starting = false
+  stop_timer(self.startup_timer)
+  self.startup_timer = nil
+  self:_fail_pending(message)
+  if had_waiters then
+    self:_finish_start(message)
+  end
+  transport:stop()
+  if self.opts.on_exit then
+    self.opts.on_exit(expected and 0 or -1, expected == true)
+  end
+  return true
+end
+
+function Client:_handle(message, generation, transport)
+  generation = generation or self.transport_generation
+  transport = transport or self.transport
   if type(message) == "string" then
     local ok, decoded = pcall(vim.json.decode, message)
     if not ok then
@@ -237,17 +286,25 @@ function Client:_handle(message)
         clientInfo = { name = "seal", title = "Seal", version = "0.1.0" },
         capabilities = { experimentalApi = true },
       }, function(_, err)
-        if err then
-          if self.transport then
-            self.transport:stop()
-            self.transport = nil
-          end
-          self:_finish_start(err.message or "Codex initialization failed")
+        if self.transport_generation ~= generation or self.transport ~= transport then
           return
         end
-        self:_send({ method = "initialized" })
+        if err then
+          self:_abort_transport(
+            generation,
+            transport,
+            err.message or "Codex initialization failed",
+            true
+          )
+          return
+        end
+        local sent, send_error = self:_send({ method = "initialized" }, generation, transport)
+        if not sent then
+          self:_abort_transport(generation, transport, send_error, true)
+          return
+        end
         self:_finish_start()
-      end)
+      end, generation, transport)
     elseif message.seal.event == "error" then
       self:_error(message.seal.message or "Seal bridge failed")
     end
@@ -295,14 +352,15 @@ function Client:start(callback)
   transport, err = self.transport_factory(self.opts, function(line)
     vim.schedule(function()
       if self.transport_generation == generation and self.transport == transport then
-        self:_handle(line)
+        self:_handle(line, generation, transport)
       end
     end)
   end, function(code, expected)
     vim.schedule(function()
-      if self.transport_generation ~= generation then
+      if self.transport_generation ~= generation or self.transport ~= transport then
         return
       end
+      self.transport_generation = self.transport_generation + 1
       self.transport = nil
       self.ready = false
       self.starting = false
@@ -326,15 +384,16 @@ function Client:start(callback)
   if self.starting then
     local timeout = math.max(1, tonumber(self.opts.startup_timeout_ms) or 10000)
     self.startup_timer = vim.defer_fn(function()
-      if self.transport_generation ~= generation or not self.starting then
+      if self.transport_generation ~= generation
+        or self.transport ~= transport
+        or not self.starting
+      then
         return
       end
       local message = string.format("Codex app-server startup timed out after %d ms", timeout)
-      if self.transport then
-        self.transport:stop()
+      if self:_abort_transport(generation, transport, message, true) then
+        self:_error(message)
       end
-      self:_finish_start(message)
-      self:_error(message)
     end, timeout)
   end
 end
@@ -361,21 +420,23 @@ function Client:url()
 end
 
 function Client:stop()
+  local generation = self.transport_generation
+  local transport = self.transport
+  if transport then
+    self:_abort_transport(generation, transport, "Codex app-server stopped", true)
+    return
+  end
   self.ready = false
   self.starting = false
   self.remote_url = nil
   stop_timer(self.startup_timer)
   self.startup_timer = nil
   self:_fail_pending("Codex app-server stopped")
-  if self.transport then
-    self.transport:stop()
-    self.transport = nil
-  end
 end
 
 -- Test seam for protocol messages that do not need a process.
 function Client:_feed(message)
-  self:_handle(message)
+  self:_handle(message, self.transport_generation, self.transport)
 end
 
 return Client

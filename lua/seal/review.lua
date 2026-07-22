@@ -1,6 +1,9 @@
 local M = {}
 
 local function change_kind(change)
+  if type(change) ~= "table" then
+    return "invalid"
+  end
   if type(change.kind) == "table" then
     return type(change.kind.type) == "string" and change.kind.type or "update"
   end
@@ -8,7 +11,7 @@ local function change_kind(change)
 end
 
 local function move_path(change)
-  if type(change.kind) ~= "table" then
+  if type(change) ~= "table" or type(change.kind) ~= "table" then
     return nil
   end
   local path = change.kind.movePath or change.kind.move_path
@@ -33,8 +36,10 @@ function M.lines(changes, root, warning)
   if warning then
     vim.list_extend(lines, { "REVIEW BLOCKED: " .. warning, "" })
   end
-  for index, change in ipairs(changes or {}) do
-    local path = display_path(root, change.path)
+  changes = type(changes) == "table" and changes or {}
+  for index, change in ipairs(changes) do
+    local valid_change = type(change) == "table"
+    local path = display_path(root, valid_change and change.path or nil)
     local kind = change_kind(change)
     local destination = move_path(change)
     local label = string.format("%s %s", kind:upper(), path)
@@ -46,7 +51,7 @@ function M.lines(changes, root, warning)
     end
     table.insert(lines, label)
     table.insert(lines, string.rep("=", math.max(3, vim.fn.strdisplaywidth(label))))
-    local diff = type(change.diff) == "string" and change.diff or ""
+    local diff = valid_change and type(change.diff) == "string" and change.diff or ""
     if diff == "" then
       table.insert(lines, "<diff unavailable>")
     else
@@ -80,7 +85,6 @@ function M.open(opts)
       and " Seal changes · Tab accept · Esc reject · q later "
     or " Seal changes · Esc reject · q later "
   local opened, win = pcall(function()
-    vim.api.nvim_buf_set_name(buf, "seal://review/" .. tostring(opts.id))
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
     vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
@@ -99,6 +103,11 @@ function M.open(opts)
       col = math.max(0, math.floor((vim.o.columns - width) / 2)),
     })
     vim.api.nvim_set_option_value("wrap", false, { win = created })
+    -- Name the buffer only after the window is usable. Some contexts, such
+    -- as the command-line window, reject opening a floating window and also
+    -- reject deleting a buffer. Keeping the failed buffer unnamed prevents
+    -- it from poisoning every later attempt with E95.
+    vim.api.nvim_buf_set_name(buf, "seal://review/" .. tostring(opts.id))
     return created
   end)
   if not opened then

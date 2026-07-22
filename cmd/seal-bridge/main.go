@@ -28,6 +28,7 @@ const (
 	connectTimeout = 5 * time.Second
 	writeTimeout   = 10 * time.Second
 	maxMessageSize = 64 << 20
+	maxSocketPath  = 100
 )
 
 type controlMessage struct {
@@ -71,13 +72,32 @@ func (o *output) message(message []byte) error {
 	return err
 }
 
+func forwardServerMessage(out *output, message []byte) error {
+	if !json.Valid(message) {
+		out.control(controlEvent{Event: "error", Message: "invalid JSON received from Codex app-server"})
+		return nil
+	}
+	return out.message(message)
+}
+
 func reserveEndpoint() (string, func(), error) {
-	directory, err := os.MkdirTemp("", "seal-app-server-")
+	// Unix socket paths have a small platform-dependent limit. Keep the
+	// private directory under the short, conventional /tmp path even when a
+	// caller has configured a deeply nested TMPDIR.
+	directory, err := os.MkdirTemp("/tmp", "seal-")
+	if err != nil {
+		directory, err = os.MkdirTemp("", "seal-")
+	}
 	if err != nil {
 		return "", nil, err
 	}
 	cleanup := func() { _ = os.RemoveAll(directory) }
-	return "unix://" + filepath.Join(directory, "app.sock"), cleanup, nil
+	socket := filepath.Join(directory, "app.sock")
+	if len(socket) >= maxSocketPath {
+		cleanup()
+		return "", nil, fmt.Errorf("temporary directory produces an overlong Unix socket path: %s", socket)
+	}
+	return "unix://" + socket, cleanup, nil
 }
 
 func connect(ctx context.Context, endpoint string, exited *processExit) (*websocket.Conn, error) {
@@ -128,7 +148,7 @@ func connect(ctx context.Context, endpoint string, exited *processExit) (*websoc
 	return nil, fmt.Errorf("connect to %s: %w", endpoint, lastErr)
 }
 
-func forwardInput(ctx context.Context, reader io.Reader, conn *websocket.Conn) error {
+func scanInput(reader io.Reader, send func([]byte) error) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), maxMessageSize)
 	for scanner.Scan() {
@@ -139,10 +159,7 @@ func forwardInput(ctx context.Context, reader io.Reader, conn *websocket.Conn) e
 		if !utf8.Valid(line) {
 			return errors.New("app-server input contains invalid UTF-8")
 		}
-		writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
-		err := conn.Write(writeCtx, websocket.MessageText, line)
-		cancel()
-		if err != nil {
+		if err := send(line); err != nil {
 			return err
 		}
 	}
@@ -150,6 +167,15 @@ func forwardInput(ctx context.Context, reader io.Reader, conn *websocket.Conn) e
 		return err
 	}
 	return io.EOF
+}
+
+func forwardInput(ctx context.Context, reader io.Reader, conn *websocket.Conn) error {
+	return scanInput(reader, func(line []byte) error {
+		writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
+		err := conn.Write(writeCtx, websocket.MessageText, line)
+		cancel()
+		return err
+	})
 }
 
 func stopProcess(command *exec.Cmd, exited *processExit) {
@@ -173,6 +199,14 @@ func stopProcess(command *exec.Cmd, exited *processExit) {
 	}
 }
 
+func appServerCommand(codex, url string) *exec.Cmd {
+	command := exec.Command(codex, "app-server", "--listen", url)
+	command.Stdout = nil
+	command.Stderr = os.Stderr
+	command.WaitDelay = time.Second
+	return command
+}
+
 func run(ctx context.Context, codex string, out *output) error {
 	url, cleanup, err := reserveEndpoint()
 	if err != nil {
@@ -180,10 +214,7 @@ func run(ctx context.Context, codex string, out *output) error {
 	}
 	defer cleanup()
 
-	command := exec.Command(codex, "app-server", "--listen", url)
-	command.Stdout = nil
-	command.Stderr = os.Stderr
-	command.WaitDelay = time.Second
+	command := appServerCommand(codex, url)
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start Codex app-server: %w", err)
 	}
@@ -241,7 +272,7 @@ func run(ctx context.Context, codex string, out *output) error {
 			}
 			return fmt.Errorf("read app-server message: %w", err)
 		case message := <-messages:
-			if err := out.message(message); err != nil {
+			if err := forwardServerMessage(out, message); err != nil {
 				return fmt.Errorf("write app-server message: %w", err)
 			}
 		}

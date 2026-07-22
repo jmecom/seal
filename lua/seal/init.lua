@@ -24,7 +24,7 @@ local defaults = {
   main_sandbox = "workspace-write",
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
-  auto_approve_commands = true,
+  auto_approve_commands = false,
   save_before_agent = true,
   validate_declarations = false,
   activity = {
@@ -428,7 +428,16 @@ local function preflight_buffer(buf)
     and not vim.api.nvim_get_option_value("modified", { buf = buf })
     and not buffer_matches_disk(buf, path)
   then
-    return false, "the buffer does not match the file on disk"
+    -- checktime can miss a same-timestamp rewrite on coarse filesystems. The
+    -- digest already proves that this unmodified buffer is stale, so force a
+    -- reload instead of turning an applied patch into a false conflict.
+    local reloaded, reload_error = pcall(vim.api.nvim_buf_call, buf, function()
+      vim.cmd("silent noautocmd edit!")
+    end)
+    if not reloaded or not buffer_matches_disk(buf, path) then
+      return false, reloaded and "the buffer does not match the file on disk" or tostring(reload_error)
+    end
+    current = disk_state(path)
   end
   state.file_baselines[buf] = { path = path, disk = current }
   return true
@@ -634,6 +643,7 @@ end
 
 local function reset_restore_attempt(entry)
   entry.settings_restore_started = nil
+  entry.settings_restore_token = nil
   entry.settings_restored = nil
   entry.settings_restore_failed = nil
   entry.restore_settings = nil
@@ -648,15 +658,27 @@ local function reset_restore_attempt(entry)
 end
 
 local function restore_main_thread_settings(session, entry)
+  local lease_token = session.current_lease_token
+  local scheduler = session.scheduler
   if entry.settings_restore_started then
-    return
+    if entry.settings_restore_token == lease_token then
+      return
+    end
+    -- A retried work item gets a new lease and therefore a new restoration
+    -- obligation. Callbacks from the prior lease no longer own this entry.
+    entry.settings_restore_started = nil
+    entry.settings_restore_token = nil
+    entry.settings_restored = nil
+    entry.settings_restore_failed = nil
+    entry.restore_request = nil
+    entry.restore_advance = nil
+    entry.restore_superseded = nil
   end
   -- App-server turn overrides also become the defaults for later turns. Reset
   -- temporary declaration and bounded-patch policies while their turn is
   -- running so the next Seal or TUI prompt inherits the prior settings.
   entry.settings_restore_started = true
-  local lease_token = session.current_lease_token
-  local scheduler = session.scheduler
+  entry.settings_restore_token = lease_token
   if not state.client then
     entry.settings_restored = true
     local action = scheduler and scheduler:restore_finished(lease_token, true)
@@ -672,6 +694,9 @@ local function restore_main_thread_settings(session, entry)
   local restore = entry.restore_settings or {}
 
   local function finish_restore(ok, message, failed_restore)
+    if entry.settings_restore_token ~= lease_token then
+      return
+    end
     if not ok then
       session.settings_blocked = true
       session.blocked_restore = vim.deepcopy(failed_restore)
@@ -1858,10 +1883,20 @@ local function path_in_root(root, path)
 end
 
 local function change_move_path(change)
-  if type(change.kind) ~= "table" then
+  if type(change) ~= "table" or type(change.kind) ~= "table" then
     return nil
   end
   return not_null(change.kind.movePath) or not_null(change.kind.move_path)
+end
+
+local function change_kind_name(change)
+  if type(change) ~= "table" then
+    return nil
+  end
+  if type(change.kind) == "table" then
+    return not_null(change.kind.type)
+  end
+  return not_null(change.kind)
 end
 
 local function buffer_for_path(path)
@@ -1880,9 +1915,20 @@ local function refresh_accepted_file_buffers(accepted)
   for path in pairs(accepted.paths or {}) do
     local buf = buffer_for_path(path)
     if buf then
-      local ok, refresh_error = preflight_buffer(buf)
-      if not ok then
-        table.insert(failures, tostring(refresh_error))
+      local deleted = accepted.expected_paths
+        and accepted.expected_paths[path] == "deleted"
+        and disk_state(path).digest == nil
+      if deleted and not vim.api.nvim_get_option_value("modified", { buf = buf }) then
+        -- The user approved this deletion or rename. Keep the now-unbacked
+        -- buffer visible, but do not misclassify the expected missing file as
+        -- an editor conflict.
+        state.file_conflicts[buf] = nil
+        state.file_baselines[buf] = { path = path, disk = disk_state(path) }
+      else
+        local ok, refresh_error = preflight_buffer(buf)
+        if not ok then
+          table.insert(failures, tostring(refresh_error))
+        end
       end
     end
   end
@@ -1901,11 +1947,16 @@ local function review_safety(review)
 
   local targets = {}
   local seen = {}
+  local expected_paths = {}
   for _, change in ipairs(review.changes) do
+    if type(change) ~= "table" then
+      return "Codex did not provide a valid change entry"
+    end
     if type(change.diff) ~= "string" or change.diff == "" then
       return "Codex did not provide a complete diff for every changed file"
     end
-    local paths = { change.path, change_move_path(change) }
+    local move_path = change_move_path(change)
+    local paths = { change.path, move_path }
     for _, path in ipairs(paths) do
       if path then
         local contained, absolute = path_in_root(review.root, path)
@@ -1920,11 +1971,19 @@ local function review_safety(review)
             buf = buf,
             changedtick = buf and vim.api.nvim_buf_get_changedtick(buf) or nil,
           }
+          if path == move_path then
+            expected_paths[absolute] = "present"
+          elseif move_path or change_kind_name(change) == "delete" then
+            expected_paths[absolute] = "deleted"
+          else
+            expected_paths[absolute] = "present"
+          end
         end
       end
     end
   end
   review.targets = targets
+  review.expected_paths = expected_paths
 end
 
 local function save_modified_review_targets(review)
@@ -1972,7 +2031,10 @@ local function changed_review_target(review)
     if buf and vim.api.nvim_get_option_value("modified", { buf = buf }) then
       return "A proposed file has unsaved editor changes: " .. path
     end
-    if target.buf and vim.api.nvim_buf_is_valid(target.buf) then
+    if target.buf
+      and vim.api.nvim_buf_is_valid(target.buf)
+      and vim.api.nvim_buf_is_loaded(target.buf)
+    then
       if vim.api.nvim_buf_get_changedtick(target.buf) ~= target.changedtick then
         return "A proposed buffer changed while you were reviewing it: " .. path
       end
@@ -2106,6 +2168,7 @@ resolve_file_review = function(review, decision)
       work_item_id = review.work_item_id,
       bounded_patch = review.bounded_patch == true,
       paths = vim.deepcopy(review.targets or {}),
+      expected_paths = vim.deepcopy(review.expected_paths or {}),
     }
     if review.bounded_patch then
       notify("Codex patch accepted; applying it before the bounded turn stops")
@@ -2933,6 +2996,11 @@ handle_notification = function(method, params)
         or turn_status == "interrupted" and entry and entry.bounded_patch_applied
       then
         notify("Codex turn finished; use :SealChat to inspect it")
+      elseif turn_status == "interrupted"
+        and entry
+        and (entry.state == "cancelled" or entry.bounded_patch_rejected)
+      then
+        notify("Codex turn cancelled; use :SealChat to inspect it")
       else
         notify("Codex turn failed: "
           .. (entry and entry.notification_error or tostring(turn_error_message or turn_status or "unknown error")),
@@ -3199,6 +3267,35 @@ handle_server_request = function(request)
   end
 end
 
+local function handle_client_exit(active_client, expected)
+  if state.client ~= active_client then
+    return
+  end
+  for _, accepted in pairs(state.accepted_file_items) do
+    refresh_accepted_file_buffers(accepted)
+  end
+  state.live = {}
+  state.loading = {}
+  reset_ownership()
+  state.approval_items = {}
+  state.accepted_file_items = {}
+  state.resolved_requests = {}
+  state.resolved_request_order = {}
+  state.pending_unowned_requests = {}
+  state.pending_unowned_request_sequence = 0
+  clear_activities()
+  clear_reviews()
+  clear_command_requests()
+  local had_generating = has_generating_jobs()
+  clear_jobs(nil, false)
+  if had_generating then
+    notify("Declaration generation stopped with the app-server", vim.log.levels.WARN)
+  end
+  if not expected and not state.stopping then
+    notify("Codex app-server stopped", vim.log.levels.WARN)
+  end
+end
+
 local function client()
   if state.client then
     return state.client
@@ -3226,29 +3323,7 @@ local function client()
       end
     end,
     on_exit = function(_, expected)
-      if state.client ~= active_client then
-        return
-      end
-      state.live = {}
-      state.loading = {}
-      reset_ownership()
-      state.approval_items = {}
-      state.accepted_file_items = {}
-      state.resolved_requests = {}
-      state.resolved_request_order = {}
-      state.pending_unowned_requests = {}
-      state.pending_unowned_request_sequence = 0
-      clear_activities()
-      clear_reviews()
-      clear_command_requests()
-      local had_generating = has_generating_jobs()
-      clear_jobs(nil, false)
-      if had_generating then
-        notify("Declaration generation stopped with the app-server", vim.log.levels.WARN)
-      end
-      if not expected and not state.stopping then
-        notify("Codex app-server stopped", vim.log.levels.WARN)
-      end
+      handle_client_exit(active_client, expected)
     end,
     on_log = config.on_log,
   })
@@ -4785,6 +4860,9 @@ requeue_session_entry = function(session, entry)
       session.active_turn_id = turn_id
     end
   end
+  if action.requeued then
+    reset_restore_attempt(entry)
+  end
   if action.waiting_for_restore then
     restore_main_thread_settings(session, entry)
   else
@@ -5086,6 +5164,7 @@ reconcile_buffer_lines = function(buf, changedtick, first, last, new_last)
   -- Reconcile the model against that actual post-edit shape.
   if first == 0
     and new_last == 0
+    and last == model:line_count()
     and vim.api.nvim_buf_line_count(buf) == 1
     and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == ""
   then
@@ -5437,6 +5516,11 @@ function M.new_thread()
       end
 
       local function start_new()
+        local replacement = {
+          callbacks = waiting_callbacks or {},
+          client = requesting_client,
+        }
+        state.loading[root] = replacement
         if previous then
           revoke_root_ownership(root, "cancel")
         end
@@ -5458,10 +5542,15 @@ function M.new_thread()
         state.sessions[root] = nil
         close_chat()
         start_thread(root, function(session, start_err)
+          if state.loading[root] ~= replacement or state.client ~= requesting_client then
+            return
+          end
           if not session then
+            finish_session_load(root, replacement, nil, start_err)
             notify(error_message(start_err, "could not start a new thread"), vim.log.levels.ERROR)
             return
           end
+          finish_session_load(root, replacement, session)
           notify("Started a new Codex thread")
         end, requesting_client)
       end
@@ -5592,8 +5681,11 @@ local function command(name, callback, opts)
 end
 
 local function global_keymap(mode, lhs)
+  local expanded = vim.api.nvim_replace_termcodes(lhs, true, true, true)
   for _, mapping in ipairs(vim.api.nvim_get_keymap(mode)) do
-    if mapping.lhs == lhs then
+    if mapping.lhs == lhs
+      or vim.api.nvim_replace_termcodes(mapping.lhs, true, true, true) == expanded
+    then
       return mapping
     end
   end
@@ -5832,6 +5924,9 @@ M._normalize_code = normalize_code
 M._validate_declaration = validate_declaration
 M._notification = handle_notification
 M._server_request = handle_server_request
+M._client_exit = function(expected)
+  handle_client_exit(state.client, expected == true)
+end
 M._capture = capture_snapshot
 M._excerpt = excerpt
 M._state = state

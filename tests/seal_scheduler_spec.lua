@@ -486,16 +486,21 @@ end
 
 function tests.clear_block_requeues_only_unleased_blocked_items()
   local scheduler = Scheduler.new()
-  scheduler:enqueue("first")
+  scheduler:enqueue("first", nil, { restore_required = true })
   scheduler:enqueue("second")
-  scheduler:block_item("first", "restore failed")
+  local lease = scheduler:start_next()
+  scheduler:start_failed(lease.token, { retry = true, error = "restore pending" })
+  scheduler:block_item("second", "restore failed")
   scheduler:set_block({ code = "restore_failed" })
 
   local action = scheduler:clear_block({ requeue_items = true })
-  equal(action.requeued, { "first" }, "clear_block should report the items it made runnable")
-  equal(scheduler:queue_ids(), { "first", "second" },
-    "recovery should restore original FIFO order without duplicating siblings")
+  equal(action.requeued, { "second" }, "clear_block should report only the unleased item it made runnable")
+  equal(scheduler:queue_ids(), { "second" },
+    "recovery must not put a finalizing item in the queue beside its lease")
   truthy(scheduler:validate(), "clear_block recovery should preserve scheduler invariants")
+  scheduler:restore_finished(lease.token, true)
+  equal(scheduler:queue_ids(), { "first", "second" },
+    "the leased retry should return through restore finalization in submission order")
 end
 
 function tests.invalid_transitions_return_structured_errors()

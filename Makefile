@@ -1,4 +1,4 @@
-.PHONY: build test smoke protocol-smoke check
+.PHONY: build test test-validators smoke protocol-smoke check
 
 build:
 	go build -o bin/seal-bridge ./cmd/seal-bridge
@@ -10,6 +10,9 @@ test:
 	nvim --headless -u NONE -l tests/work_items_spec.lua
 	nvim --headless -u NONE -l tests/seal_scheduler_spec.lua
 	nvim --headless -u NONE -l tests/seal_spec.lua
+
+test-validators:
+	SEAL_REQUIRE_OPTIONAL_PARSERS=1 nvim --headless -u NONE -l tests/seal_spec.lua
 
 smoke: build
 	nvim --headless -u NONE -l tests/seal_smoke.lua
