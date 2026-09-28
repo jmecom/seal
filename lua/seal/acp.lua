@@ -374,6 +374,7 @@ function Acp:_update(method, params)
     end
     local tool = vim.tbl_extend("force", turn.tools[id] or {}, update)
     turn.tools[id] = tool
+    if self.opts.on_tool_call then self.opts.on_tool_call(tool) end
     if tool.status == "completed" or tool.status == "failed" then
       self:_emit("item/completed", session, {
         item = { id = id, type = tool.is_file_change and "fileChange" or "commandExecution", status = tool.status },

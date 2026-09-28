@@ -536,17 +536,29 @@ function tests.bounded_policy_restore_accepts_app_server_workspace_defaults()
 end
 
 function tests.freeform_queues_behind_an_active_turn()
-  setup({ "local value = 1" })
+  setup({ "local value = 1", "return value" }, { activity = { interval_ms = 100000 } })
   seal.submit("first prompt")
   fake.thread_status = { type = "active", activeFlags = {} }
   seal._notification("turn/started", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "inProgress" },
   })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
   seal.submit("follow up exactly")
   truthy(request(fake, "turn/steer") == nil, "Seal should never steer a queued prompt into another request")
   equal(fake.main_turn_count, 1, "the second prompt should wait for the active turn")
   equal(vim.tbl_count(seal._state.activities), 2, "both cursor markers should remain visible")
+  local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
+  local function markers()
+    return vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
+  end
+  local before = markers()
+  equal(#before, 2, "running and queued freeform prompts should both render")
+  equal(before[2][4].virt_text[1][1], " ○ ", "a queued prompt should have a static marker")
+  seal._tick_activity()
+  local after = markers()
+  truthy(after[1][4].virt_text[1][1] ~= before[1][4].virt_text[1][1], "the running prompt should animate")
+  equal(after[2], before[2], "ticking should leave the queued marker unchanged")
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
@@ -558,11 +570,15 @@ function tests.freeform_queues_behind_an_active_turn()
   equal(second.params.threadId, "main-thread", "the queued prompt should use the same thread")
   equal(second.params.input[1].text, "follow up exactly", "the queued prompt must remain unchanged")
   equal(vim.tbl_count(seal._state.activities), 1, "only the queued prompt marker should remain")
+  equal(#markers(), 1, "completion should clear the first prompt's inline marker")
+  truthy(markers()[1][4].virt_text[1][1] ~= " ○ ", "the next prompt should animate when it starts")
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn-2", status = "completed" },
   })
   equal(vim.tbl_count(seal._state.activities), 0, "the second completion should clear its marker")
+  equal(#markers(), 0, "completion should remove all freeform inline markers")
+  equal(seal._state.spinner_timer, nil, "completion should stop the idle animation timer")
 end
 
 function tests.early_completion_waits_for_start_ownership_before_pumping()
@@ -3040,8 +3056,8 @@ function tests.insert_leave_noop_formatter_keeps_the_startup_spinner()
   seal.reject(job.id)
 end
 
-function tests.only_prefixed_agent_prompts_render_before_app_server_is_ready()
-  setup({ "local value = 1" }, { activity = { interval_ms = 100000 } })
+function tests.agent_prompts_render_before_backend_is_ready()
+  setup({ "local value = 1" }, { backend = "acp", activity = { interval_ms = 100000 } })
   local held_start
   function fake:start(callback)
     held_start = callback
@@ -3050,18 +3066,23 @@ function tests.only_prefixed_agent_prompts_render_before_app_server_is_ready()
   truthy(seal.submit("explain the build logger"), "a normal agent prompt should submit")
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
-  equal(#markers, 0, "an unprefixed prompt should not leave an inline marker")
-  equal(seal._state.spinner_timer, nil, "an unprefixed prompt should not start the inline animation timer")
+  equal(#markers, 1, "an unprefixed prompt should immediately leave an inline marker")
+  truthy(markers[1][4].virt_text[2][1]:find("Gemini · explain the build logger", 1, true),
+    "the marker should name the configured backend and summarize the prompt")
+  truthy(seal._state.spinner_timer ~= nil, "an unprefixed prompt should animate during startup")
+  local frame = markers[1][4].virt_text[1][1]
+  seal._tick_activity()
+  markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
+  truthy(markers[1][4].virt_text[1][1] ~= frame, "the freeform startup marker should advance its frame")
 
   truthy(seal.submit("targeted: fix the build logger"), "a targeted prompt should submit")
-  truthy(held_start ~= nil, "both prompts should be waiting on the same app-server startup")
+  truthy(held_start ~= nil, "both prompts should be waiting on the same backend startup")
   equal(vim.tbl_count(seal._state.activities), 2, "both prompts should retain their lifecycle state")
   markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
-  equal(#markers, 1, "only the prefixed prompt should render inline")
+  equal(#markers, 1, "collocated prompts should share one inline marker")
   local summary = markers[1][4].virt_text[2][1]
   truthy(summary:find("targeted · fix the build logger", 1, true), "the marker should show the prefixed request")
-  truthy(not summary:find("2 requests here", 1, true),
-    "a hidden normal prompt should not inflate the inline request count")
+  truthy(summary:find("2 requests here", 1, true), "the request count should include the normal prompt")
   truthy(seal._state.spinner_timer ~= nil, "the prefixed prompt should animate while it waits")
   truthy(
     seal._state.job_mappings[vim.api.nvim_get_current_buf()] ~= nil,
@@ -3073,6 +3094,8 @@ function tests.only_prefixed_agent_prompts_render_before_app_server_is_ready()
   equal(vim.tbl_count(seal._state.activities), 2, "editing should not cancel informational markers")
   seal.stop()
   equal(vim.tbl_count(seal._state.activities), 0, "stopping Seal should remove informational markers")
+  equal(vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, {}), {}, "stopping should remove inline markers")
+  equal(seal._state.spinner_timer, nil, "stopping should stop the inline animation timer")
 end
 
 function tests.concurrent_initial_prompts_run_fifo()
@@ -5150,7 +5173,7 @@ local order = {
   "collocated_jobs_are_preserved_and_selected_newest_first",
   "spinner_renders_before_app_server_is_ready",
   "insert_leave_noop_formatter_keeps_the_startup_spinner",
-  "only_prefixed_agent_prompts_render_before_app_server_is_ready",
+  "agent_prompts_render_before_backend_is_ready",
   "concurrent_initial_prompts_run_fifo",
   "session_read_failure_clears_immediate_agent_spinner",
   "app_server_start_failure_clears_immediate_spinners",

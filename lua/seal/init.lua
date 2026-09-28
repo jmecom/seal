@@ -18,6 +18,18 @@ local defaults = {
   backend = "codex",
   acp = {},
   alto = {},
+  warmup = {
+    enabled = false,
+    idle_ms = 1500,
+    resume_delay_ms = 10000,
+    timeout_ms = 45000,
+    max_projects = 4,
+    max_files = 8,
+    max_sources = 48,
+    max_file_bytes = 262144,
+    max_context_chars = 12000,
+    max_note_chars = 4000,
+  },
   codex_command = "codex",
   bridge = nil,
   startup_timeout_ms = 10000,
@@ -260,7 +272,8 @@ local function root_for_buffer(buf)
     return config.root(buf)
   end
   local name = vim.api.nvim_buf_get_name(buf)
-  local start = name ~= "" and vim.fs.dirname(name) or (vim.uv or vim.loop).cwd()
+  local start = name ~= "" and (vim.fn.isdirectory(name) == 1 and name or vim.fs.dirname(name))
+    or (vim.uv or vim.loop).cwd()
   return vim.fs.root(start, { ".git" }) or start
 end
 
@@ -962,10 +975,7 @@ local function build_buffer_layout(buf)
   local groups = {}
   local layout = {}
   for _, item in pairs(state.buffer_items[buf] or {}) do
-    if item_registered(item)
-      and (item.kind ~= "agent" or item.show_inline ~= false)
-      and item.snapshot.buf == buf
-    then
+    if item_registered(item) and item.snapshot.buf == buf then
       local position = job_position(item)
       if position then
         local key = tostring(position[1]) .. ":" .. tostring(position[2])
@@ -1028,7 +1038,6 @@ end
 
 local function item_should_animate(item)
   return item_registered(item)
-    and (item.kind ~= "agent" or item.show_inline ~= false)
     and item.phase == "generating"
     and (item.awaiting_session or item.state == "starting" or item.state == "running")
 end
@@ -1073,10 +1082,6 @@ end
 
 local function render_spinner(job, layout)
   local buf = job.snapshot.buf
-  if job.kind == "agent" and job.show_inline == false then
-    clear_item_extmark(job)
-    return true
-  end
   if job.phase ~= "generating" or job.invalidated or not vim.api.nvim_buf_is_valid(buf) then
     return false
   end
@@ -3916,12 +3921,15 @@ local function editor_context(snapshot)
 end
 
 local function additional_context(snapshot)
-  return {
+  local context = {
     ["seal.editor"] = {
       kind = "untrusted",
       value = editor_context(snapshot),
     },
   }
+  local notes = state.warmup and state.warmup:context(snapshot.root)
+  if notes then context["seal.orientation"] = { kind = "untrusted", value = notes } end
+  return context
 end
 
 local function route_prompt(text)
@@ -5075,6 +5083,7 @@ function M.submit(text, opts)
     notify("The source buffer or file changed while the prompt was open", vim.log.levels.WARN)
     return false
   end
+  if state.warmup then state.warmup:pause() end
   local pending_limit = math.max(1, math.floor(tonumber(config.max_pending_items) or defaults.max_pending_items))
   if work_store:count({ root = snapshot.root, terminal = false }) >= pending_limit then
     notify(
@@ -5131,7 +5140,6 @@ function M.submit(text, opts)
         route = route,
         prompt = routed_agent_prompt(route),
         bounded_patch = route.bounded_patch == true,
-        show_inline = route.label ~= nil,
         summary = summary_text(route.label or Backend.name(config), route.prompt),
       },
     })
@@ -5166,6 +5174,7 @@ function M.prompt(opts)
   if not snapshot then
     return
   end
+  if state.warmup then state.warmup:pause() end
   local input = config.input or vim.ui.input
   input({ prompt = "Seal> " }, function(text)
     if text ~= nil then
@@ -5178,6 +5187,7 @@ function M.alto(text, opts)
   opts = opts or {}
   local snapshot = capture_snapshot(opts)
   if not snapshot then return end
+  if state.warmup then state.warmup:pause() end
   local function send(prompt)
     if not prompt or vim.trim(prompt) == "" then return end
     require("seal.alto").request({
@@ -5857,6 +5867,7 @@ end
 
 function M.stop()
   state.stopping = true
+  if state.warmup then state.warmup:dispose(); state.warmup = nil end
   if package.loaded["seal.alto"] then require("seal.alto").stop() end
   clear_jobs(nil, true)
   clear_activities()
@@ -5931,7 +5942,18 @@ function M.status()
     pending_reviews = pending_reviews,
     attaching = state.attach_waiting[root] ~= nil,
     remote = state.client and state.client:url() or nil,
+    warmup = state.warmup and state.warmup:status(root) or { phase = "disabled" },
   }
+end
+
+function M.warmup_status()
+  if not state.warmup then return "" end
+  local status = state.warmup:status(current_project_root())
+  if status.phase == "learning" then return "Seal: learning " .. (status.detail or "project") end
+  if status.phase == "ready" then return "Seal: context ready" end
+  if status.phase == "paused" then return "Seal: warm-up paused" end
+  if status.phase == "error" or status.phase == "unavailable" then return "Seal: warm-up unavailable" end
+  return ""
 end
 
 local function command(name, callback, opts)
@@ -5963,6 +5985,13 @@ end
 function M.setup(opts)
   opts = opts or {}
   local next_config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
+  for name, value in pairs(defaults.warmup) do
+    if type(value) == "number" then
+      assert(type(next_config.warmup[name]) == "number" and next_config.warmup[name] >= 1,
+        "warmup." .. name .. " must be a positive number")
+    end
+  end
+  if state.warmup then state.warmup:dispose(); state.warmup = nil end
   if next_config.backend ~= "codex" and next_config.backend ~= "acp" then
     error("Seal backend must be 'codex' or 'acp'")
   end
@@ -6028,6 +6057,14 @@ function M.setup(opts)
     M.alto(args.args, { range = args.range, line1 = args.line1, line2 = args.line2, steer = args.bang })
   end, { nargs = "*", range = true, bang = true, desc = "Send prompt and editor context to the current Alto chat" })
   command("SealAltoStatus", M.alto_status, { desc = "Show the Alto chat selected for Seal handoffs" })
+  command("SealWarmup", function()
+    if not state.warmup then notify("Enable warmup.enabled in Seal's setup to orient the project"); return end
+    state.warmup:restart(current_project_root())
+  end, { desc = "Refresh background repository orientation" })
+  command("SealWarmupStatus", function()
+    local status = M.status().warmup
+    notify("Background orientation: " .. status.phase .. (status.detail and (" · " .. status.detail) or ""))
+  end, { desc = "Show background repository orientation status" })
   command("SealNew", M.new_thread, { desc = "Start a new Seal " .. Backend.name(config) .. " thread" })
   command("SealStop", M.stop, { desc = "Stop Seal's agent connection and pending handoffs" })
   pcall(vim.api.nvim_del_user_command, "SealTerminal")
@@ -6188,6 +6225,13 @@ function M.setup(opts)
     local chat = M.chat
     vim.keymap.set("n", config.keymaps.chat, chat, { desc = "Seal chat" })
     table.insert(state.global_keymaps, { mode = "n", lhs = config.keymaps.chat, callback = chat })
+  end
+  if config.warmup.enabled then
+    state.warmup = require("seal.warmup").new(config, {
+      root = root_for_buffer,
+      busy = function() return work_store:count({ terminal = false }) > 0 end,
+      prepare = function(root) ensure_session(root, function() end) end,
+    })
   end
   return M
 end

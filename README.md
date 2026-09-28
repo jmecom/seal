@@ -4,11 +4,11 @@ Seal is a small Neovim interface for a real agent session. It supports Codex app
 
 Press one key, enter a prompt, and Seal routes it in one of three ways:
 
-- A normal prompt goes unchanged to one persistent Codex thread without adding inline status to the source buffer. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
+- A normal prompt goes unchanged to one persistent Codex thread and shows a spinner and prompt summary at the originating cursor while it runs. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
 - `targeted:` and `refactor:` use that same thread as bounded patch turns and leave a spinner and prompt summary at the originating cursor while they run. Codex may inspect the repository, then proposes one reviewed patch and stops after app-server applies it. These turns do not run tests, builds, linters, or formatters.
 - `fun:`, `type:`, `class:`, and other declaration prefixes use read-only turns in the same conversation. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview.
 
-You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Prefixed requests remain visible inline; only the request that owns the current turn animates, while queued markers are static. Collocated visible requests share one marker with a count and remain independently addressable, newest first.
+You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. All requests show an inline marker, including while the agent starts up; once connected, only the request that owns the current turn animates, while queued markers are static. Collocated requests share one marker with a count and remain independently addressable, newest first.
 
 The selected agent owns the agent loop, tools, and compaction. Seal keeps one session per project root in the current Neovim process. Codex is the default backend; its behavior is described below. ACP differences are covered in the next section.
 
@@ -52,6 +52,29 @@ ACP has no standard per-turn sandbox setting. Declaration prompts instruct the a
 File-edit permission requests with complete ACP diffs open the existing review window. Seal grants only `allow_once`, never permanent approval. It also refuses an accepted replacement if the file differs from the original text supplied by the agent, including after saving local buffer edits; reject that proposal and request a fresh edit. Tools without diffs require an explicit decision through the command approval dialog. Seal does not advertise client filesystem or terminal capabilities; agents use their own tools.
 
 `targeted:` and `refactor:` retain their one-proposal handling: command permission requests are declined, and Seal cancels the turn after the accepted edit tool reports completion. ACP tools that write without requesting permission cannot be intercepted. A cancelled turn continues to own the queue until the agent acknowledges cancellation; an unresponsive agent is stopped after `request_timeout_ms`. Ordinary prompt duration and time spent reviewing are not limited by that timeout.
+
+### Background repository orientation
+
+Enable background orientation with Gemini CLI:
+
+```lua
+require("seal").setup({
+  backend = "acp",
+  warmup = { enabled = true },
+})
+```
+
+After Neovim opens a Git repository and remains idle for 1.5 seconds, Seal starts the edit connection and a separate background Gemini process. That process reads repository instructions, the top-level structure, manifests, and key entry points. It then investigates the focused file's related definitions, callers, and tests during idle time. It uses your configured Gemini command, model, credentials, and thinking settings. Background orientation makes real model requests; it is disabled by default.
+
+The background process has a process-specific Gemini policy that allows file reads, directory listings, globbing, and code search. Shell commands, file writes, network tools, MCP tools, and subagents are denied. All interactive permission requests are declined. This policy is passed with `--admin-policy`; it does not change your foreground agent's approvals or global Gemini settings. Background orientation currently requires a Gemini CLI executable named `gemini` with support for that flag.
+
+Opening a Seal or Alto prompt immediately stops an active background process. Foreground requests never wait for orientation to finish. Completed findings remain available as concise, untrusted context for normal prompts and declaration previews, and the editing agent retains its normal read/search tools. Raw background conversations stay in separate per-project sessions so research cannot occupy the foreground queue.
+
+Seal discards a project's findings when an observed source file changes on disk or in an unsaved buffer, or when the Git HEAD/ref/index changes. Changes made while Gemini is reading also invalidate its result. The current editor snapshot remains authoritative. Findings live only in the Neovim process; restarting Neovim starts fresh. An orientation failure leaves foreground editing available. Use `:SealWarmup` to explicitly retry or refresh, and `:SealWarmupStatus` to inspect progress or errors. `:SealStop` stops both agents and disables automatic warm-up until the next `setup()` or Neovim restart.
+
+For a quiet statusline indicator, add `function() return require("seal").warmup_status() end` to a lualine section. It shows learning, ready, paused, or unavailable status; `User SealWarmupUpdated` fires when that status changes. `require("seal").status().warmup` exposes the same state as a table.
+
+Optional limits are configured under `warmup`: `idle_ms` (1500), `resume_delay_ms` (10000 after opening a prompt), `timeout_ms` (45000 per background turn), `max_projects` (4), `max_files` (8 focused file attempts per project), `max_sources` (48 observed paths per turn), `max_file_bytes` (262144), `max_context_chars` (12000 supplied editor characters), and `max_note_chars` (4000 per result). Ordinary edits do not have these background limits. A timed-out or failed read does not retry in a loop.
 
 ## Install
 

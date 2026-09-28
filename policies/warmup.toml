@@ -1,0 +1,11 @@
+# Applied only to Seal's background Gemini process. Foreground edits use the
+# user's normal policy. Deny other tools, including shell, writes, MCP, and agents.
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 998
+
+[[rule]]
+toolName = ["glob", "grep_search", "list_directory", "read_file", "read_many_files"]
+decision = "allow"
+priority = 999

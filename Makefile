@@ -8,6 +8,7 @@ test:
 	nvim --headless -u NONE -l tests/client_spec.lua
 	nvim --headless -u NONE -l tests/acp_spec.lua
 	nvim --headless -u NONE -l tests/alto_spec.lua
+	nvim --headless -u NONE -l tests/warmup_spec.lua
 	nvim --headless -u NONE -l tests/buffer_model_spec.lua
 	nvim --headless -u NONE -l tests/work_items_spec.lua
 	nvim --headless -u NONE -l tests/seal_scheduler_spec.lua
