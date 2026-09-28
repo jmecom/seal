@@ -150,7 +150,10 @@ end)
 
 test("tool approvals are declined silently and the worker gets its own read policy", function()
   local f = fixture()
+  f.config.acp.mode = "autoEdit"
   local worker = f:run()
+  equal("default", worker.callbacks.acp.mode)
+  equal("autoEdit", f.config.acp.mode)
   worker.callbacks.on_server_request({ id = "write-request" })
   equal({ id = "write-request", result = { decision = "decline" } }, worker.decision)
   local command = worker.callbacks.acp.command

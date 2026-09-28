@@ -1116,12 +1116,11 @@ local function render_spinner(job, layout)
     id = job.extmark,
     right_gravity = true,
     strict = false,
-    virt_text = {
+    virt_lines = { {
       { " " .. frame .. " ", "SealSpinner" },
       { detail, "SealSpinnerSummary" },
-    },
-    virt_text_pos = "inline",
-    hl_mode = "combine",
+    } },
+    virt_lines_above = true,
     priority = 200,
     undo_restore = true,
   })

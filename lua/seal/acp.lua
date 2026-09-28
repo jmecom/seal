@@ -102,6 +102,9 @@ end
 function Acp.new(opts)
   opts = opts or {}
   local config = opts.acp or {}
+  if config.mode ~= nil then
+    assert(type(config.mode) == "string" and config.mode ~= "", "acp.mode must be a nonempty session mode ID")
+  end
   if config.command ~= nil then
     assert(type(config.command) == "table" and vim.islist(config.command) and #config.command > 0,
       "acp.command must be a nonempty array of arguments")
@@ -321,8 +324,26 @@ function Acp:request(method, params, callback)
         return
       end
       local session = { id = result.sessionId, cwd = params.cwd, turns = {} }
-      self.sessions[session.id] = session
-      callback({ thread = self:_thread(session, false), model = result.models and result.models.currentModelId })
+      local function ready()
+        self.sessions[session.id] = session
+        callback({ thread = self:_thread(session, false), model = result.models and result.models.currentModelId })
+      end
+      local mode = (self.opts.acp or {}).mode
+      if not mode or result.modes and result.modes.currentModeId == mode then ready(); return end
+      local available = false
+      for _, candidate in ipairs(result.modes and result.modes.availableModes or {}) do
+        if candidate.id == mode then available = true; break end
+      end
+      if not available then
+        callback(nil, { message = "ACP agent does not offer session mode: " .. mode })
+        return
+      end
+      -- Select the requested mode before exposing the session to Seal, so no
+      -- prompt can race ahead with the agent's initial approval settings.
+      self.rpc:request("session/set_mode", { sessionId = session.id, modeId = mode }, function(_, mode_err)
+        if mode_err then callback(nil, mode_err); return end
+        ready()
+      end)
     end)
   end
   local session = self.sessions[params.threadId]

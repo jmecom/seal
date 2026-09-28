@@ -132,7 +132,58 @@ test("negotiates ACP over JSON-RPC without bridge readiness or initialized notif
   f:start()
   equal(1, #f.sent)
   f:session()
+  equal(nil, f:last("session/set_mode"))
   equal(nil, f.client:url())
+end)
+
+test("selects the configured mode before allowing a session to send prompts", function()
+  for _, current in ipairs({ "default", "autoEdit" }) do
+    local f = fixture({ acp = { mode = "autoEdit" } })
+    f:start()
+    local thread
+    f.client:request("thread/start", { cwd = project }, function(result, err)
+      assert(not err, vim.inspect(err))
+      thread = result.thread
+    end)
+    f:reply(f:last("session/new"), { sessionId = "s1", modes = {
+      currentModeId = current, availableModes = { { id = "default" }, { id = "autoEdit" } },
+    } })
+    if current == "default" then
+      equal(nil, thread)
+      equal(nil, f.client.sessions.s1)
+      local mode = f:last("session/set_mode")
+      equal({ sessionId = "s1", modeId = "autoEdit" }, mode.params)
+      f:reply(mode, {})
+    else
+      equal(nil, f:last("session/set_mode"))
+    end
+    equal("s1", thread.id)
+    f:prompt()
+    assert(f:last("session/prompt"))
+  end
+end)
+
+test("unavailable or rejected modes cannot silently start a session", function()
+  for _, available in ipairs({ false, true }) do
+    local f = fixture({ acp = { mode = "autoEdit" } })
+    f:start()
+    local failure
+    f.client:request("thread/start", { cwd = project }, function(result, err)
+      equal(nil, result)
+      failure = err
+    end)
+    f:reply(f:last("session/new"), { sessionId = "s1", modes = {
+      currentModeId = "default", availableModes = available and { { id = "autoEdit" } } or {},
+    } })
+    if available then
+      f:reply(f:last("session/set_mode"), nil, { code = -32602, message = "mode rejected" })
+    else
+      equal(nil, f:last("session/set_mode"))
+    end
+    assert(failure and failure.message:find("mode", 1, true))
+    equal(nil, f.client.sessions.s1)
+    equal(nil, f:last("session/prompt"))
+  end
 end)
 
 test("rejects unsupported protocol versions and authentication methods", function()

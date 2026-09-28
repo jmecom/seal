@@ -6,9 +6,9 @@ Press one key, enter a prompt, and Seal routes it in one of three ways:
 
 - A normal prompt goes unchanged to one persistent Codex thread and shows a spinner and prompt summary at the originating cursor while it runs. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
 - `targeted:` and `refactor:` use that same thread as bounded patch turns and leave a spinner and prompt summary at the originating cursor while they run. Codex may inspect the repository, then proposes one reviewed patch and stops after app-server applies it. These turns do not run tests, builds, linters, or formatters.
-- `fun:`, `type:`, `class:`, and other declaration prefixes use read-only turns in the same conversation. Each cursor gets an inline spinner and prompt summary while Codex works, then an inline declaration preview.
+- `fun:`, `type:`, `class:`, and other declaration prefixes use read-only turns in the same conversation. Each cursor gets a spinner and prompt summary above its line while Codex works, then an inline declaration preview.
 
-You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. All requests show an inline marker, including while the agent starts up; once connected, only the request that owns the current turn animates, while queued markers are static. Collocated requests share one marker with a count and remain independently addressable, newest first.
+You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Progress appears on a virtual line above the originating code, so the spinner and prompt summary never shift code sideways or change the buffer. This includes agent startup; once connected, only the request that owns the current turn animates, while queued markers are static. Collocated requests share one marker with a count and remain independently addressable, newest first.
 
 The selected agent owns the agent loop, tools, and compaction. Seal keeps one session per project root in the current Neovim process. Codex is the default backend; its behavior is described below. ACP differences are covered in the next section.
 
@@ -39,6 +39,7 @@ require("seal").setup({
   acp = {
     name = "Gemini",
     command = { "gemini", "--acp", "--model", "gemini-3.8-flash", "--approval-mode", "default" },
+    -- mode = "autoEdit", -- optional Gemini session mode; auto-approves file edits
     -- auth_method = "gemini-api-key", -- optional; must be advertised by the agent
     -- env = { GEMINI_API_KEY = vim.env.GEMINI_API_KEY },
   },
@@ -46,6 +47,8 @@ require("seal").setup({
 ```
 
 ACP uses the same per-project queue, editor context, inline declaration previews, and patch review UI. `:SealChat` shows messages received during the current connection. `:SealNew` starts another session. Restarting the agent starts fresh sessions; loading previous ACP sessions and `:SealAttach` are not supported. Changing the backend or ACP configuration in `setup()` stops the old connection and clears its session IDs.
+
+To let Gemini read and edit project files without approval dialogs, set `acp.mode = "autoEdit"`. Seal selects this mode through ACP before sending any prompts. Shell commands retain their normal approvals. An agent must advertise the requested mode; an unavailable or rejected mode stops session startup. Gemini requires the project folder to be trusted before enabling Auto Edit. Background orientation always uses its separate read-only policy and default session mode.
 
 ACP has no standard per-turn sandbox setting. Declaration prompts instruct the agent not to change files, and Seal declines every permission request during those turns. This is not an operating-system read-only sandbox: an agent's tools or configured policies can execute without asking Seal. Configure the agent's own sandbox and approval policy as needed. Codex's `main_sandbox` and `main_approval_policy` options do not configure ACP agents.
 

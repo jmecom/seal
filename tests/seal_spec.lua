@@ -554,10 +554,10 @@ function tests.freeform_queues_behind_an_active_turn()
   end
   local before = markers()
   equal(#before, 2, "running and queued freeform prompts should both render")
-  equal(before[2][4].virt_text[1][1], " ○ ", "a queued prompt should have a static marker")
+  equal(before[2][4].virt_lines[1][1][1], " ○ ", "a queued prompt should have a static marker")
   seal._tick_activity()
   local after = markers()
-  truthy(after[1][4].virt_text[1][1] ~= before[1][4].virt_text[1][1], "the running prompt should animate")
+  truthy(after[1][4].virt_lines[1][1][1] ~= before[1][4].virt_lines[1][1][1], "the running prompt should animate")
   equal(after[2], before[2], "ticking should leave the queued marker unchanged")
   seal._notification("turn/completed", {
     threadId = "main-thread",
@@ -570,14 +570,14 @@ function tests.freeform_queues_behind_an_active_turn()
   equal(second.params.threadId, "main-thread", "the queued prompt should use the same thread")
   equal(second.params.input[1].text, "follow up exactly", "the queued prompt must remain unchanged")
   equal(vim.tbl_count(seal._state.activities), 1, "only the queued prompt marker should remain")
-  equal(#markers(), 1, "completion should clear the first prompt's inline marker")
-  truthy(markers()[1][4].virt_text[1][1] ~= " ○ ", "the next prompt should animate when it starts")
+  equal(#markers(), 1, "completion should clear the first prompt's progress marker")
+  truthy(markers()[1][4].virt_lines[1][1][1] ~= " ○ ", "the next prompt should animate when it starts")
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn-2", status = "completed" },
   })
   equal(vim.tbl_count(seal._state.activities), 0, "the second completion should clear its marker")
-  equal(#markers(), 0, "completion should remove all freeform inline markers")
+  equal(#markers(), 0, "completion should remove all freeform progress markers")
   equal(seal._state.spinner_timer, nil, "completion should stop the idle animation timer")
 end
 
@@ -3008,7 +3008,7 @@ function tests.spinner_renders_before_app_server_is_ready()
   truthy(job and job.phase == "generating", "the declaration job should exist immediately")
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local marker = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, { details = true })
-  local text = marker[3].virt_text[1][1] .. marker[3].virt_text[2][1]
+  local text = marker[3].virt_lines[1][1][1] .. marker[3].virt_lines[1][2][1]
   truthy(text:find("function · add build logging", 1, true), "the immediate spinner should summarize the request")
   truthy(seal._state.spinner_timer ~= nil, "the spinner animation should start before network readiness")
 
@@ -3066,21 +3066,21 @@ function tests.agent_prompts_render_before_backend_is_ready()
   truthy(seal.submit("explain the build logger"), "a normal agent prompt should submit")
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
-  equal(#markers, 1, "an unprefixed prompt should immediately leave an inline marker")
-  truthy(markers[1][4].virt_text[2][1]:find("Gemini · explain the build logger", 1, true),
+  equal(#markers, 1, "an unprefixed prompt should immediately leave an progress marker")
+  truthy(markers[1][4].virt_lines[1][2][1]:find("Gemini · explain the build logger", 1, true),
     "the marker should name the configured backend and summarize the prompt")
   truthy(seal._state.spinner_timer ~= nil, "an unprefixed prompt should animate during startup")
-  local frame = markers[1][4].virt_text[1][1]
+  local frame = markers[1][4].virt_lines[1][1][1]
   seal._tick_activity()
   markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
-  truthy(markers[1][4].virt_text[1][1] ~= frame, "the freeform startup marker should advance its frame")
+  truthy(markers[1][4].virt_lines[1][1][1] ~= frame, "the freeform startup marker should advance its frame")
 
   truthy(seal.submit("targeted: fix the build logger"), "a targeted prompt should submit")
   truthy(held_start ~= nil, "both prompts should be waiting on the same backend startup")
   equal(vim.tbl_count(seal._state.activities), 2, "both prompts should retain their lifecycle state")
   markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
-  equal(#markers, 1, "collocated prompts should share one inline marker")
-  local summary = markers[1][4].virt_text[2][1]
+  equal(#markers, 1, "collocated prompts should share one progress marker")
+  local summary = markers[1][4].virt_lines[1][2][1]
   truthy(summary:find("targeted · fix the build logger", 1, true), "the marker should show the prefixed request")
   truthy(summary:find("2 requests here", 1, true), "the request count should include the normal prompt")
   truthy(seal._state.spinner_timer ~= nil, "the prefixed prompt should animate while it waits")
@@ -3094,8 +3094,8 @@ function tests.agent_prompts_render_before_backend_is_ready()
   equal(vim.tbl_count(seal._state.activities), 2, "editing should not cancel informational markers")
   seal.stop()
   equal(vim.tbl_count(seal._state.activities), 0, "stopping Seal should remove informational markers")
-  equal(vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, {}), {}, "stopping should remove inline markers")
-  equal(seal._state.spinner_timer, nil, "stopping should stop the inline animation timer")
+  equal(vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, {}), {}, "stopping should remove progress markers")
+  equal(seal._state.spinner_timer, nil, "stopping should stop the animation timer")
 end
 
 function tests.concurrent_initial_prompts_run_fifo()
@@ -3289,7 +3289,7 @@ function tests.spinner_is_anchored_and_animates_in_place()
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local before = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, { details = true })
   equal({ before[1], before[2] }, { 0, 6 }, "the spinner should stay at the captured cursor")
-  local before_text = before[3].virt_text[1][1] .. before[3].virt_text[2][1]
+  local before_text = before[3].virt_lines[1][1][1] .. before[3].virt_lines[1][2][1]
   truthy(before_text:find("function · load the saved state", 1, true), "the spinner should summarize the prompt")
   vim.fn.maparg("<Tab>", "n", false, true).callback()
   truthy(seal._state.jobs[1] ~= nil, "Tab should not accept a job that is still generating")
@@ -3299,7 +3299,7 @@ function tests.spinner_is_anchored_and_animates_in_place()
   local after_text
   truthy(vim.wait(1000, function()
     after = vim.api.nvim_buf_get_extmark_by_id(0, namespace, job.extmark, { details = true })
-    after_text = after[3].virt_text[1][1] .. after[3].virt_text[2][1]
+    after_text = after[3].virt_lines[1][1][1] .. after[3].virt_lines[1][2][1]
     return after_text ~= before_text
   end, 5), "the real spinner timer should advance the frame")
   equal({ after[1], after[2] }, { 0, 6 }, "animation must update the existing anchored extmark")

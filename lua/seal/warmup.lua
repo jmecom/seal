@@ -258,7 +258,7 @@ function Warmup:worker()
   local client
   local function current() return not self.disposed and generation == self.generation and self.client == client end
   local opts = vim.tbl_extend("force", self.config, {
-    acp = vim.tbl_extend("force", self.config.acp or {}, { command = self.command }),
+    acp = vim.tbl_extend("force", self.config.acp or {}, { command = self.command, mode = "default" }),
     on_notification = function(method, params)
       local job = current() and self.active
       if not job or params.threadId ~= job.entry.thread then return end
