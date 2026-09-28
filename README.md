@@ -182,7 +182,7 @@ Seal never opens a terminal or Zellij pane. Permission expansion and structured 
 
 The backing session is a normal Codex app-server thread. You can run `:SealAttach` before sending any prompt, switch to your existing Zellij terminal pane, and paste the copied command. The remote TUI creates the empty chat and Seal adopts it; a Seal prompt entered while the TUI is connecting waits for that handoff, then appears in the visible TUI conversation. Once the chat has processed a turn and has durable history, later `:SealAttach` calls copy an exact `codex resume --remote ...` command instead. Seal only copies the command; it never creates or controls the pane. A standalone TUI that was not started with the copied `--remote` endpoint cannot be adopted while it is already running.
 
-Seal does not block model output based on language-specific AST shapes. Prefixes constrain the Codex prompt, and the inline preview plus `Tab` is the approval boundary. Set `validate_declarations = true` to opt into the stricter Tree-sitter check that requires one syntax unit of the requested kind.
+Seal does not block model output based on language-specific AST shapes. Prefixes constrain the Codex prompt, and declarations wait for `Tab` by default. Set `auto_accept_declarations = true` to insert completed `fun:`, `type:`, and other declaration results immediately, even after switching buffers. Each automatic insertion is a separate undo step. Ambiguous insertion points, disk conflicts, and non-modifiable buffers retain a preview instead of changing the source. Set `validate_declarations = true` to opt into the stricter Tree-sitter check that requires one syntax unit of the requested kind.
 
 ## Configure
 
@@ -199,6 +199,7 @@ require("seal").setup({
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
   auto_approve_commands = false,
+  auto_accept_declarations = false,
   save_before_agent = true,
   validate_declarations = false,
   max_context_chars = 120000,

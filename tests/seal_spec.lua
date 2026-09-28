@@ -4009,6 +4009,92 @@ function tests.preview_accepts_as_one_edit()
   equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), { "  ", "  local existing = true" }, "one undo should remove the declaration")
 end
 
+function tests.automatic_declarations_preserve_edits_and_separate_undo_steps()
+  setup({ "  ", "local existing = true" }, { auto_accept_declarations = true })
+  local global_undo = vim.go.undolevels
+  seal.submit("fun: load it")
+  vim.api.nvim_buf_set_lines(0, 1, 2, false, { "local existing = false" })
+  complete_declaration("function load()\n  return true\nend")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {
+    "  function load()", "    return true", "  end", "local existing = false",
+  }, "the declaration should insert automatically and preserve the intervening edit")
+  equal(vim.tbl_count(seal._state.jobs), 0, "automatic insertion should retire its job")
+  equal(seal._state.preview, nil, "successful insertion should leave no acceptance UI")
+  equal(vim.go.undolevels, global_undo, "automatic insertion must not change global undo settings")
+  for _, notification in ipairs(notifications) do
+    truthy(not notification.message:find("Tab accepts", 1, true), "automatic results should not request acceptance")
+  end
+  vim.api.nvim_buf_set_lines(0, 3, 4, false, { "local existing = later_edit" })
+  vim.cmd("undo")
+  equal(vim.api.nvim_buf_get_lines(0, 0, 1, false), { "  function load()" },
+    "undoing later typing should preserve the generated declaration")
+  vim.cmd("undo")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), { "  ", "local existing = false" },
+    "one more undo should remove only the automatic insertion")
+  vim.cmd("undo")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), { "  ", "local existing = true" },
+    "the earlier user edit should retain its own undo history")
+end
+
+function tests.automatic_declarations_apply_without_switching_back_to_the_source()
+  setup({ "" }, { auto_accept_declarations = true })
+  local source = vim.api.nvim_get_current_buf()
+  seal.submit("fun: finish in the background")
+  local other = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_lines(other, 0, -1, false, { "local elsewhere = true" })
+  vim.api.nvim_win_set_buf(0, other)
+  vim.api.nvim_win_set_cursor(0, { 1, 6 })
+  local tick = vim.api.nvim_buf_get_changedtick(other)
+  complete_declaration("function finished() end")
+  equal(vim.api.nvim_buf_get_lines(source, 0, -1, false), { "function finished() end" },
+    "a result should insert into its original buffer without an acceptance step")
+  equal(vim.api.nvim_get_current_buf(), other, "automatic insertion must not steal focus")
+  equal(vim.api.nvim_win_get_cursor(0), { 1, 6 }, "automatic insertion must not move the active cursor")
+  equal(vim.api.nvim_buf_get_changedtick(other), tick, "automatic insertion must not edit the active buffer")
+  equal(seal._state.preview, nil, "a hidden source buffer should not retain a successful preview")
+end
+
+function tests.automatic_declarations_rebase_collocated_queued_results()
+  setup({ "" }, { auto_accept_declarations = true })
+  seal.submit("fun: first")
+  seal.submit("fun: second")
+  complete_declaration("function first()\n  return true\nend")
+  truthy(vim.wait(1000, function() return fake.main_turn_count == 2 end, 5), "the queued request should start")
+  complete_declaration("function second() end")
+  equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {
+    "function first()", "  return true", "end", "function second() end",
+  }, "queued results at one cursor should both insert in order")
+  equal(vim.tbl_count(seal._state.jobs), 0, "both automatic jobs should finish")
+end
+
+function tests.automatic_declarations_leave_conflicts_for_resolution()
+  for _, conflict in ipairs({ "disk", "ambiguous", "readonly" }) do
+    setup({ "local target = true", "local after = true" }, { auto_accept_declarations = true })
+    local path = vim.api.nvim_buf_get_name(0)
+    vim.cmd("silent write")
+    seal.submit("fun: keep conflicts safe")
+    if conflict == "disk" then
+      vim.fn.writefile({ "changed elsewhere" }, path)
+    elseif conflict == "ambiguous" then
+      vim.api.nvim_buf_set_lines(0, 0, 1, false, {})
+    else
+      vim.bo.modifiable = false
+    end
+    local before = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    complete_declaration("function should_wait() end")
+    equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), before, "automatic insertion must preserve a " .. conflict .. " conflict")
+    truthy(seal._state.preview ~= nil, "a conflicting result should remain available for resolution")
+    if conflict == "ambiguous" then
+      truthy(seal._state.preview.snapshot.anchor_ambiguous, "automatic insertion must not guess a new anchor")
+    else
+      truthy(seal._state.preview.preview_blocked_reason ~= nil, "the preview should explain why insertion was blocked")
+    end
+    vim.bo.modifiable = true
+    seal.reject()
+    vim.fn.delete(path)
+  end
+end
+
 function tests.reject_leaves_buffer_untouched()
   setup({ "" })
   seal.submit("fun: stored state")
@@ -5205,6 +5291,10 @@ local order = {
   "collocated_acceptance_preserves_a_siblings_existing_ambiguity",
   "acceptance_finalizes_when_sibling_reconciliation_fails",
   "preview_accepts_as_one_edit",
+  "automatic_declarations_preserve_edits_and_separate_undo_steps",
+  "automatic_declarations_apply_without_switching_back_to_the_source",
+  "automatic_declarations_rebase_collocated_queued_results",
+  "automatic_declarations_leave_conflicts_for_resolution",
   "reject_leaves_buffer_untouched",
   "freeform_preserves_an_existing_preview",
   "targeted_preserves_queued_declaration_spinners",

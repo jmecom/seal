@@ -43,6 +43,7 @@ local defaults = {
   main_approval_policy = "untrusted",
   main_approvals_reviewer = "user",
   auto_approve_commands = false,
+  auto_accept_declarations = false,
   save_before_agent = true,
   validate_declarations = false,
   activity = {
@@ -4380,7 +4381,9 @@ function M._finish_generation(job)
     cancel_job(job, false)
     return
   end
-  render_preview(job, lines)
+  if render_preview(job, lines, config.auto_accept_declarations) and config.auto_accept_declarations then
+    M.accept(job, { automatic = true })
+  end
 end
 
 local function defer_preflight_item(session, item, message)
@@ -5386,7 +5389,8 @@ reconcile_buffer_tick = function(buf, changedtick)
   end
 end
 
-function M.accept(job_id)
+function M.accept(job_id, opts)
+  local automatic = opts and opts.automatic == true
   local job = selected_job(job_id)
   if not job then
     return false
@@ -5397,7 +5401,7 @@ function M.accept(job_id)
     return false
   end
   local snapshot = job.snapshot
-  if vim.api.nvim_get_current_buf() ~= snapshot.buf then
+  if not automatic and vim.api.nvim_get_current_buf() ~= snapshot.buf then
     notify("Return to the source buffer before accepting", vim.log.levels.WARN)
     return false
   end
@@ -5415,6 +5419,10 @@ function M.accept(job_id)
   end
 
   if snapshot.anchor_ambiguous then
+    if automatic then
+      notify("Declaration needs a new insertion point; re-anchor it before applying", vim.log.levels.WARN)
+      return false
+    end
     local model = state.buffer_models[snapshot.buf]
     local cursor = vim.api.nvim_win_get_cursor(0)
     local resolved_row = cursor[1] - 1
@@ -5505,7 +5513,13 @@ function M.accept(job_id)
     return false
   end
   job.phase = "applying"
-  local ok, insert_error = pcall(vim.api.nvim_buf_set_lines, buf, row, last, false, job.lines)
+  local ok, insert_error = pcall(function()
+    -- A result can arrive while the user is typing. Keep its insertion separate
+    -- from both the preceding and following edits in this buffer's undo history.
+    if automatic then vim.bo[buf].undolevels = vim.bo[buf].undolevels end
+    vim.api.nvim_buf_set_lines(buf, row, last, false, job.lines)
+    if automatic then vim.bo[buf].undolevels = vim.bo[buf].undolevels end
+  end)
   if not ok then
     if scheduler and scheduler:canonical_item(job.id) == job then
       scheduler:apply_failed(job.id, tostring(insert_error))
