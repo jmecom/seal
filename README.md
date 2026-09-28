@@ -1,6 +1,6 @@
 # Seal
 
-Seal is a small Neovim interface for a real Codex session.
+Seal is a small Neovim interface for a real agent session. It supports Codex app-server and ACP agents, including Gemini CLI with Gemini 3.8 Flash.
 
 Press one key, enter a prompt, and Seal routes it in one of three ways:
 
@@ -10,16 +10,48 @@ Press one key, enter a prompt, and Seal routes it in one of three ways:
 
 You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Prefixed requests remain visible inline; only the request that owns the current turn animates, while queued markers are static. Collocated visible requests share one marker with a count and remain independently addressable, newest first.
 
-Codex owns the agent loop, tools, conversation history, and compaction. Seal keeps only one thread ID per project root in the current Neovim process.
+The selected agent owns the agent loop, tools, and compaction. Seal keeps one session per project root in the current Neovim process. Codex is the default backend; its behavior is described below. ACP differences are covered in the next section.
 
 ## Requirements
 
 - Neovim 0.11 or newer
 - A Tree-sitter parser only if declaration validation is explicitly enabled
-- Go 1.23 or newer for the small bridge binary
-- Codex CLI with `app-server` and `--remote` support
+- For Codex: Go 1.23 or newer for the bridge binary, and Codex CLI with `app-server` and `--remote` support
+- For ACP: an authenticated ACP agent executable; no Go bridge is needed
 
 The current implementation is tested with Codex CLI 0.144.5. App-server and its WebSocket transport are experimental Codex interfaces.
+
+## Gemini and other ACP agents
+
+Install and authenticate Gemini CLI, then select the ACP backend:
+
+```lua
+require("seal").setup({ backend = "acp" })
+```
+
+This runs `gemini --acp --model gemini-3.8-flash --approval-mode default`. It is tested with Gemini CLI `0.62.0-preview.0`, which includes Flash 3.8 support. The [Gemini release notes](https://geminicli.com/docs/changelogs/preview/) and [ACP mode documentation](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md) describe the CLI requirements. Authenticate by running `gemini` interactively before using Seal, or use your existing configured credentials.
+
+To choose another model or ACP executable, replace the command array. Arguments are passed directly without a shell:
+
+```lua
+require("seal").setup({
+  backend = "acp",
+  acp = {
+    name = "Gemini",
+    command = { "gemini", "--acp", "--model", "gemini-3.8-flash", "--approval-mode", "default" },
+    -- auth_method = "gemini-api-key", -- optional; must be advertised by the agent
+    -- env = { GEMINI_API_KEY = vim.env.GEMINI_API_KEY },
+  },
+})
+```
+
+ACP uses the same per-project queue, editor context, inline declaration previews, and patch review UI. `:SealChat` shows messages received during the current connection. `:SealNew` starts another session. Restarting the agent starts fresh sessions; loading previous ACP sessions and `:SealAttach` are not supported. Changing the backend or ACP configuration in `setup()` stops the old connection and clears its session IDs.
+
+ACP has no standard per-turn sandbox setting. Declaration prompts instruct the agent not to change files, and Seal declines every permission request during those turns. This is not an operating-system read-only sandbox: an agent's tools or configured policies can execute without asking Seal. Configure the agent's own sandbox and approval policy as needed. Codex's `main_sandbox` and `main_approval_policy` options do not configure ACP agents.
+
+File-edit permission requests with complete ACP diffs open the existing review window. Seal grants only `allow_once`, never permanent approval. It also refuses an accepted replacement if the file differs from the original text supplied by the agent, including after saving local buffer edits; reject that proposal and request a fresh edit. Tools without diffs require an explicit decision through the command approval dialog. Seal does not advertise client filesystem or terminal capabilities; agents use their own tools.
+
+`targeted:` and `refactor:` retain their one-proposal handling: command permission requests are declined, and Seal cancels the turn after the accepted edit tool reports completion. ACP tools that write without requesting permission cannot be intercepted. A cancelled turn continues to own the queue until the agent acknowledges cancellation; an unresponsive agent is stopped after `request_timeout_ms`. Ordinary prompt duration and time spent reviewing are not limited by that timeout.
 
 ## Install
 
@@ -47,6 +79,31 @@ require("seal").setup()
 ```
 
 ## Use
+
+### Send to the open Alto chat
+
+The Alto **Seal** plugin receives prompts through a private local Unix socket. With that plugin enabled, these commands work independently of the configured Codex or ACP backend:
+
+```vim
+:SealAlto explain the code at this cursor
+:'<,'>SealAlto review this selection
+:SealAlto! use this additional context in the running turn
+:SealAltoStatus
+```
+
+`:SealAlto` without text opens a prompt. The handoff includes the originating file, project root, language, cursor, nearby buffer contents, and selected text, including unsaved edits. It targets the focused chat in the most recently focused Alto window. The destination is captured when Alto receives the handoff; switching panes afterward does not redirect it. A pane that changes to another conversation before delivery causes an error.
+
+Normal handoffs use Alto's existing queue when a turn is running. The `!` variant requests live steering. Alto keeps its selected model, provider, workspace, and permissions. This is a one-way handoff: responses and edit approvals remain in Alto, and Seal does not apply inline results, save the buffer, or reload files after the Alto turn.
+
+The default socket is `~/.cache/alto/seal.sock`. Set `alto = { socket = "/another/path", timeout_ms = 20000 }` in Seal's `setup()` if the Alto plugin uses another location. The parent directory is private to your user, and the plugin closes its socket when disabled. If a handoff times out after delivery may have started, check Alto's chat and queue before retrying; Seal does not automatically resend it.
+
+For a shortcut, map `require("seal").alto()` to a key of your choice:
+
+```lua
+vim.keymap.set("n", "<leader>aa", function() require("seal").alto() end)
+```
+
+### Agent prompts
 
 The default mappings are:
 
@@ -105,6 +162,7 @@ Seal does not block model output based on language-specific AST shapes. Prefixes
 
 ```lua
 require("seal").setup({
+  backend = "codex", -- or "acp" for Gemini 3.8 Flash
   codex_command = "codex",
   -- bridge = "/absolute/path/to/seal-bridge",
   startup_timeout_ms = 10000,
@@ -168,3 +226,5 @@ make smoke
 ```
 
 `make protocol-smoke` verifies that sequential structured turns share one persisted conversation and that a real file stays untouched until its proposed patch is accepted.
+
+`make acp-smoke` runs the queued declaration and reviewed-file smoke tests against Gemini 3.8 Flash through ACP. It requires an authenticated Gemini CLI and makes real model requests.

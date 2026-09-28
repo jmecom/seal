@@ -37,6 +37,7 @@ local function status_name(status)
 end
 
 function M.render(thread)
+  local agent = thread.agentName or "Codex"
   local lines = {
     "# Seal chat",
     "",
@@ -58,11 +59,11 @@ function M.render(thread)
           messages = messages + 1
         end
       elseif item.type == "agentMessage" and item.text and item.text ~= "" then
-        local heading = item.phase == "commentary" and "### Codex · progress" or "## Codex"
+        local heading = item.phase == "commentary" and ("### " .. agent .. " · progress") or ("## " .. agent)
         append_message(lines, heading, item.text)
         messages = messages + 1
       elseif item.type == "contextCompaction" then
-        table.insert(lines, "> Codex compacted the conversation context here.")
+        table.insert(lines, "> " .. agent .. " compacted the conversation context here.")
         table.insert(lines, "")
       end
     end

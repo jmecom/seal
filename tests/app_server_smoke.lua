@@ -6,7 +6,8 @@ package.path = table.concat({
   package.path,
 }, ";")
 
-local Client = require("seal.client")
+local Backend = require("seal.backend")
+local backend_config = { backend = vim.env.SEAL_BACKEND or "codex", acp = {} }
 local completed
 local answer
 local protocol_error
@@ -19,7 +20,7 @@ local function item_key(params, item_id)
 end
 
 local client
-client = Client.new({
+client = Backend.new(backend_config, {
   bridge = root .. "/bin/seal-bridge",
   on_notification = function(method, params)
     if method == "item/started" and params.item and params.item.type == "fileChange" then
@@ -211,7 +212,9 @@ local ok, smoke_error = xpcall(function()
       {
         type = "text",
         text = table.concat({
-          "Use the apply_patch tool to add seal-review-smoke.txt in the current directory.",
+          backend_config.backend == "acp"
+            and "Use your file editing tool to add seal-review-smoke.txt in the current directory."
+            or "Use the apply_patch tool to add seal-review-smoke.txt in the current directory.",
           "Its complete contents must be exactly: approved after review",
           "Do not use shell commands or any other write mechanism. Do not make other changes.",
         }, " "),
@@ -228,10 +231,10 @@ local ok, smoke_error = xpcall(function()
   assert(vim.deep_equal(vim.fn.readfile(review_file), { "approved after review" }), "approved patch contents differed")
 end, debug.traceback)
 
-if source then
+if source and backend_config.backend == "codex" then
   pcall(request, "thread/delete", { threadId = source.id })
 end
-if patch_source then
+if patch_source and backend_config.backend == "codex" then
   pcall(request, "thread/delete", { threadId = patch_source.id })
 end
 client:stop()
@@ -242,4 +245,4 @@ end
 if not ok then
   error(smoke_error)
 end
-io.stdout:write("real app-server and patch approval smoke test passed\n")
+io.stdout:write("real " .. Backend.name(backend_config) .. " session and patch approval smoke test passed\n")

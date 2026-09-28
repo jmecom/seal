@@ -9,6 +9,7 @@ package.path = table.concat({
 local seal = require("seal")
 local errors = {}
 seal.setup({
+  backend = vim.env.SEAL_BACKEND or "codex",
   bridge = root .. "/bin/seal-bridge",
   root = function()
     return root
@@ -66,7 +67,7 @@ local ok, smoke_error = xpcall(function()
 end, debug.traceback)
 
 local status = seal.status()
-if status.thread_id and seal._state.client then
+if status.thread_id and seal._state.client and vim.env.SEAL_BACKEND ~= "acp" then
   local deleted = false
   seal._state.client:request("thread/delete", { threadId = status.thread_id }, function()
     deleted = true

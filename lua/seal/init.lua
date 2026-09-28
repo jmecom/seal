@@ -1,4 +1,4 @@
-local Client = require("seal.client")
+local Backend = require("seal.backend")
 local Chat = require("seal.chat")
 local Review = require("seal.review")
 local BufferModel = require("seal.buffer_model")
@@ -15,6 +15,9 @@ local bounded_agent_prefixes = {
 }
 
 local defaults = {
+  backend = "codex",
+  acp = {},
+  alto = {},
   codex_command = "codex",
   bridge = nil,
   startup_timeout_ms = 10000,
@@ -88,6 +91,7 @@ local defaults = {
 }
 
 local config = vim.deepcopy(defaults)
+
 local work_store = WorkItems.new()
 local state = {
   client = nil,
@@ -683,7 +687,10 @@ local function restore_main_thread_settings(session, entry)
   -- running so the next Seal or TUI prompt inherits the prior settings.
   entry.settings_restore_started = true
   entry.settings_restore_token = lease_token
-  if not state.client then
+  if not state.client or state.client.supports_turn_policy == false then
+    -- ACP has no per-turn sandbox override to restore. Its adapter declines
+    -- declaration permissions without changing the agent's session settings.
+    entry.policy_override_pending = nil
     entry.settings_restored = true
     local action = scheduler and scheduler:restore_finished(lease_token, true)
     if action then
@@ -790,7 +797,7 @@ local function restore_main_thread_settings(session, entry)
           entry.restore_settings_epoch = session.settings_epoch
           finish_restore(true)
         else
-          finish_restore(false, error_message(err, "could not restore the main Codex thread settings"), latest)
+          finish_restore(false, error_message(err, "could not restore the main " .. Backend.name(config) .. " thread settings"), latest)
         end
         return
       end
@@ -1265,7 +1272,7 @@ remove_activity = function(activity, interrupt)
         turnId = action.interrupt_turn_id,
       }, function(_, interrupt_error)
         if interrupt_error then
-          notify("Could not stop the cancelled Codex turn: "
+          notify("Could not stop the cancelled " .. Backend.name(config) .. " turn: "
             .. error_message(interrupt_error, "interrupt failed"), vim.log.levels.ERROR)
         end
       end)
@@ -1540,7 +1547,7 @@ cancel_job = function(job, interrupt)
       turnId = interrupt_turn_id,
     }, function(_, interrupt_error)
       if interrupt_error then
-        notify("Could not stop the cancelled Codex turn: "
+        notify("Could not stop the cancelled " .. Backend.name(config) .. " turn: "
           .. error_message(interrupt_error, "interrupt failed"), vim.log.levels.ERROR)
       end
     end)
@@ -1772,7 +1779,7 @@ local function stop_bounded_turn(session, entry, reason)
     turnId = entry.turn_id,
   }, function(_, err)
     if err and session.current == entry and not entry.terminal then
-      notify("Could not stop the bounded Codex turn: " .. error_message(err, "interrupt failed"), vim.log.levels.ERROR)
+      notify("Could not stop the bounded " .. Backend.name(config) .. " turn: " .. error_message(err, "interrupt failed"), vim.log.levels.ERROR)
     end
   end)
   return true
@@ -1945,16 +1952,16 @@ local function refresh_accepted_file_buffers(accepted)
     end
   end
   if #failures > 0 then
-    notify("Could not reload an applied Codex patch: " .. table.concat(failures, "; "), vim.log.levels.WARN)
+    notify("Could not reload an applied " .. Backend.name(config) .. " patch: " .. table.concat(failures, "; "), vim.log.levels.WARN)
   end
 end
 
 local function review_safety(review)
   if review.grant_root then
-    return "Codex requested broader write access; use the full Codex TUI to review that request"
+    return Backend.name(config) .. " requested broader write access; use the full " .. Backend.name(config) .. " TUI to review that request"
   end
   if type(review.changes) ~= "table" or #review.changes == 0 then
-    return "Codex did not provide the proposed diff"
+    return Backend.name(config) .. " did not provide the proposed diff"
   end
 
   local targets = {}
@@ -1962,10 +1969,10 @@ local function review_safety(review)
   local expected_paths = {}
   for _, change in ipairs(review.changes) do
     if type(change) ~= "table" then
-      return "Codex did not provide a valid change entry"
+      return Backend.name(config) .. " did not provide a valid change entry"
     end
     if type(change.diff) ~= "string" or change.diff == "" then
-      return "Codex did not provide a complete diff for every changed file"
+      return Backend.name(config) .. " did not provide a complete diff for every changed file"
     end
     local move_path = change_move_path(change)
     local paths = { change.path, move_path }
@@ -2007,13 +2014,13 @@ local function save_modified_review_targets(review)
     local buf = buffer_for_path(path)
     if buf and vim.api.nvim_get_option_value("modified", { buf = buf }) then
       if target.disk.digest == nil then
-        return "Codex proposed creating a file that now has local editor changes: " .. path
+        return Backend.name(config) .. " proposed creating a file that now has local editor changes: " .. path
       end
       local ok, save_error = pcall(vim.api.nvim_buf_call, buf, function()
         vim.cmd("silent update")
       end)
       if not ok then
-        return "Could not save local changes before accepting the Codex patch: " .. tostring(save_error)
+        return "Could not save local changes before accepting the " .. Backend.name(config) .. " patch: " .. tostring(save_error)
       end
       saved = saved + 1
     end
@@ -2112,7 +2119,7 @@ local function open_file_review(review)
     end,
   })
   if not ok then
-    notify("Could not open the Codex patch review: " .. tostring(view), vim.log.levels.ERROR)
+    notify("Could not open the " .. Backend.name(config) .. " patch review: " .. tostring(view), vim.log.levels.ERROR)
     return false
   end
   review.view = view
@@ -2165,7 +2172,7 @@ resolve_file_review = function(review, decision)
     notify("The bounded turn stopped while its patch was being checked; Seal rejected it", vim.log.levels.WARN)
   end
   if not state.client or not state.client:respond(review.request_id, { decision = decision }) then
-    notify("Could not send the patch decision to Codex", vim.log.levels.ERROR)
+    notify("Could not send the patch decision to " .. Backend.name(config), vim.log.levels.ERROR)
     if state.stopping then
       drop_review(review)
     else
@@ -2183,18 +2190,18 @@ resolve_file_review = function(review, decision)
       expected_paths = vim.deepcopy(review.expected_paths or {}),
     }
     if review.bounded_patch then
-      notify("Codex patch accepted; applying it before the bounded turn stops")
+      notify(Backend.name(config) .. " patch accepted; applying it before the bounded turn stops")
     else
-      notify("Codex patch accepted; the turn is continuing")
+      notify(Backend.name(config) .. " patch accepted; the turn is continuing")
     end
   elseif decision == "decline" then
     if review.bounded_patch then
-      notify("Codex patch rejected; stopping the bounded turn")
+      notify(Backend.name(config) .. " patch rejected; stopping the bounded turn")
     else
-      notify("Codex patch rejected; the turn is continuing")
+      notify(Backend.name(config) .. " patch rejected; the turn is continuing")
     end
   else
-    notify("Codex patch rejected and the turn was cancelled")
+    notify(Backend.name(config) .. " patch rejected and the turn was cancelled")
   end
   if review.bounded_patch and decision ~= "accept" then
     local session = state.live[review.root]
@@ -2490,7 +2497,7 @@ local function request_command_decision(request, item)
   local params = request.params or {}
   local details, can_accept = command_details(params, item)
   local choices, fallback = command_decision_choices(params, can_accept)
-  local prompt = details ~= "" and ("Codex approval request\n" .. details) or "Codex approval request cannot be displayed"
+  local prompt = details ~= "" and (Backend.name(config) .. " approval request\n" .. details) or Backend.name(config) .. " approval request cannot be displayed"
   local select = config.select or vim.ui.select
   local ok, select_error = pcall(select, choices, {
     prompt = prompt,
@@ -2503,16 +2510,16 @@ local function request_command_decision(request, item)
     end
     local decision = choice and choice.decision or fallback
     if not state.client or not state.client:respond(request.id, { decision = decision }) then
-      notify("Could not send the command decision to Codex", vim.log.levels.ERROR)
+      notify("Could not send the command decision to " .. Backend.name(config), vim.log.levels.ERROR)
       return
     end
     state.command_requests[key] = nil
     if decision == "accept" then
-      notify("Codex command accepted; it may change files without a patch preview", vim.log.levels.WARN)
+      notify(Backend.name(config) .. " command accepted; it may change files without a patch preview", vim.log.levels.WARN)
     elseif decision == "decline" then
-      notify("Codex command declined; the turn is continuing")
+      notify(Backend.name(config) .. " command declined; the turn is continuing")
     else
-      notify("Codex command declined and the turn was cancelled")
+      notify(Backend.name(config) .. " command declined and the turn was cancelled")
     end
   end)
   if not ok then
@@ -2597,7 +2604,7 @@ local function accept_start_response(session, entry, turn_id)
   end
   local action, err = scheduler:start_succeeded(token, turn_id)
   if not action then
-    notify(error_message(err, "could not bind the Codex turn"), vim.log.levels.ERROR)
+    notify(error_message(err, "could not bind the " .. Backend.name(config) .. " turn"), vim.log.levels.ERROR)
     return nil
   end
   if session.unbound_turns then
@@ -2669,7 +2676,7 @@ local function accept_start_response(session, entry, turn_id)
       turnId = action.interrupt_turn_id,
     }, function(_, interrupt_error)
       if interrupt_error then
-        notify("Could not stop the cancelled Codex turn: "
+        notify("Could not stop the cancelled " .. Backend.name(config) .. " turn: "
           .. error_message(interrupt_error, "interrupt failed"), vim.log.levels.ERROR)
       end
     end)
@@ -2719,7 +2726,7 @@ handle_notification = function(method, params)
       and params.item.status == "failed"
       and accepted
     then
-      notify("Codex could not apply the complete reviewed patch; inspect the workspace", vim.log.levels.ERROR)
+      notify(Backend.name(config) .. " could not apply the complete reviewed patch; inspect the workspace", vim.log.levels.ERROR)
     end
     if params.item.type == "fileChange"
       and params.item.status == "completed"
@@ -2735,10 +2742,10 @@ handle_notification = function(method, params)
       if entry and entry.id == accepted.work_item_id then
         if params.item.status == "completed" then
           entry.bounded_patch_applied = true
-          notify("Codex patch applied; stopping the bounded turn")
+          notify(Backend.name(config) .. " patch applied; stopping the bounded turn")
           stop_bounded_turn(session, entry, "patch_applied")
         else
-          entry.bounded_patch_failed = "Codex did not apply the accepted patch"
+          entry.bounded_patch_failed = Backend.name(config) .. " did not apply the accepted patch"
           stop_bounded_turn(session, entry, "patch_failed")
         end
       end
@@ -2762,7 +2769,7 @@ handle_notification = function(method, params)
     local status = params.status and params.status.type
     if job and (status == "notLoaded" or status == "systemError") then
       cancel_job(job, false)
-      notify("Codex stopped the shared project thread", vim.log.levels.ERROR)
+      notify(Backend.name(config) .. " stopped the shared project thread", vim.log.levels.ERROR)
     end
     if status == "notLoaded" or status == "systemError" then
       clear_pending_unowned_requests(params.threadId)
@@ -2892,7 +2899,7 @@ handle_notification = function(method, params)
     local job = state.jobs_by_thread[params.threadId]
     if job then
       cancel_job(job, false)
-      notify("Codex closed the shared project thread", vim.log.levels.ERROR)
+      notify(Backend.name(config) .. " closed the shared project thread", vim.log.levels.ERROR)
     end
     if session then
       revoke_root_ownership(session.root)
@@ -3014,15 +3021,15 @@ handle_notification = function(method, params)
         or turn_status == "interrupted" and entry and entry.bounded_patch_applied
       then
         if config.verbose then
-          notify("Codex turn finished; use :SealChat to inspect it")
+          notify(Backend.name(config) .. " turn finished; use :SealChat to inspect it")
         end
       elseif turn_status == "interrupted"
         and entry
         and (entry.state == "cancelled" or entry.bounded_patch_rejected)
       then
-        notify("Codex turn cancelled; use :SealChat to inspect it")
+        notify(Backend.name(config) .. " turn cancelled; use :SealChat to inspect it")
       else
-        notify("Codex turn failed: "
+        notify(Backend.name(config) .. " turn failed: "
           .. (entry and entry.notification_error or tostring(turn_error_message or turn_status or "unknown error")),
         vim.log.levels.ERROR)
       end
@@ -3036,7 +3043,7 @@ handle_notification = function(method, params)
       vim.schedule(function()
         local failures = check_unmodified_project_buffers(session.root)
         if #failures > 0 then
-          notify("Could not check for Codex file changes: " .. table.concat(failures, "; "), vim.log.levels.WARN)
+          notify("Could not check for " .. Backend.name(config) .. " file changes: " .. table.concat(failures, "; "), vim.log.levels.WARN)
         end
       end)
     end
@@ -3062,7 +3069,7 @@ handle_notification = function(method, params)
         fields = { preview = { raw = entry.answer } }
       elseif turn_status == "completed" and entry.bounded_patch and not entry.bounded_patch_applied then
         outcome = "failed"
-        fields = { error = "Codex completed the bounded turn without applying one patch" }
+        fields = { error = Backend.name(config) .. " completed the bounded turn without applying one patch" }
       elseif turn_status == "completed" then
         outcome = "done"
       elseif turn_status == "interrupted"
@@ -3072,7 +3079,7 @@ handle_notification = function(method, params)
         outcome = "done"
       else
         outcome = "failed"
-        fields = { error = entry.notification_error or "Codex turn failed" }
+        fields = { error = entry.notification_error or Backend.name(config) .. " turn failed" }
       end
       local action, scheduler_error = session.scheduler:finish_turn(completed_turn_id, outcome, fields)
       if entry.kind == "declaration" then
@@ -3089,7 +3096,7 @@ handle_notification = function(method, params)
       if action then
         handle_scheduler_action(session, action)
       elseif scheduler_error then
-        notify(error_message(scheduler_error, "could not finish Codex work"), vim.log.levels.ERROR)
+        notify(error_message(scheduler_error, "could not finish " .. Backend.name(config) .. " work"), vim.log.levels.ERROR)
       end
     elseif session and not session.current then
       session.busy = false
@@ -3117,7 +3124,7 @@ handle_notification = function(method, params)
     local session = find_session_by_thread(params.threadId)
     local entry = session and session.current
     if entry and (not notification_turn_id or not entry.turn_id or entry.turn_id == notification_turn_id) then
-      entry.notification_error = params.error and params.error.message or "Codex turn failed"
+      entry.notification_error = params.error and params.error.message or Backend.name(config) .. " turn failed"
     end
   end
 
@@ -3145,7 +3152,7 @@ handle_notification = function(method, params)
       job.answer_phase = item.phase
     end
   elseif method == "error" then
-    job.notification_error = params.error and params.error.message or "Codex turn failed"
+    job.notification_error = params.error and params.error.message or Backend.name(config) .. " turn failed"
   end
 end
 
@@ -3209,15 +3216,15 @@ handle_server_request = function(request)
         notify("Could not reject an extra bounded-turn patch", vim.log.levels.ERROR)
       end
       bounded_entry.bounded_patch_failed = bounded_entry.bounded_patch_failed
-        or "Codex proposed more than one patch for a bounded turn"
+        or Backend.name(config) .. " proposed more than one patch for a bounded turn"
       stop_bounded_turn(bounded_session, bounded_entry, "extra_patch")
       clear_reviews(function(review)
         return review.bounded_patch and review.work_item_id == bounded_entry.id
       end, "decline")
       if already_stopping then
-        notify("Codex proposed a patch after the bounded turn began stopping; Seal rejected it", vim.log.levels.ERROR)
+        notify(Backend.name(config) .. " proposed a patch after the bounded turn began stopping; Seal rejected it", vim.log.levels.ERROR)
       else
-        notify("Codex proposed a second patch; Seal rejected it and stopped the bounded turn", vim.log.levels.ERROR)
+        notify(Backend.name(config) .. " proposed a second patch; Seal rejected it and stopped the bounded turn", vim.log.levels.ERROR)
       end
       return
     end
@@ -3242,9 +3249,9 @@ handle_server_request = function(request)
     review.warning = review_safety(review)
     state.reviews[review_key(request.id)] = review
     if review.warning then
-      notify("Codex patch cannot be accepted safely: " .. review.warning, vim.log.levels.WARN)
+      notify(Backend.name(config) .. " patch cannot be accepted safely: " .. review.warning, vim.log.levels.WARN)
     else
-      notify(string.format("Codex proposed changes to %d file(s)", #review.changes))
+      notify(string.format(Backend.name(config) .. " proposed changes to %d file(s)", #review.changes))
     end
     open_file_review(review)
     return
@@ -3263,7 +3270,7 @@ handle_server_request = function(request)
     local decision = config.auto_approve_commands and automatic_command_decision(params, item)
     if decision then
       if not state.client:respond(request.id, { decision = decision }) then
-        notify("Could not auto-approve the Codex command", vim.log.levels.ERROR)
+        notify("Could not auto-approve the " .. Backend.name(config) .. " command", vim.log.levels.ERROR)
       end
     else
       request_command_decision(request, item)
@@ -3283,7 +3290,7 @@ handle_server_request = function(request)
     state.client:respond_error(request.id, -32601, "Seal does not support interactive requests")
   end
   if session then
-    notify("Codex requested interactive input; Seal declined it", vim.log.levels.WARN)
+    notify(Backend.name(config) .. " requested interactive input; Seal declined it", vim.log.levels.WARN)
   end
 end
 
@@ -3331,7 +3338,7 @@ local function handle_client_exit(active_client, expected)
   end
   state.live = {}
   state.loading = {}
-  M._attach_flow.clear("Codex app-server stopped while waiting for the side-pane chat")
+  M._attach_flow.clear(Backend.name(config) .. " app-server stopped while waiting for the side-pane chat")
   reset_ownership()
   state.approval_items = {}
   state.accepted_file_items = {}
@@ -3348,7 +3355,7 @@ local function handle_client_exit(active_client, expected)
     notify("Declaration generation stopped with the app-server", vim.log.levels.WARN)
   end
   if not expected and not state.stopping then
-    notify("Codex app-server stopped", vim.log.levels.WARN)
+    notify(Backend.name(config) .. " app-server stopped", vim.log.levels.WARN)
   end
 end
 
@@ -3357,12 +3364,7 @@ local function client()
     return state.client
   end
   local active_client
-  active_client = Client.new({
-    bridge = config.bridge,
-    codex_command = config.codex_command,
-    transport_factory = config.transport_factory,
-    startup_timeout_ms = config.startup_timeout_ms,
-    request_timeout_ms = config.request_timeout_ms,
+  active_client = Backend.new(config, {
     on_notification = function(method, params)
       if state.client == active_client then
         handle_notification(method, params)
@@ -3453,7 +3455,7 @@ function M._attach_flow.adopt(thread)
             state.live[root] = pending.previous
             state.sessions[root] = { thread_id = pending.previous.thread_id }
           end
-          local message = error_message(err, "could not subscribe Seal to the side-pane Codex chat")
+          local message = error_message(err, "could not subscribe Seal to the side-pane " .. Backend.name(config) .. " chat")
           M._attach_flow.finish(root, pending, pending.previous, message)
           notify(message, vim.log.levels.ERROR)
           return
@@ -3465,7 +3467,7 @@ function M._attach_flow.adopt(thread)
           pending.client:request("thread/unsubscribe", { threadId = pending.previous_thread_id }, function() end)
         end
         M._attach_flow.finish(root, pending, session)
-        notify("Seal attached to the side-pane Codex chat")
+        notify("Seal attached to the side-pane " .. Backend.name(config) .. " chat")
       end)
       return true
     end
@@ -3485,7 +3487,7 @@ local function start_thread(root, callback, requesting_client)
       return
     end
     if err or not result or not result.thread then
-      callback(nil, error_message(err, "could not start a Codex thread"))
+      callback(nil, error_message(err, "could not start a " .. Backend.name(config) .. " thread"))
       return
     end
     callback(remember_thread(root, result))
@@ -3565,7 +3567,7 @@ local function with_session_status(root, callback, on_failure)
       if on_failure then
         on_failure()
       end
-      notify(error_message(err, "could not create a Codex session"), vim.log.levels.ERROR)
+      notify(error_message(err, "could not create a " .. Backend.name(config) .. " session"), vim.log.levels.ERROR)
       return
     end
     session.status_waiters = session.status_waiters or {}
@@ -3598,7 +3600,7 @@ local function with_session_status(root, callback, on_failure)
             waiter.on_failure()
           end
         end
-        notify(error_message(read_err, "could not read Codex thread"), vim.log.levels.ERROR)
+        notify(error_message(read_err, "could not read " .. Backend.name(config) .. " thread"), vim.log.levels.ERROR)
         return
       end
       if session.status_read_generation == (session.status_generation or 0) then
@@ -4334,12 +4336,12 @@ function M._finish_generation(job)
     return
   end
   if job.turn_status ~= "completed" then
-    notify(job.notification_error or "Codex did not complete the declaration", vim.log.levels.ERROR)
+    notify(job.notification_error or Backend.name(config) .. " did not complete the declaration", vim.log.levels.ERROR)
     cancel_job(job, false)
     return
   end
   if not job.answer then
-    notify("Codex completed without returning a declaration", vim.log.levels.ERROR)
+    notify(Backend.name(config) .. " completed without returning a declaration", vim.log.levels.ERROR)
     cancel_job(job, false)
     return
   end
@@ -4347,7 +4349,7 @@ function M._finish_generation(job)
   local answer = strip_fence(job.answer)
   local ok, decoded = pcall(vim.json.decode, answer)
   if not ok or type(decoded) ~= "table" or type(decoded.code) ~= "string" then
-    notify("Codex returned an invalid declaration payload", vim.log.levels.ERROR)
+    notify(Backend.name(config) .. " returned an invalid declaration payload", vim.log.levels.ERROR)
     cancel_job(job, false)
     return
   end
@@ -4361,7 +4363,7 @@ function M._finish_generation(job)
   job.raw_code = decoded.code
   local lines = normalize_code(job.raw_code, job.snapshot.base_indent)
   if #lines == 0 then
-    notify("Codex returned an empty declaration", vim.log.levels.ERROR)
+    notify(Backend.name(config) .. " returned an empty declaration", vim.log.levels.ERROR)
     cancel_job(job, false)
     return
   end
@@ -4400,7 +4402,7 @@ local function start_declaration(session, snapshot, route, job)
     return defer_preflight_item(session, job, "Seal could not reconcile the marked buffer; reload it before retrying")
   end
   if not sync_item_snapshot(job, nil, true) then
-    notify("The source buffer changed while Codex was starting", vim.log.levels.WARN)
+    notify("The source buffer changed while " .. Backend.name(config) .. " was starting", vim.log.levels.WARN)
     cancel_job(job, false)
     return false
   end
@@ -4408,7 +4410,7 @@ local function start_declaration(session, snapshot, route, job)
     return defer_preflight_item(session, job, "The declaration anchor moved ambiguously; place the cursor and press Tab to re-anchor it")
   end
   if not snapshot_valid(snapshot) then
-    return defer_preflight_item(session, job, "The source buffer or file changed while Codex was starting")
+    return defer_preflight_item(session, job, "The source buffer or file changed while " .. Backend.name(config) .. " was starting")
   end
   if route.prompt == "" then
     notify(route.kind .. " prompt cannot be empty", vim.log.levels.WARN)
@@ -4620,7 +4622,7 @@ local function read_chat(session, open)
     if state.live[session.root] ~= session then
       return
     end
-    local message = error_message(err, "could not read Codex chat")
+    local message = error_message(err, "could not read " .. Backend.name(config) .. " chat")
     if err and message:find("includeTurns is unavailable before first user message", 1, true) then
       render_chat(session, {
         id = session.thread_id,
@@ -4710,18 +4712,18 @@ local function start_agent(session, snapshot, prompt, activity)
     return defer("Seal could not reconcile the marked buffer; reload it before retrying")
   end
   if not sync_item_snapshot(activity, nil, true) then
-    return reject("The source buffer closed while Codex was starting")
+    return reject("The source buffer closed while " .. Backend.name(config) .. " was starting")
   end
   if snapshot.anchor_ambiguous then
     return reject("The marked context moved ambiguously; place the cursor and submit the prompt again")
   end
   if not snapshot_valid(snapshot) then
-    return defer("The source buffer or file changed while Codex was starting")
+    return defer("The source buffer or file changed while " .. Backend.name(config) .. " was starting")
   end
   local modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
   if #modified > 0 then
     return defer(
-      "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
+      "Save other modified project buffers before starting " .. Backend.name(config) .. ": " .. table.concat(modified, ", "),
       vim.log.levels.WARN
     )
   end
@@ -4760,7 +4762,7 @@ local function start_agent(session, snapshot, prompt, activity)
     snapshot.file_digest = saved_disk.digest
     if snapshot.modified or not buffer_matches_disk(snapshot.buf, snapshot.file) then
       return defer(
-        "Save or format hooks left the buffer different from disk; save again before starting Codex",
+        "Save or format hooks left the buffer different from disk; save again before starting " .. Backend.name(config),
         vim.log.levels.WARN
       )
     end
@@ -4768,7 +4770,7 @@ local function start_agent(session, snapshot, prompt, activity)
     modified = other_modified_project_buffers(snapshot.root, snapshot.buf)
     if #modified > 0 then
       return defer(
-        "Save other modified project buffers before starting Codex: " .. table.concat(modified, ", "),
+        "Save other modified project buffers before starting " .. Backend.name(config) .. ": " .. table.concat(modified, ", "),
         vim.log.levels.WARN
       )
     end
@@ -4805,7 +4807,7 @@ local function start_agent(session, snapshot, prompt, activity)
   local dispatched, dispatch_error = session.scheduler:mark_start_dispatched(lease_token)
   if not dispatched then
     entry.policy_override_pending = nil
-    return reject(error_message(dispatch_error, "could not dispatch Codex prompt"), vim.log.levels.ERROR)
+    return reject(error_message(dispatch_error, "could not dispatch " .. Backend.name(config) .. " prompt"), vim.log.levels.ERROR)
   end
   request_client:request("turn/start", params, function(result, err)
     if state.client ~= request_client or session.current ~= entry then
@@ -4820,9 +4822,9 @@ local function start_agent(session, snapshot, prompt, activity)
       end
       discard_unbound_session_events(session)
       local action, scheduler_error = session.scheduler:start_failed(lease_token, {
-        error = error_message(err, "could not start Codex turn"),
+        error = error_message(err, "could not start " .. Backend.name(config) .. " turn"),
       })
-      notify(error_message(err, "could not start Codex turn"), vim.log.levels.ERROR)
+      notify(error_message(err, "could not start " .. Backend.name(config) .. " turn"), vim.log.levels.ERROR)
       remove_activity(activity)
       if action then
         if action.waiting_for_restore then
@@ -4831,13 +4833,13 @@ local function start_agent(session, snapshot, prompt, activity)
           handle_scheduler_action(session, action)
         end
       elseif scheduler_error then
-        notify(error_message(scheduler_error, "could not release failed Codex work"), vim.log.levels.ERROR)
+        notify(error_message(scheduler_error, "could not release failed " .. Backend.name(config) .. " work"), vim.log.levels.ERROR)
       end
       return
     end
     accept_start_response(session, entry, result.turn.id)
     if config.verbose then
-      notify("Prompt sent to Codex; use :SealChat to inspect it")
+      notify("Prompt sent to " .. Backend.name(config) .. "; use :SealChat to inspect it")
     end
   end)
   return true
@@ -4944,7 +4946,7 @@ requeue_session_entry = function(session, entry)
   end
   local action, err = session.scheduler:start_failed(lease.token, {
     retry = true,
-    error = "another Codex turn won the start race",
+    error = "another " .. Backend.name(config) .. " turn won the start race",
   })
   if not action then
     notify(error_message(err, "could not requeue Seal work"), vim.log.levels.ERROR)
@@ -5114,7 +5116,7 @@ function M.submit(text, opts)
       notify("Could not render the Seal activity marker", vim.log.levels.ERROR)
       return false
     end
-    notify("Codex is generating one " .. route.kind .. "…")
+    notify(Backend.name(config) .. " is generating one " .. route.kind .. "…")
   else
     local item, create_error = work_store:create({
       kind = "agent",
@@ -5130,7 +5132,7 @@ function M.submit(text, opts)
         prompt = routed_agent_prompt(route),
         bounded_patch = route.bounded_patch == true,
         show_inline = route.label ~= nil,
-        summary = summary_text(route.label or "Codex", route.prompt),
+        summary = summary_text(route.label or Backend.name(config), route.prompt),
       },
     })
     if not item then
@@ -5169,6 +5171,46 @@ function M.prompt(opts)
     if text ~= nil then
       M.submit(text, { snapshot = snapshot })
     end
+  end)
+end
+
+function M.alto(text, opts)
+  opts = opts or {}
+  local snapshot = capture_snapshot(opts)
+  if not snapshot then return end
+  local function send(prompt)
+    if not prompt or vim.trim(prompt) == "" then return end
+    require("seal.alto").request({
+      action = "send",
+      text = prompt,
+      context = editor_context(snapshot),
+      mode = opts.steer and "steer" or "queue",
+    }, config.alto, function(result, err)
+      if err then
+        notify(err, vim.log.levels.ERROR)
+      else
+        local target = result.target or {}
+        notify("Sent to Alto: " .. (target.title or target.threadId or "current chat"))
+      end
+    end)
+  end
+  if text and vim.trim(text) ~= "" then
+    send(text)
+  else
+    local input = config.input or vim.ui.input
+    input({ prompt = "Seal → Alto> " }, send)
+  end
+end
+
+function M.alto_status()
+  require("seal.alto").request({ action = "status" }, config.alto, function(result, err)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    local target = type(result.target) == "table" and result.target or nil
+    notify(target and ("Alto target: " .. target.title .. " (" .. target.workspace .. ")")
+      or "Alto is connected; focus a chat pane to receive Seal prompts")
   end)
 end
 
@@ -5391,7 +5433,7 @@ function M.accept(job_id)
     if session and session.preflight_blocked == job.id then
       resumed = retry_preflight_blocked(session)
     end
-    notify(resumed and "Insertion point re-anchored; Codex request resumed"
+    notify(resumed and "Insertion point re-anchored; " .. Backend.name(config) .. " request resumed"
       or "Insertion point re-anchored; press Tab again to accept")
     return false
   end
@@ -5557,7 +5599,7 @@ function M.review(requested_root)
         return true
       end
     end
-    notify("There is no pending Codex approval to review", vim.log.levels.INFO)
+    notify("There is no pending " .. Backend.name(config) .. " approval to review", vim.log.levels.INFO)
     return false
   end
   return open_file_review(selected)
@@ -5567,7 +5609,7 @@ function M.chat(requested_root)
   local root = current_project_root(requested_root)
   ensure_session(root, function(session, err)
     if not session then
-      notify(error_message(err, "could not create a Codex session"), vim.log.levels.ERROR)
+      notify(error_message(err, "could not create a " .. Backend.name(config) .. " session"), vim.log.levels.ERROR)
       return
     end
     read_chat(session, true)
@@ -5590,7 +5632,7 @@ function M._attach_flow.copy_command(args, message)
     end)
   end
   if not ok then
-    notify("Could not copy the Codex attach command: " .. tostring(copy_error), vim.log.levels.ERROR)
+    notify("Could not copy the " .. Backend.name(config) .. " attach command: " .. tostring(copy_error), vim.log.levels.ERROR)
     return false
   end
   notify(message)
@@ -5668,6 +5710,10 @@ function M._attach_flow.begin_empty(root, previous, requesting_client)
 end
 
 function M.attach(requested_root)
+  if client().supports_attach == false then
+    notify("SealAttach is only available for Codex; use :SealChat to inspect the ACP conversation", vim.log.levels.WARN)
+    return
+  end
   local root = current_project_root(requested_root)
   local requesting_client = client()
   requesting_client:start(function(ok, err)
@@ -5706,7 +5752,7 @@ function M.new_thread()
   local requesting_client = client()
   requesting_client:start(function(ok, err)
     if not ok then
-      notify(error_message(err, "could not start Codex"), vim.log.levels.ERROR)
+      notify(error_message(err, "could not start " .. Backend.name(config)), vim.log.levels.ERROR)
       return
     end
     if state.client ~= requesting_client then
@@ -5720,7 +5766,7 @@ function M.new_thread()
         end
       end
       if previous and previous.status and previous.status.type == "active" and not previous.active_turn_id then
-        notify("Wait for the active Codex turn before starting a new thread", vim.log.levels.WARN)
+        notify("Wait for the active " .. Backend.name(config) .. " turn before starting a new thread", vim.log.levels.WARN)
         resume_waiters(previous)
         return
       end
@@ -5761,14 +5807,14 @@ function M.new_thread()
             return
           end
           finish_session_load(root, replacement, session)
-          notify("Started a new Codex thread")
+          notify("Started a new " .. Backend.name(config) .. " thread")
         end, requesting_client)
       end
 
       local function unsubscribe_previous()
         unsubscribe_thread(previous and previous.thread_id, function(_, unsubscribe_error)
           if unsubscribe_error then
-            notify(error_message(unsubscribe_error, "could not detach the old Codex thread"), vim.log.levels.ERROR)
+            notify(error_message(unsubscribe_error, "could not detach the old " .. Backend.name(config) .. " thread"), vim.log.levels.ERROR)
             resume_waiters(previous)
             return
           end
@@ -5784,7 +5830,7 @@ function M.new_thread()
           turnId = previous.active_turn_id,
         }, function(_, interrupt_error)
           if interrupt_error then
-            notify(error_message(interrupt_error, "could not stop the old Codex turn"), vim.log.levels.ERROR)
+            notify(error_message(interrupt_error, "could not stop the old " .. Backend.name(config) .. " turn"), vim.log.levels.ERROR)
             resume_waiters(previous)
             return
           end
@@ -5811,6 +5857,7 @@ end
 
 function M.stop()
   state.stopping = true
+  if package.loaded["seal.alto"] then require("seal.alto").stop() end
   clear_jobs(nil, true)
   clear_activities()
   clear_reviews(nil, "cancel")
@@ -5915,8 +5962,17 @@ end
 
 function M.setup(opts)
   opts = opts or {}
+  local next_config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
+  if next_config.backend ~= "codex" and next_config.backend ~= "acp" then
+    error("Seal backend must be 'codex' or 'acp'")
+  end
+  -- A different agent cannot resume the previous backend's session IDs.
+  if config.backend ~= next_config.backend or not vim.deep_equal(config.acp, next_config.acp) then
+    M.stop()
+    state.sessions = {}
+  end
   clear_setup_keymaps()
-  config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts)
+  config = next_config
   if opts.client and state.client ~= opts.client then
     local previous_client = state.client
     if previous_client then
@@ -5958,7 +6014,7 @@ function M.setup(opts)
     else
       M.prompt(context)
     end
-  end, { nargs = "*", range = true, desc = "Prompt Codex through Seal" })
+  end, { nargs = "*", range = true, desc = "Prompt " .. Backend.name(config) .. " through Seal" })
   command("SealAccept", function()
     M.accept()
   end, { desc = "Accept Seal declaration" })
@@ -5966,10 +6022,14 @@ function M.setup(opts)
     M.reject()
   end, { desc = "Cancel or reject Seal job" })
   command("SealChat", M.chat, { desc = "Inspect the Seal conversation" })
-  command("SealReview", M.review, { desc = "Review a pending Codex patch" })
+  command("SealReview", M.review, { desc = "Review a pending " .. Backend.name(config) .. " patch" })
   command("SealAttach", M.attach, { desc = "Copy the Codex TUI attach command" })
-  command("SealNew", M.new_thread, { desc = "Start a new Seal Codex thread" })
-  command("SealStop", M.stop, { desc = "Stop Seal's local app-server" })
+  command("SealAlto", function(args)
+    M.alto(args.args, { range = args.range, line1 = args.line1, line2 = args.line2, steer = args.bang })
+  end, { nargs = "*", range = true, bang = true, desc = "Send prompt and editor context to the current Alto chat" })
+  command("SealAltoStatus", M.alto_status, { desc = "Show the Alto chat selected for Seal handoffs" })
+  command("SealNew", M.new_thread, { desc = "Start a new Seal " .. Backend.name(config) .. " thread" })
+  command("SealStop", M.stop, { desc = "Stop Seal's agent connection and pending handoffs" })
   pcall(vim.api.nvim_del_user_command, "SealTerminal")
 
   local group = vim.api.nvim_create_augroup("Seal", { clear = true })

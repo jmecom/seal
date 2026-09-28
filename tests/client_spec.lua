@@ -379,7 +379,7 @@ test("fails a request immediately when the transport cannot send", function()
   client:request("thread/read", {}, function(_, err)
     result = err
   end)
-  assert_equal({ message = "could not send the app-server message" }, result)
+  assert_equal({ message = "could not send the RPC message" }, result)
   assert_equal({}, client.pending, "a failed send must not leave a pending request")
 end)
 
