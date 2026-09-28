@@ -74,16 +74,23 @@ local function read_file(path)
   return text, false
 end
 
+local function is_file_change(tool)
+  if tool.kind == "edit" or tool.kind == "delete" or tool.kind == "move" then return true end
+  for _, content in ipairs(tool.content or {}) do
+    if content.type == "diff" then return true end
+  end
+  return false
+end
+
 local function file_changes(tool)
-  local changes, originals, has_diff = {}, {}, false
+  local changes, originals = {}, {}
   for _, content in ipairs(tool.content or {}) do
     if content.type == "diff" then
-      has_diff = true
       if type(content.path) ~= "string" or content.path:sub(1, 1) ~= "/"
         or type(content.newText) ~= "string"
         or (content.oldText ~= nil and content.oldText ~= vim.NIL and type(content.oldText) ~= "string")
       then
-        return {}, {}, true
+        return {}, {}
       end
       local old = type(content.oldText) == "string" and content.oldText or nil
       local _, missing = read_file(content.path)
@@ -96,7 +103,7 @@ local function file_changes(tool)
       table.insert(originals, { path = content.path, text = old, missing = creating })
     end
   end
-  return changes, originals, has_diff
+  return changes, originals
 end
 
 function Acp.new(opts)
@@ -287,6 +294,18 @@ function Acp:_prompt(session, params, callback)
   session.active = turn
   table.insert(session.turns, turn)
   local prompt = vim.deepcopy(params.input or {})
+  if params.additionalContext and params.additionalContext["seal.editor"] then
+    table.insert(prompt, {
+      type = "text",
+      text = "This is an interactive Neovim request. Use the supplied current buffer and repository observations "
+        .. "to avoid redundant discovery. When a selection is present, 'here' means that selection. For edit requests, "
+        .. "edit only the selection unless the user explicitly requests a broader change. Surrounding code is reference context, "
+        .. "not an additional edit target. If the request cannot be satisfied within that scope, explain the limitation instead of silently expanding it. "
+        .. "Read applicable instructions and directly related definitions or callers as needed for correctness; start with the selected symbols, "
+        .. "use narrow searches, and batch independent reads. Do not inspect Git history or run tests, builds, linters, or formatters unless requested. "
+        .. "Make the smallest change that satisfies the request, preserve unrelated behavior, and keep the final reply brief.",
+    })
+  end
   for _, name in ipairs(vim.fn.sort(vim.tbl_keys(params.additionalContext or {}))) do
     local context = params.additionalContext[name]
     table.insert(prompt, {
@@ -394,6 +413,7 @@ function Acp:_update(method, params)
       return
     end
     local tool = vim.tbl_extend("force", turn.tools[id] or {}, update)
+    tool.is_file_change = tool.is_file_change or is_file_change(tool)
     turn.tools[id] = tool
     if self.opts.on_tool_call then self.opts.on_tool_call(tool) end
     if tool.status == "completed" or tool.status == "failed" then
@@ -423,8 +443,8 @@ function Acp:_permission(request)
     return
   end
   local tool = vim.tbl_extend("force", turn.tools[id] or {}, update)
-  local changes, originals, has_diff = file_changes(tool)
-  local is_edit = has_diff or tool.kind == "edit" or tool.kind == "delete" or tool.kind == "move"
+  local changes, originals = file_changes(tool)
+  local is_edit = tool.is_file_change or is_file_change(tool)
   tool.is_file_change = is_edit
   turn.tools[id] = tool
   -- ACP request IDs can be reused after a response and may be either numbers

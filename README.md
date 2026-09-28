@@ -2,10 +2,9 @@
 
 Seal is a small Neovim interface for a real agent session. It supports Codex app-server and ACP agents, including Gemini CLI with Gemini 3.8 Flash.
 
-Press one key, enter a prompt, and Seal routes it in one of three ways:
+Press one key, enter a prompt, and Seal routes it in one of two ways:
 
 - A normal prompt goes unchanged to one persistent Codex thread and shows a spinner and prompt summary at the originating cursor while it runs. When app-server requests approval for a native Codex patch, Seal opens a multi-file diff before answering. `:SealChat` shows the persisted conversation in a read-only Markdown buffer.
-- `targeted:` and `refactor:` use that same thread as bounded patch turns and leave a spinner and prompt summary at the originating cursor while they run. Codex may inspect the repository, then proposes one reviewed patch and stops after app-server applies it. These turns do not run tests, builds, linters, or formatters.
 - `fun:`, `type:`, `class:`, and other declaration prefixes use read-only turns in the same conversation. Each cursor gets a spinner and prompt summary above its line while Codex works, then an inline declaration preview.
 
 You can submit several prompts immediately. On each project thread, Seal runs the model turns in submission order, one at a time, so every request and result becomes context for the next one. Progress appears on a virtual line above the originating code, so the spinner and prompt summary never shift code sideways or change the buffer. This includes agent startup; once connected, only the request that owns the current turn animates, while queued markers are static. Collocated requests share one marker with a count and remain independently addressable, newest first.
@@ -50,11 +49,15 @@ ACP uses the same per-project queue, editor context, inline declaration previews
 
 To let Gemini read and edit project files without approval dialogs, set `acp.mode = "autoEdit"`. Seal selects this mode through ACP before sending any prompts. Shell commands retain their normal approvals. An agent must advertise the requested mode; an unavailable or rejected mode stops session startup. Gemini requires the project folder to be trusted before enabling Auto Edit. Background orientation always uses its separate read-only policy and default session mode.
 
+Completed edit tools immediately refresh saved project buffers, including auto-approved writes. You see the edit while the agent prepares its final reply; buffers with unsaved changes remain untouched. Seal supplies the current buffer and any completed background findings, and asks the agent to reuse that context and batch independent reads. The agent can still investigate additional files when needed.
+
+For visual selections, Seal sends the selected lines before surrounding code and tells the ACP agent to treat them as the edit target. Related definitions and callers may still be read. Broader edits require an explicit request; Git-history investigation and verification commands are excluded unless requested. This is a prompt instruction, not an enforced filesystem boundary.
+
 ACP has no standard per-turn sandbox setting. Declaration prompts instruct the agent not to change files, and Seal declines every permission request during those turns. This is not an operating-system read-only sandbox: an agent's tools or configured policies can execute without asking Seal. Configure the agent's own sandbox and approval policy as needed. Codex's `main_sandbox` and `main_approval_policy` options do not configure ACP agents.
 
 File-edit permission requests with complete ACP diffs open the existing review window. Seal grants only `allow_once`, never permanent approval. It also refuses an accepted replacement if the file differs from the original text supplied by the agent, including after saving local buffer edits; reject that proposal and request a fresh edit. Tools without diffs require an explicit decision through the command approval dialog. Seal does not advertise client filesystem or terminal capabilities; agents use their own tools.
 
-`targeted:` and `refactor:` retain their one-proposal handling: command permission requests are declined, and Seal cancels the turn after the accepted edit tool reports completion. ACP tools that write without requesting permission cannot be intercepted. A cancelled turn continues to own the queue until the agent acknowledges cancellation; an unresponsive agent is stopped after `request_timeout_ms`. Ordinary prompt duration and time spent reviewing are not limited by that timeout.
+A cancelled ACP turn continues to own the queue until the agent acknowledges cancellation; an unresponsive agent is stopped after `request_timeout_ms`. Ordinary prompt duration and time spent reviewing are not limited by that timeout.
 
 ### Background repository orientation
 
@@ -138,14 +141,14 @@ The default mappings are:
 - `Tab`: accept the ready declaration at the cursor marker
 - `Esc`: cancel or reject the Seal job at the cursor marker
 
-In a patch review, `Tab` accepts the complete proposed patch, `Esc` rejects it and normally lets Codex continue, `x` rejects it and stops the turn, and `q` closes the view without deciding. A rejected `targeted:` or `refactor:` patch also stops because a bounded turn gets only one proposal.
+In a patch review, `Tab` accepts the complete proposed patch, `Esc` rejects it and normally lets Codex continue, `x` rejects it and stops the turn, and `q` closes the view without deciding.
 
 Commands provide the same operations:
 
 ```vim
 :Seal explain why this test is failing
-:Seal targeted: fix only the parser edge case
-:Seal refactor: extract the parser's error handling
+:Seal fix only the parser edge case
+:Seal extract the parser's error handling without changing behavior
 :Seal fun: load the saved state from disk
 :Seal type: represent an entry in the on-disk cache
 :Seal interface: define the storage API without implementations
@@ -158,17 +161,15 @@ Commands provide the same operations:
 :SealStop
 ```
 
-`targeted:` and `refactor:` are writable main-thread convenience prefixes. `targeted:` asks for the minimum change needed, while `refactor:` asks for the smallest requested structural change and preserves behavior and public APIs unless told otherwise. Both may read and search as needed, but their prompt prohibits tests, builds, linters, formatters, other verification commands, and delegation to subagents. Each turn may propose exactly one file-change patch, which can span several files. After an accepted patch finishes applying, Seal interrupts that turn before Codex can test it or propose another patch. The expanded prompt and request remain in the persistent Codex conversation.
-
 Recognized inline declaration prefixes are `fun`, `fn`, `function`, `type`, `class`, `method`, `struct`, `interface`, `enum`, `trait`, and `impl`. The colon is required: `fun: add build logging` requests one inline function, while `fun add build logging` is an unrestricted normal prompt. `interface:` asks for the target language's API surface and signatures without concrete implementations. Everything else is a normal Codex prompt, including unknown colon-prefixed text such as `fix: ...`.
 
 The project root, file path, file type, cursor line and byte column, nearby buffer excerpt, and visual selection are attached as editor context. A declaration turn is also told to inspect the repository as needed, return exactly one declaration of the requested kind at that cursor, and omit helpers, surrounding declarations, prose, and Markdown. Normal agent prompts save the current modified buffer first so Codex does not edit an older on-disk version. Declaration turns are read-only and can use an unsaved buffer snapshot safely.
 
 Normal saves run through the editor's usual `BufWritePre` hooks, including format-on-save. Seal tracks the cursor and selection through formatter edits, then captures the formatted buffer. A writable turn blocked by another modified project buffer remains queued and retries after the buffers are saved; later prompts cannot overtake it. After any main-thread turn, Seal reloads unmodified buffers changed by Codex in that project while preserving local modified buffers for manual conflict resolution.
 
-Normal Seal turns keep Codex's `untrusted` approval policy so file changes still reach Seal's review boundary. Command-execution requests require an explicit decision by default because accepting one can let Codex retry a sandbox-blocked command with broader access even when the request has no separate escalation fields. Every Seal-owned file-change request opens the complete patch in a read-only diff window before Seal answers. `targeted:` and `refactor:` are the exception: Seal declines commands that require approval, rejects a second patch proposal, and stops the owning turn after the first accepted patch completes. If Codex unexpectedly delegates despite the bounded prompt, observed child patch requests inherit the same review and one-patch handling. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself can partially fail. Seal queues concurrent file-change requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Opening a new Seal prompt from the review defers it and targets the underlying editable source buffer. When you accept, Seal saves modified target buffers before approving the patch; Codex will apply clean hunks or report that its patch no longer applies. Once app-server reports that the accepted patch was applied, Seal immediately reloads unmodified target buffers. Edits made while the patch was applying are preserved and latched as conflicts for manual resolution. External disk changes and save/format conflicts still block acceptance.
+Normal Seal turns keep Codex's `untrusted` approval policy so file changes still reach Seal's review boundary. Command-execution requests require an explicit decision by default because accepting one can let Codex retry a sandbox-blocked command with broader access even when the request has no separate escalation fields. Every Seal-owned file-change request opens the complete patch in a read-only diff window before Seal answers. A patch can cover several files; one decision authorizes or rejects that entire patch operation, though application itself can partially fail. Seal queues concurrent file-change requests and presents the decisions one at a time. Use `q` and later `:SealReview` if you want to inspect the workspace before deciding. Opening a new Seal prompt from the review defers it and targets the underlying editable source buffer. When you accept, Seal saves modified target buffers before approving the patch; Codex will apply clean hunks or report that its patch no longer applies. Once app-server reports that the accepted patch was applied, Seal immediately reloads unmodified target buffers. Edits made while the patch was applying are preserved and latched as conflicts for manual resolution. External disk changes and save/format conflicts still block acceptance.
 
-This is an app-server approval UI, not a universal filesystem barrier. A formatter, generator, script, MCP tool, or shell command that app-server executes without requesting approval can change files directly without a patch preview. App-server can also skip a prompt after another attached client grants session-wide approval, and custom Codex or Seal permission settings can disable prompts. The bounded-prefix prompt and command declines prevent the normal verification path, but they cannot override permissions granted elsewhere. App-server does not expose a per-turn collaboration-tool switch, so the no-subagent rule is a model instruction rather than a hard security boundary. Set `auto_approve_commands = true` only if you intentionally want displayed command requests accepted without interaction; that opt-in can authorize an unsandboxed retry. Turns started from an attached Codex TUI use that TUI's permissions and are not presented as Seal-reviewed turns. Keep the workspace sandbox enabled; Seal's path checks are a review safeguard, not a replacement for it.
+This is an app-server approval UI, not a universal filesystem barrier. A formatter, generator, script, MCP tool, or shell command that app-server executes without requesting approval can change files directly without a patch preview. App-server can also skip a prompt after another attached client grants session-wide approval, and custom Codex or Seal permission settings can disable prompts. Set `auto_approve_commands = true` only if you intentionally want displayed command requests accepted without interaction; that opt-in can authorize an unsandboxed retry. Turns started from an attached Codex TUI use that TUI's permissions and are not presented as Seal-reviewed turns. Keep the workspace sandbox enabled; Seal's path checks are a review safeguard, not a replacement for it.
 
 Before capturing context, Seal checks whether the file changed or disappeared on disk. A local/external conflict stays blocked until the buffer is reloaded, merged, or written deliberately, so a later prompt cannot accidentally overwrite either version.
 
@@ -178,7 +179,7 @@ Ready previews retain the raw model output and recompute indentation when their 
 
 Seal never opens a terminal or Zellij pane. Permission expansion and structured user-input requests are declined instead of hanging. Send another normal prompt to continue the conversation.
 
-`SealChat` replaces the current buffer with a read-only conversation view. Press `r` to refresh and `q` to return. It shows persisted user and Codex messages from every normal, targeted, and declaration turn while omitting tool activity, editor context attachments, and system instructions.
+`SealChat` replaces the current buffer with a read-only conversation view. Press `r` to refresh and `q` to return. It shows persisted user and Codex messages from every normal and declaration turn while omitting tool activity, editor context attachments, and system instructions.
 
 The backing session is a normal Codex app-server thread. You can run `:SealAttach` before sending any prompt, switch to your existing Zellij terminal pane, and paste the copied command. The remote TUI creates the empty chat and Seal adopts it; a Seal prompt entered while the TUI is connecting waits for that handoff, then appears in the visible TUI conversation. Once the chat has processed a turn and has durable history, later `:SealAttach` calls copy an exact `codex resume --remote ...` command instead. Seal only copies the command; it never creates or controls the pane. A standalone TUI that was not started with the copied `--remote` endpoint cannot be adopted while it is already running.
 
@@ -219,10 +220,7 @@ require("seal").setup({
     type = "type",
     class = "class",
   },
-  agent_prefixes = {
-    targeted = "Make the minimum change needed for the request.",
-    refactor = "Make only the requested behavior-preserving structural change.",
-  },
+  agent_prefixes = {}, -- optional custom instructions; no built-in agent prefixes
   declaration_instructions = {
     interface = "Return API signatures without concrete implementations.",
   },
@@ -230,7 +228,7 @@ require("seal").setup({
 ```
 
 `declaration_instructions` is keyed by the resolved declaration kind, so aliases such as `fn` share the `function` instruction.
-Custom `agent_prefixes.targeted` and `agent_prefixes.refactor` strings replace only the wording; those two prefixes remain bounded patch turns.
+Optional `agent_prefixes` entries may be instruction strings or tables with `instruction` and `bounded_patch`. Setting `bounded_patch = true` explicitly opts a custom prefix into one reviewed patch followed by cancellation. No prefix name enables this behavior implicitly. `targeted:` and `refactor:` are ordinary prompt text unless you explicitly configure them.
 Set `bridge` only when the built `bin/seal-bridge` cannot be discovered through Neovim's `runtimepath`. `attach_timeout_ms` bounds how long prompts wait for a copied empty-chat TUI command to connect. A startup or request timeout retires that app-server connection because a timed-out mutating request may still complete remotely; the next prompt starts a fresh connection instead of accepting a late response into the wrong session.
 Set `verbose = true` to show routine prompt-sent and turn-finished notifications. Errors, warnings, reviews, cancellations, and decisions are always shown.
 

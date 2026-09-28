@@ -191,6 +191,12 @@ local function setup(lines, overrides, before_setup)
   local options = {
     client = fake,
     save_before_agent = false,
+    agent_prefixes = {
+      patch = {
+        bounded_patch = true,
+        instruction = "Make the minimum necessary change; do not run tests, builds, linters, formatters. Do not delegate this request to subagents.",
+      },
+    },
     root = function()
       return test_root
     end,
@@ -234,11 +240,11 @@ function tests.routes_only_known_prefixes()
     original = "fun: load it",
   }, "fun prefix should select declaration mode")
   equal(seal._route("TYPE: durable state").kind, "type", "prefixes should be case insensitive")
-  local targeted = seal._route(" TARGETED: fix only the parser edge case ")
-  equal(targeted.mode, "agent", "targeted should remain a main-thread prompt")
-  equal(targeted.prompt, "fix only the parser edge case", "targeted should strip its control prefix")
-  truthy(targeted.bounded_patch, "targeted should use the bounded patch lifecycle")
-  truthy(targeted.instruction:find("minimum necessary", 1, true), "targeted should add the minimal-change policy")
+  local patch = seal._route(" PATCH: fix only the parser edge case ")
+  equal(patch.mode, "agent", "patch should remain a main-thread prompt")
+  equal(patch.prompt, "fix only the parser edge case", "patch should strip its control prefix")
+  truthy(patch.bounded_patch, "patch should use the bounded patch lifecycle")
+  truthy(patch.instruction:find("minimum necessary", 1, true), "patch should add the minimal-change policy")
   local interface = seal._route("INTERFACE: storage backend")
   equal(interface.kind, "interface", "interface should remain an inline declaration")
   truthy(
@@ -250,14 +256,8 @@ function tests.routes_only_known_prefixes()
   equal(seal._route("https://example.com").mode, "agent", "URLs should remain freeform")
   equal(seal._route("  preserve me  ").prompt, "  preserve me  ", "freeform whitespace should be preserved")
 
-  setup(nil, {
-    agent_prefixes = {
-      targeted = "Use the project's custom minimal-change wording.",
-      refactor = "Use the project's custom refactor wording.",
-    },
-  })
-  truthy(seal._route("targeted: fix it").bounded_patch, "custom targeted wording must preserve its boundary")
-  truthy(seal._route("refactor: extract it").bounded_patch, "custom refactor wording must preserve its boundary")
+  setup(nil, { agent_prefixes = { patch = "Use custom instructions." } })
+  truthy(not seal._route("patch: fix it").bounded_patch, "custom instruction strings must not imply a patch limit")
 end
 
 function tests.normalizes_nested_indentation()
@@ -407,77 +407,62 @@ function tests.routine_turn_notifications_require_verbose_mode()
   truthy(finished, "verbose mode should announce routine completion")
 end
 
-function tests.targeted_adds_minimal_change_guidance_to_the_main_thread()
+function tests.patch_adds_minimal_change_guidance_to_the_main_thread()
   setup({ "local value = 1" }, {
     main_approval_policy = "never",
     main_approvals_reviewer = "auto_review",
   })
-  truthy(seal.submit("TARGETED: fix only the parser edge case"), "targeted prompt should submit")
+  truthy(seal.submit("PATCH: fix only the parser edge case"), "patch prompt should submit")
   local turn = request(fake, "turn/start")
-  equal(turn.params.threadId, "main-thread", "targeted should use the persistent thread")
-  truthy(request(fake, "thread/fork") == nil, "targeted must not create a declaration fork")
-  truthy(turn.params.outputSchema == nil, "targeted must not constrain the agent response")
-  equal(turn.params.approvalPolicy, "untrusted", "targeted patches should force the review gate")
-  equal(turn.params.approvalsReviewer, "user", "targeted reviews should stay with the user")
+  equal(turn.params.threadId, "main-thread", "patch should use the persistent thread")
+  truthy(request(fake, "thread/fork") == nil, "patch must not create a declaration fork")
+  truthy(turn.params.outputSchema == nil, "patch must not constrain the agent response")
+  equal(turn.params.approvalPolicy, "untrusted", "patch patches should force the review gate")
+  equal(turn.params.approvalsReviewer, "user", "patch reviews should stay with the user")
   local restore = request(fake, "thread/settings/update")
-  equal(restore.params.approvalPolicy, "never", "targeted should restore the thread's previous approval policy")
-  equal(restore.params.approvalsReviewer, "auto_review", "targeted should restore the previous reviewer")
+  equal(restore.params.approvalPolicy, "never", "patch should restore the thread's previous approval policy")
+  equal(restore.params.approvalsReviewer, "auto_review", "patch should restore the previous reviewer")
   truthy(
     turn.params.input[1].text:find("minimum necessary", 1, true),
     "Codex should receive the minimal-change policy"
   )
   truthy(
     turn.params.input[1].text:find("do not run tests, builds, linters, formatters", 1, true),
-    "targeted should prohibit verification commands"
+    "patch should prohibit verification commands"
   )
   truthy(
     turn.params.input[1].text:find("Propose exactly one file-change patch", 1, true),
-    "targeted should request one patch"
+    "patch should request one patch"
   )
   truthy(
     turn.params.input[1].text:find("Do not delegate this request to subagents", 1, true),
-    "targeted should keep the bounded turn on the policy-controlled root agent"
+    "patch should keep the bounded turn on the policy-controlled root agent"
   )
   truthy(
     turn.params.input[1].text:find("\n\nRequest:\nfix only the parser edge case", 1, true),
     "the policy should remain scoped to this request"
   )
-  truthy(not turn.params.input[1].text:find("TARGETED:", 1, true), "the control prefix should not reach Codex")
+  truthy(not turn.params.input[1].text:find("PATCH:", 1, true), "the control prefix should not reach Codex")
   truthy(
     turn.params.additionalContext["seal.editor"].value:find("local value = 1", 1, true),
-    "targeted should retain editor context"
+    "patch should retain editor context"
   )
 
   setup({ "" })
-  truthy(not seal.submit("targeted:   "), "an empty targeted prompt should not submit")
-  truthy(request(fake, "thread/start") == nil, "an empty targeted prompt should not open a thread")
+  truthy(not seal.submit("patch:   "), "an empty patch prompt should not submit")
+  truthy(request(fake, "thread/start") == nil, "an empty patch prompt should not open a thread")
 end
 
-function tests.refactor_adds_minimal_behavior_preserving_guidance()
-  setup({ "local value = 1" })
-  truthy(seal.submit("REFACTOR: extract the parsing branch"), "refactor prompt should submit")
-  local turn = request(fake, "turn/start")
-  equal(turn.params.threadId, "main-thread", "refactor should use the persistent thread")
-  truthy(turn.params.outputSchema == nil, "refactor must not constrain the agent response")
-  equal(turn.params.approvalPolicy, "untrusted", "refactor patches should use the normal review gate")
-  truthy(
-    turn.params.input[1].text:find("smallest structural change necessary", 1, true),
-    "refactor should request the smallest structural change"
-  )
-  truthy(
-    turn.params.input[1].text:find("Preserve existing behavior and public APIs", 1, true),
-    "refactor should preserve behavior and public APIs by default"
-  )
-  truthy(seal._route("refactor: extract it").bounded_patch, "refactor should use the bounded patch lifecycle")
-  truthy(
-    turn.params.input[1].text:find("extract the parsing branch", 1, true),
-    "refactor should include the user's request"
-  )
-  truthy(not turn.params.input[1].text:find("REFACTOR:", 1, true), "the control prefix should not reach Codex")
-
-  setup({ "" })
-  truthy(not seal.submit("refactor:   "), "an empty refactor prompt should not submit")
-  truthy(request(fake, "thread/start") == nil, "an empty refactor prompt should not open a thread")
+function tests.removed_agent_prefixes_are_plain_prompts()
+  for _, text in ipairs({ "TARGETED: fix the parser", "refactor: extract the branch", "refactor this function" }) do
+    setup({ "local value = 1" })
+    equal(seal._route(text), { mode = "agent", prompt = text, original = text },
+      "removed prefixes must use the ordinary prompt route")
+    truthy(seal.submit(text), "the ordinary prompt should submit")
+    local turn = request(fake, "turn/start")
+    equal(turn.params.input[1].text, text, "removed prefixes must not expand instructions or strip text")
+    truthy(not seal._state.live[test_root].current.bounded_patch, "ordinary prompts must allow multiple edits")
+  end
 end
 
 function tests.bounded_policy_restore_accepts_app_server_workspace_defaults()
@@ -496,7 +481,7 @@ function tests.bounded_policy_restore_accepts_app_server_workspace_defaults()
     return original_request(self, method, params, callback)
   end
 
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   local session = seal._state.live[test_root]
   local entry = session.current
   truthy(restore_callback ~= nil, "the prior thread policy should be awaiting restoration")
@@ -1077,7 +1062,7 @@ function tests.attach_before_a_prompt_lets_the_side_tui_create_the_shared_thread
     ":SealAttach should not create an unresumable empty app-server thread")
   truthy(seal.status().attaching, "Seal should wait to adopt the side-pane thread")
 
-  seal.submit("targeted: update the visible chat")
+  seal.submit("patch: update the visible chat")
   truthy(request(fake, "turn/start") == nil,
     "a prompt entered during handoff should wait for the TUI-created thread")
   seal._notification("thread/started", {
@@ -1124,7 +1109,7 @@ function tests.attach_before_a_prompt_lets_the_side_tui_create_the_shared_thread
   })
   local turn = request(fake, "turn/start")
   equal(turn.params.threadId, "side-pane-thread",
-    "the waiting targeted prompt should run in the chat created by the side TUI")
+    "the waiting patch prompt should run in the chat created by the side TUI")
   truthy(turn.params.input[1].text:find("update the visible chat", 1, true) ~= nil,
     "the side-pane turn should receive the original prompt")
   equal(seal.status().thread_id, "side-pane-thread", "Seal should retain the adopted TUI chat")
@@ -1222,24 +1207,24 @@ end
 
 function tests.declaration_queues_during_active_main_turn()
   setup({ "" })
-  seal.submit("targeted: make the surrounding change")
+  seal.submit("patch: make the surrounding change")
   fake.thread_status = { type = "active", activeFlags = {} }
   seal._notification("turn/started", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "inProgress" },
   })
-  seal.submit("fun: run alongside the targeted turn")
+  seal.submit("fun: run alongside the patch turn")
   truthy(request(fake, "thread/fork") == nil, "a declaration should not fork the backing chat")
-  equal(fake.main_turn_count, 1, "the declaration should wait for the targeted turn")
+  equal(fake.main_turn_count, 1, "the declaration should wait for the patch turn")
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
   })
   truthy(vim.wait(1000, function()
     return fake.main_turn_count == 2
-  end, 5), "the declaration should start after the targeted turn")
+  end, 5), "the declaration should start after the patch turn")
   equal(request(fake, "turn/start").params.threadId, "main-thread", "the declaration should reuse the backing chat")
-  complete_declaration("function run_after_targeted() end")
+  complete_declaration("function run_after_patch() end")
   seal.reject(1)
 end
 
@@ -1273,7 +1258,7 @@ function tests.interface_prefix_requests_api_without_implementation()
   truthy(turn.params.input[1].text:find("storage backend", 1, true), "interface should carry the user's request")
   truthy(
     not turn.params.input[1].text:find("minimum necessary", 1, true),
-    "interface should not inherit the targeted policy"
+    "interface should not inherit the patch policy"
   )
   equal(turn.params.outputSchema.required, { "code" }, "interface should retain structured declaration output")
 end
@@ -1807,7 +1792,7 @@ function tests.failed_bounded_patch_application_stops_and_fails_the_turn()
   setup({ "local value = 1" })
   vim.fn.mkdir(test_root, "p")
   vim.cmd("silent write")
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   local activity = seal._state.activities[1]
   local changes = { {
     path = vim.api.nvim_buf_get_name(0),
@@ -1879,7 +1864,7 @@ end
 
 function tests.rejecting_a_bounded_patch_stops_its_turn()
   setup({ "local value = 1" })
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   local activity = seal._state.activities[1]
   local changes = { {
     path = vim.api.nvim_buf_get_name(0),
@@ -1910,7 +1895,7 @@ end
 
 function tests.cancel_key_rejects_and_stops_a_bounded_patch_end_to_end()
   setup({ "local value = 1" })
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   local changes = { {
     path = vim.api.nvim_buf_get_name(0),
     kind = { type = "update" },
@@ -1938,10 +1923,10 @@ function tests.cancel_key_rejects_and_stops_a_bounded_patch_end_to_end()
     "the cancel decision should also stop the bounded owner")
 end
 
-function tests.targeted_patch_stops_only_after_the_accepted_patch_is_applied()
+function tests.patch_patch_stops_only_after_the_accepted_patch_is_applied()
   setup({ "local value = 1" })
   vim.api.nvim_set_option_value("modified", false, { buf = 0 })
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   local activity = seal._state.activities[1]
   local source_path = vim.api.nvim_buf_get_name(0)
   local changes = {
@@ -1987,7 +1972,7 @@ end
 function tests.second_bounded_patch_is_rejected_and_invalidates_the_first_review()
   setup({ "local value = 1" })
   vim.api.nvim_set_option_value("modified", false, { buf = 0 })
-  seal.submit("targeted: update one value")
+  seal.submit("patch: update one value")
   local activity = seal._state.activities[1]
   local source_path = vim.api.nvim_buf_get_name(0)
   local function propose(item_id, request_id, value)
@@ -2041,7 +2026,7 @@ end
 function tests.bounded_v2_child_patch_inherits_review_and_stops_the_root_turn()
   setup({ "" })
   vim.api.nvim_set_option_value("modified", false, { buf = 0 })
-  seal.submit("refactor: extract the storage helper")
+  seal.submit("patch: extract the storage helper")
   seal._notification("item/completed", {
     threadId = "main-thread",
     turnId = "main-turn",
@@ -2092,7 +2077,7 @@ end
 
 function tests.bounded_turn_that_finishes_without_a_patch_fails()
   setup({ "local value = 1" })
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   local activity = seal._state.activities[1]
   seal._notification("turn/completed", {
     threadId = "main-thread",
@@ -2120,7 +2105,7 @@ function tests.prompting_from_patch_review_targets_the_source_buffer()
   setup({ "local value = 1", "" })
   local source = vim.api.nvim_get_current_buf()
   local source_path = vim.api.nvim_buf_get_name(source)
-  seal.submit("targeted: update the value")
+  seal.submit("patch: update the value")
   fake.thread_status = { type = "active", activeFlags = {} }
   seal._notification("turn/started", {
     threadId = "main-thread",
@@ -2160,10 +2145,10 @@ function tests.prompting_from_patch_review_targets_the_source_buffer()
   equal(vim.bo.modifiable, true, "Seal must not leave the source buffer read-only")
   equal(seal._state.jobs[1].snapshot.buf, source, "the declaration should belong to the source buffer")
   truthy(request(fake, "thread/fork") == nil, "the declaration should stay in the backing chat")
-  equal(seal._state.jobs[1].thread_id, nil, "the declaration should wait for the active targeted turn")
+  equal(seal._state.jobs[1].thread_id, nil, "the declaration should wait for the active patch turn")
 
   seal.reject(seal._state.jobs[1])
-  truthy(request(fake, "turn/interrupt") == nil, "rejecting a queued declaration should not interrupt the targeted turn")
+  truthy(request(fake, "turn/interrupt") == nil, "rejecting a queued declaration should not interrupt the patch turn")
   seal.review(test_root)
   vim.fn.maparg("<Esc>", "n", false, true).callback()
 end
@@ -2456,31 +2441,29 @@ function tests.command_escalations_require_explicit_approval_even_when_commands_
   truthy(prompts[2]:find("Additional permissions:", 1, true), "additional permissions should be visible")
 end
 
-function tests.targeted_and_refactor_decline_commands_that_require_approval()
-  for _, prompt in ipairs({ "targeted: update the value", "refactor: extract the branch" }) do
-    setup({ "local value = 1" }, {
-      select = function()
-        fail("bounded commands must not open an approval dialog")
-      end,
-    })
-    seal.submit(prompt)
-    seal._server_request({
-      id = 158,
-      method = "item/commandExecution/requestApproval",
-      params = {
-        threadId = "main-thread",
-        turnId = "main-turn",
-        itemId = "bounded-command",
-        command = "make test",
-        availableDecisions = { "accept", "decline", "cancel" },
-      },
-    })
-    equal(fake.responses[#fake.responses], {
-      id = 158,
-      result = { decision = "decline" },
-    }, "bounded turns should decline commands that cross the approval boundary")
-    truthy(request(fake, "turn/interrupt") == nil, "a declined command should let Codex proceed to its one patch")
-  end
+function tests.custom_bounded_prefix_declines_commands_that_require_approval()
+  setup({ "local value = 1" }, {
+    select = function()
+      fail("bounded commands must not open an approval dialog")
+    end,
+  })
+  seal.submit("patch: update the value")
+  seal._server_request({
+    id = 158,
+    method = "item/commandExecution/requestApproval",
+    params = {
+      threadId = "main-thread",
+      turnId = "main-turn",
+      itemId = "bounded-command",
+      command = "make test",
+      availableDecisions = { "accept", "decline", "cancel" },
+    },
+  })
+  equal(fake.responses[#fake.responses], {
+    id = 158,
+    result = { decision = "decline" },
+  }, "bounded turns should decline commands that cross the approval boundary")
+  truthy(request(fake, "turn/interrupt") == nil, "a declined command should let Codex proceed to its one patch")
 end
 
 function tests.command_approval_warns_about_unpreviewed_writes()
@@ -3075,13 +3058,13 @@ function tests.agent_prompts_render_before_backend_is_ready()
   markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
   truthy(markers[1][4].virt_lines[1][1][1] ~= frame, "the freeform startup marker should advance its frame")
 
-  truthy(seal.submit("targeted: fix the build logger"), "a targeted prompt should submit")
+  truthy(seal.submit("patch: fix the build logger"), "a patch prompt should submit")
   truthy(held_start ~= nil, "both prompts should be waiting on the same backend startup")
   equal(vim.tbl_count(seal._state.activities), 2, "both prompts should retain their lifecycle state")
   markers = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })
   equal(#markers, 1, "collocated prompts should share one progress marker")
   local summary = markers[1][4].virt_lines[1][2][1]
-  truthy(summary:find("targeted · fix the build logger", 1, true), "the marker should show the prefixed request")
+  truthy(summary:find("patch · fix the build logger", 1, true), "the marker should show the prefixed request")
   truthy(summary:find("2 requests here", 1, true), "the request count should include the normal prompt")
   truthy(seal._state.spinner_timer ~= nil, "the prefixed prompt should animate while it waits")
   truthy(
@@ -3332,8 +3315,8 @@ function tests.mapping_away_from_marker_preserves_global_behavior()
   vim.keymap.del("n", "<Tab>")
 end
 
-function tests.escape_at_agent_markers_cancels_normal_and_targeted_turns()
-  for _, prompt in ipairs({ "explain this file", "targeted: update this file" }) do
+function tests.escape_at_agent_markers_cancels_normal_and_patch_turns()
+  for _, prompt in ipairs({ "explain this file", "patch: update this file" }) do
     setup({ "" }, { activity = { interval_ms = 100000 } })
     seal.submit(prompt)
     local escape = vim.fn.maparg("<Esc>", "n", false, true)
@@ -4113,7 +4096,7 @@ function tests.freeform_preserves_an_existing_preview()
   seal.reject(1)
 end
 
-function tests.targeted_preserves_queued_declaration_spinners()
+function tests.patch_preserves_queued_declaration_spinners()
   setup({ "", "" }, { activity = { interval_ms = 100000 } })
   seal.submit("fun: log the build process")
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
@@ -4121,20 +4104,20 @@ function tests.targeted_preserves_queued_declaration_spinners()
   local first = seal._state.jobs[1]
   local second = seal._state.jobs[2]
 
-  seal.submit("targeted: connect build logging")
-  equal(vim.tbl_count(seal._state.jobs), 2, "targeted submission should preserve both declaration spinners")
+  seal.submit("patch: connect build logging")
+  equal(vim.tbl_count(seal._state.jobs), 2, "patch submission should preserve both declaration spinners")
   seal._notification("turn/started", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "inProgress" },
   })
-  equal(seal._state.jobs[1], first, "the function spinner should survive the targeted turn start")
-  equal(seal._state.jobs[2], second, "the type spinner should survive the targeted turn start")
+  equal(seal._state.jobs[1], first, "the function spinner should survive the patch turn start")
+  equal(seal._state.jobs[2], second, "the type spinner should survive the patch turn start")
 
   seal.reject(1)
   seal.reject(2)
 end
 
-function tests.targeted_patch_reload_preserves_unaffected_previews()
+function tests.patch_patch_reload_preserves_unaffected_previews()
   setup({ "local build = true", "", "local output = {}", "" }, { activity = { interval_ms = 100000 } })
   local path = vim.fn.tempname() .. ".lua"
   vim.api.nvim_buf_set_name(0, path)
@@ -4151,24 +4134,24 @@ function tests.targeted_patch_reload_preserves_unaffected_previews()
   truthy(first and first.phase == "ready" and second and second.phase == "ready", "both previews should be ready")
 
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
-  seal.submit("targeted: add a build-file header")
+  seal.submit("patch: add a build-file header")
   seal._notification("turn/started", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "inProgress" },
   })
-  vim.fn.writefile({ "-- targeted change", "local build = true", "", "local output = {}", "" }, path)
+  vim.fn.writefile({ "-- patch change", "local build = true", "", "local output = {}", "" }, path)
   seal._notification("turn/completed", {
     threadId = "main-thread",
     turn = { id = "main-turn", status = "completed" },
   })
 
   truthy(vim.wait(1000, function()
-    return vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "-- targeted change"
+    return vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "-- patch change"
       and seal._state.jobs[1] == first
       and seal._state.jobs[2] == second
       and first.phase == "ready"
       and second.phase == "ready"
-  end, 5), "an unrelated targeted patch should reload without discarding either preview")
+  end, 5), "an unrelated patch patch should reload without discarding either preview")
   local namespace = vim.api.nvim_get_namespaces()["seal-activity"]
   local first_position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, first.extmark, {})
   local second_position = vim.api.nvim_buf_get_extmark_by_id(0, namespace, second.extmark, {})
@@ -5175,8 +5158,8 @@ local order = {
   "repeated_setup_removes_leader_keymaps_after_termcode_expansion",
   "freeform_uses_main_thread_unchanged",
   "routine_turn_notifications_require_verbose_mode",
-  "targeted_adds_minimal_change_guidance_to_the_main_thread",
-  "refactor_adds_minimal_behavior_preserving_guidance",
+  "patch_adds_minimal_change_guidance_to_the_main_thread",
+  "removed_agent_prefixes_are_plain_prompts",
   "bounded_policy_restore_accepts_app_server_workspace_defaults",
   "freeform_queues_behind_an_active_turn",
   "early_completion_waits_for_start_ownership_before_pumping",
@@ -5225,7 +5208,7 @@ local order = {
   "accepted_patch_preserves_edits_made_while_codex_applies_it",
   "rejecting_a_bounded_patch_stops_its_turn",
   "cancel_key_rejects_and_stops_a_bounded_patch_end_to_end",
-  "targeted_patch_stops_only_after_the_accepted_patch_is_applied",
+  "patch_patch_stops_only_after_the_accepted_patch_is_applied",
   "second_bounded_patch_is_rejected_and_invalidates_the_first_review",
   "bounded_v2_child_patch_inherits_review_and_stops_the_root_turn",
   "bounded_turn_that_finishes_without_a_patch_fails",
@@ -5239,7 +5222,7 @@ local order = {
   "command_approvals_require_an_explicit_decision_by_default",
   "command_approvals_auto_accept_when_explicitly_enabled",
   "command_escalations_require_explicit_approval_even_when_commands_auto_accept",
-  "targeted_and_refactor_decline_commands_that_require_approval",
+  "custom_bounded_prefix_declines_commands_that_require_approval",
   "command_approval_warns_about_unpreviewed_writes",
   "command_approval_honors_available_decisions",
   "dismissed_command_uses_the_advertised_cancel",
@@ -5267,7 +5250,7 @@ local order = {
   "status_batch_preserves_submission_order",
   "spinner_is_anchored_and_animates_in_place",
   "mapping_away_from_marker_preserves_global_behavior",
-  "escape_at_agent_markers_cancels_normal_and_targeted_turns",
+  "escape_at_agent_markers_cancels_normal_and_patch_turns",
   "rejecting_one_queued_job_keeps_its_sibling",
   "multiple_jobs_share_and_restore_buffer_mappings",
   "closed_source_buffer_discards_ready_jobs_and_mappings",
@@ -5297,8 +5280,8 @@ local order = {
   "automatic_declarations_leave_conflicts_for_resolution",
   "reject_leaves_buffer_untouched",
   "freeform_preserves_an_existing_preview",
-  "targeted_preserves_queued_declaration_spinners",
-  "targeted_patch_reload_preserves_unaffected_previews",
+  "patch_preserves_queued_declaration_spinners",
+  "patch_patch_reload_preserves_unaffected_previews",
   "attached_tui_turn_preserves_an_existing_preview",
   "external_file_change_blocks_preview_acceptance",
   "external_file_change_retains_a_blocked_preview",

@@ -326,6 +326,7 @@ function Warmup:run()
     "Orient yourself for future targeted edits in this repository. This is background research, not an edit request.",
     "Use only the available file read, directory listing, glob, and search tools. Do not modify files, run commands, tests, or agents.",
     "Read repository instructions and applicable nested instructions. Follow the project's conventions.",
+    "Batch independent file reads and searches when possible. Reuse the supplied editor excerpt and files already read in this session.",
     key == "repo"
       and "Inspect the top-level structure, README, and build/package manifests. Read only the key entry points needed to understand the architecture. Do not exhaustively read the repository."
       or "Investigate the focused file's imports, important definitions, callers, and relevant tests. Focus on facts that would help edit it correctly.",

@@ -217,7 +217,7 @@ test("keeps long prompts open and assembles only agent text in the transcript", 
   f:start()
   f:session()
   local _, prompt = f:prompt({ additionalContext = { ["seal.editor"] = { value = "private editor context" } } })
-  equal(2, #prompt.params.prompt)
+  equal(3, #prompt.params.prompt)
   vim.wait(30, function() return false end, 1)
   equal(true, f.client.rpc.ready)
   f:update({ sessionUpdate = "agent_message_chunk", content = { type = "text", text = "Hel" } })
@@ -258,6 +258,31 @@ test("reviews complete diffs even when permission precedes the tool notification
   equal({ outcome = "selected", optionId = "once" }, f.sent[#f.sent].result.outcome)
   f:update({ sessionUpdate = "tool_call_update", toolCallId = "edit", status = "completed" })
   equal("fileChange", f.events[#f.events].params.item.type)
+end)
+
+test("recognizes file changes without permission requests and retains their kind across partial updates", function()
+  for _, metadata in ipairs({
+    { kind = "edit" }, { kind = "delete" }, { kind = "move" },
+    { content = { { type = "diff", path = project .. "/auto.lua", newText = "new" } } },
+  }) do
+    local f = running()
+    f:update(vim.tbl_extend("force", metadata, { sessionUpdate = "tool_call", toolCallId = "auto", status = "in_progress" }))
+    -- Agents may replace the diff with a text result on completion.
+    f:update({ sessionUpdate = "tool_call_update", toolCallId = "auto", status = "completed", content = {} })
+    equal(0, #f.requests)
+    equal("fileChange", f.events[#f.events].params.item.type)
+    equal("completed", f.events[#f.events].params.item.status)
+  end
+end)
+
+test("an incomplete permission update cannot downgrade a known edit to command approval", function()
+  local f = running()
+  f:update({ sessionUpdate = "tool_call", toolCallId = "edit", content = {
+    { type = "diff", path = project .. "/known.lua", oldText = "old", newText = "new" },
+  } })
+  f:permission(6, { toolCallId = "edit", content = {} })
+  equal("item/fileChange/requestApproval", f.requests[#f.requests].method)
+  assert(not f:decide("accept"))
 end)
 
 test("merges partial tool updates and never substitutes permanent approval", function()
@@ -388,9 +413,9 @@ test("routes concurrent project sessions independently", function()
   equal("model unavailable", f.events[#f.events].params.turn.error.message)
 end)
 
-local function editor_fixture()
+local function editor_fixture(overrides)
   local f = fixture()
-  seal.setup({
+  seal.setup(vim.tbl_deep_extend("force", {
     backend = "acp",
     transport_factory = f.factory,
     root = function() return project end,
@@ -398,7 +423,7 @@ local function editor_fixture()
       if level == vim.log.levels.ERROR then table.insert(f.errors, message) end
     end,
     keymaps = { prompt = false, chat = false },
-  })
+  }, overrides or {}))
   vim.cmd("enew!")
   vim.bo.filetype = "lua"
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "", "" })
@@ -434,12 +459,34 @@ test("queues two editor declarations on one session and accepts inline previews"
   equal({}, f.errors)
 end)
 
-test("bounded editor edits stop only after the reviewed tool completes", function()
+test("selected edits identify their boundary before the surrounding reference code", function()
   local f = editor_fixture()
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, {
+    "local unrelated = true", "local function main()", "  print('failed')", "end", "return unrelated",
+  })
+  vim.api.nvim_buf_set_name(0, project .. "/selection.lua")
+  vim.cmd("silent write")
+  assert(seal.submit("improve logging here", { range = 2, line1 = 2, line2 = 4 }))
+  f:connect_editor()
+  local prompt = assert(f:last("session/prompt")).params.prompt
+  equal("improve logging here", prompt[1].text)
+  assert(prompt[2].text:find("edit only the selection unless the user explicitly requests a broader change", 1, true))
+  assert(prompt[2].text:find("directly related definitions or callers", 1, true))
+  assert(prompt[2].text:find("Do not inspect Git history or run tests", 1, true))
+  local context = prompt[3].text
+  assert(context:find("Selected lines: 2-4", 1, true))
+  local selection = assert(context:find("<selection>\nlocal function main()\n  print('failed')\nend\n</selection>", 1, true))
+  local buffer = assert(context:find("<buffer", 1, true))
+  assert(selection < buffer)
+  assert(context:find("return unrelated", buffer, true))
+end)
+
+test("bounded editor edits stop only after the reviewed tool completes", function()
+  local f = editor_fixture({ agent_prefixes = { patch = { instruction = "Make the requested edit.", bounded_patch = true } } })
   local path = project .. "/bounded.lua"
   vim.fn.writefile({ "local value = 1" }, path)
   vim.cmd.edit(path)
-  assert(seal.submit("targeted: set value to 2"))
+  assert(seal.submit("patch: set value to 2"))
   f:connect_editor()
   local prompt = assert(f:last("session/prompt"))
   f:permission(80, { toolCallId = "edit", kind = "edit", content = {
@@ -458,6 +505,106 @@ test("bounded editor edits stop only after the reviewed tool completes", functio
   f:reply(prompt, { stopReason = "cancelled" })
   wait_for(function() return seal.status().running_count == 0 end)
   equal({}, f.errors)
+end)
+
+test("auto-approved edits appear before the prompt ends and keep unsaved edits intact", function()
+  for _, modified in ipairs({ false, true }) do
+    local f = editor_fixture()
+    local path = project .. "/automatic.lua"
+    vim.fn.writefile({ "local value = 1" }, path)
+    vim.cmd.edit(path)
+    vim.bo.autoread = false
+    assert(seal.submit("set value to 2"))
+    f:connect_editor()
+    local prompt = assert(f:last("session/prompt"))
+    f:update({ sessionUpdate = "tool_call", toolCallId = "auto", kind = "edit", status = "in_progress" })
+    vim.fn.writefile({ "local value = 2" }, path)
+    f:update({ sessionUpdate = "tool_call_update", toolCallId = "auto", status = "completed" })
+    -- This change races the scheduled buffer refresh.
+    if modified then vim.api.nvim_buf_set_lines(0, 0, -1, false, { "local value = unsaved" }) end
+    if modified then
+      vim.wait(20, function() return false end, 1)
+      equal({ "local value = unsaved" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    else
+      wait_for(function() return vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "local value = 2" end)
+    end
+    equal({ "local value = 2" }, vim.fn.readfile(path))
+    assert(seal.status().generating)
+    equal(nil, f:last("session/cancel"))
+    f:reply(prompt, { stopReason = "end_turn" })
+    wait_for(function() return not seal.status().generating end)
+    equal({}, f.errors)
+    seal.stop()
+    vim.cmd("enew!")
+    vim.api.nvim_buf_delete(vim.fn.bufnr(path), { force = true })
+  end
+end)
+
+test("failed edits and completed reads do not refresh the editor", function()
+  local f = editor_fixture()
+  local path = project .. "/failed.lua"
+  vim.fn.writefile({ "local value = 1" }, path)
+  vim.cmd.edit(path)
+  assert(seal.submit("set value to 2"))
+  f:connect_editor()
+  vim.fn.writefile({ "local value = 2" }, path)
+  f:update({ sessionUpdate = "tool_call", toolCallId = "failed", kind = "edit", status = "failed" })
+  f:update({ sessionUpdate = "tool_call", toolCallId = "read", kind = "read", status = "completed" })
+  vim.wait(20, function() return false end, 1)
+  equal({ "local value = 1" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+  equal({}, f.errors)
+end)
+
+test("bounded auto-approved edits cancel after writing and release the queue only on acknowledgement", function()
+  local f = editor_fixture({ agent_prefixes = { patch = { instruction = "Make the requested edit.", bounded_patch = true } } })
+  local path = project .. "/auto-bounded.lua"
+  vim.fn.writefile({ "local value = 1" }, path)
+  vim.cmd.edit(path)
+  assert(seal.submit("patch: set value to 2"))
+  f:connect_editor()
+  local prompt = assert(f:last("session/prompt"))
+  f:update({ sessionUpdate = "tool_call", toolCallId = "auto", kind = "edit", status = "in_progress" })
+  equal(nil, f:last("session/cancel"))
+  vim.fn.writefile({ "local value = 2" }, path)
+  f:update({ sessionUpdate = "tool_call_update", toolCallId = "auto", status = "completed" })
+  assert(f:last("session/cancel"))
+  assert(seal.status().generating)
+  f:reply(prompt, { stopReason = "cancelled" })
+  wait_for(function() return seal.status().running_count == 0 end)
+  wait_for(function() return vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "local value = 2" end)
+  equal({}, f.errors)
+end)
+
+test("ordinary prompts can finish multiple automatic edits", function()
+  for _, prefix in ipairs({ "", "refactor: " }) do
+    local f = editor_fixture()
+    local paths = { project .. "/first.lua", project .. "/second.lua" }
+    local buffers = {}
+    for _, path in ipairs(paths) do
+      vim.fn.writefile({ "local value = 1" }, path)
+      vim.cmd.edit(path)
+      table.insert(buffers, vim.api.nvim_get_current_buf())
+    end
+    assert(seal.submit(prefix .. "set value to 2 in first.lua and second.lua"))
+    f:connect_editor()
+    local prompt = assert(f:last("session/prompt"))
+    local instruction = prompt.params.prompt[1].text
+    assert(not instruction:find("exactly one file-change patch", 1, true))
+    equal(prefix .. "set value to 2 in first.lua and second.lua", instruction)
+    for i, path in ipairs(paths) do
+      f:update({ sessionUpdate = "tool_call", toolCallId = "edit-" .. i, kind = "edit", status = "in_progress" })
+      vim.fn.writefile({ "local value = 2" }, path)
+      f:update({ sessionUpdate = "tool_call_update", toolCallId = "edit-" .. i, status = "completed" })
+      wait_for(function() return vim.api.nvim_buf_get_lines(buffers[i], 0, -1, false)[1] == "local value = 2" end)
+      equal(nil, f:last("session/cancel"))
+      equal(0, seal.status().pending_reviews)
+      assert(seal.status().generating)
+    end
+    f:reply(prompt, { stopReason = "end_turn" })
+    wait_for(function() return not seal.status().generating end)
+    equal({}, f.errors)
+    seal.stop()
+  end
 end)
 
 local failures = {}
