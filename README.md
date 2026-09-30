@@ -120,9 +120,11 @@ The Alto **Seal** plugin receives prompts through a private local Unix socket. W
 :SealAltoStatus
 ```
 
-`:SealAlto` without text opens a prompt. The handoff includes the originating file, project root, language, cursor, nearby buffer contents, and selected text, including unsaved edits. It targets the focused chat in the most recently focused Alto window. The destination is captured when Alto receives the handoff; switching panes afterward does not redirect it. A pane that changes to another conversation before delivery causes an error.
+`:SealAlto` without text opens a prompt. The handoff includes the originating file, project root, language, cursor, nearby buffer contents, and selected text, including unsaved edits. In the most recently focused Alto window, it targets the focused chat or, when a terminal or another non-chat pane is focused, the chat immediately to its left in the same workspace tab. You can keep editing in the terminal without focusing the chat first. The destination is captured when Alto receives the handoff; switching panes afterward does not redirect it. A pane that changes to another conversation before delivery causes an error.
 
 Normal handoffs use Alto's existing queue when a turn is running. The `!` variant requests live steering. Alto keeps its selected model, provider, workspace, and permissions. This is a one-way handoff: responses and edit approvals remain in Alto, and Seal does not apply inline results, save the buffer, or reload files after the Alto turn.
+
+Alto shows a compact selection with a header such as **Seal · mod.rs:6-13**. Long lines wrap, and the display stays within six visible lines without an inner scrollbar or a control to expand the full context. The agent still receives the buffer context, including unsaved edits.
 
 The default socket is `~/.cache/alto/seal.sock`. Set `alto = { socket = "/another/path", timeout_ms = 20000 }` in Seal's `setup()` if the Alto plugin uses another location. The parent directory is private to your user, and the plugin closes its socket when disabled. If a handoff times out after delivery may have started, check Alto's chat and queue before retrying; Seal does not automatically resend it.
 

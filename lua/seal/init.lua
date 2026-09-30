@@ -5209,7 +5209,7 @@ function M.alto_status()
     end
     local target = type(result.target) == "table" and result.target or nil
     notify(target and ("Alto target: " .. target.title .. " (" .. target.workspace .. ")")
-      or "Alto is connected; focus a chat pane to receive Seal prompts")
+      or "Alto is connected; open a chat pane to the left of the active pane to receive Seal prompts")
   end)
 end
 
